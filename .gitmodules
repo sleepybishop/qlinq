@@ -4,7 +4,7 @@
 [submodule "deps/quicly"]
 	path = deps/quicly
 	url = https://github.com/sleepybishop/quicly
-	branch = multipath-draft21
+	branch = bishlink
 [submodule "deps/nanors"]
 	path = deps/nanors
 	url = https://github.com/sleepybishop/nanors
