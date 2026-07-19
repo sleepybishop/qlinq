@@ -4,8 +4,8 @@
 set -e
 
 # Compile the benchmark
-echo "Compiling video latency benchmark..."
-make examples/video_latency_benchmark
+echo "Compiling data multipath benchmark..."
+make examples/data_multipath_benchmark
 
 # Run the benchmark in an unshared user/network namespace
 echo "Entering isolated namespace for multipath setup..."
@@ -31,11 +31,11 @@ unshare -Urn bash -c '
     
     echo ""
     echo "====================================================="
-    echo "  TEST 1: Dynamic Multipath Mode (ifmon demo)"
+    echo "  TEST 1: Dynamic Multipath Mode (data stream)"
     echo "====================================================="
     # We pass all potential remote IPs so the client knows them.
     # We only pass the first local IPs to start, the rest will be dynamically discovered.
-    ./examples/video_latency_benchmark --server-bind 10.0.1.1 --client-bind 10.0.1.2 --client-remote 10.0.1.1 10.0.2.1 10.0.3.1 10.0.4.1 &
+    ./examples/data_multipath_benchmark --server-bind 10.0.1.1 --client-bind 10.0.1.2 --client-remote 10.0.1.1 10.0.2.1 10.0.3.1 10.0.4.1 &
     BENCH_PID=$!
     
     sleep 2

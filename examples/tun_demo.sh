@@ -8,7 +8,7 @@ mkdir -p logs
 
 # 1. Compile all required daemons
 echo "Compiling bishlink host, client, and tun daemons..."
-make bishlink-host bishlink-client bishlink-tund
+make bishlinkd bishlink-tund
 
 # 2. Run the comparison benchmark inside an unshared user/network/mount namespace
 echo "Launching virtual tunnel benchmark inside isolated namespace stack..."
@@ -59,15 +59,15 @@ unshare -Urnm bash -c '
     # RUN 1: RaptorQ FEC Datagram Mode
     # ========================================================
     echo "=== RUN 1: RaptorQ FEC Datagram Mode ==="
-    ip netns exec ns_host ./bishlink-host > logs/host_fec.log 2>&1 &
+    ip netns exec ns_host ./bishlinkd --listen 8888 --bind 192.168.1.1 --socket bishlink-data --track tund/tun-client > logs/host_fec.log 2>&1 &
     PID_HOST=$!
-    ip netns exec ns_client ./bishlink-client 192.168.1.1 > logs/client_fec.log 2>&1 &
+    ip netns exec ns_client ./bishlinkd --peer 192.168.1.1:8888 --socket bishlink-data-client --track tund/tun-host > logs/client_fec.log 2>&1 &
     PID_CLIENT=$!
     sleep 2
 
-    ip netns exec ns_host ./bishlink-tund --socket bishlink-data -i tun-host -a 10.8.0.1/24 > logs/tund_host_fec.log 2>&1 &
+    ip netns exec ns_host ./bishlink-tund --socket bishlink-data -i tun-host -a 10.8.0.1/24 --track tund/tun-host > logs/tund_host_fec.log 2>&1 &
     PID_TUND_HOST=$!
-    ip netns exec ns_client ./bishlink-tund --socket bishlink-data-client -i tun-client -a 10.8.0.2/24 > logs/tund_client_fec.log 2>&1 &
+    ip netns exec ns_client ./bishlink-tund --socket bishlink-data-client -i tun-client -a 10.8.0.2/24 --track tund/tun-client > logs/tund_client_fec.log 2>&1 &
     PID_TUND_CLIENT=$!
     sleep 2
 
@@ -108,15 +108,15 @@ print(m.group(2) + \" ms\" if m else \"N/A\")
     # RUN 2: Vanilla Reliable QUIC Stream Mode
     # ========================================================
     echo "=== RUN 2: Vanilla Reliable QUIC Stream Mode ==="
-    ip netns exec ns_host ./bishlink-host > logs/host_reliable.log 2>&1 &
+    ip netns exec ns_host ./bishlinkd --listen 8888 --bind 192.168.1.1 --socket bishlink-data --track tund/tun-client --reliable > logs/host_reliable.log 2>&1 &
     PID_HOST=$!
-    ip netns exec ns_client ./bishlink-client 192.168.1.1 --reliable > logs/client_reliable.log 2>&1 &
+    ip netns exec ns_client ./bishlinkd --peer 192.168.1.1:8888 --socket bishlink-data-client --track tund/tun-host --reliable > logs/client_reliable.log 2>&1 &
     PID_CLIENT=$!
     sleep 2
 
-    ip netns exec ns_host ./bishlink-tund --socket bishlink-data -i tun-host -a 10.8.0.1/24 > logs/tund_host_reliable.log 2>&1 &
+    ip netns exec ns_host ./bishlink-tund --socket bishlink-data -i tun-host -a 10.8.0.1/24 --track tund/tun-host --reliable > logs/tund_host_reliable.log 2>&1 &
     PID_TUND_HOST=$!
-    ip netns exec ns_client ./bishlink-tund --socket bishlink-data-client -i tun-client -a 10.8.0.2/24 > logs/tund_client_reliable.log 2>&1 &
+    ip netns exec ns_client ./bishlink-tund --socket bishlink-data-client -i tun-client -a 10.8.0.2/24 --track tund/tun-client --reliable > logs/tund_client_reliable.log 2>&1 &
     PID_TUND_CLIENT=$!
     sleep 2
 

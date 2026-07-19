@@ -82,6 +82,41 @@ static uint8_t count_bits_v6(struct in6_addr addr) {
 }
 #endif
 
+static int is_iface_allowed(const char *name) {
+  if (!name || name[0] == '\0')
+    return 0;
+
+  /* Linux / Generic */
+  if (strncmp(name, "lo", 2) == 0)
+    return 0;
+  if (strncmp(name, "tun", 3) == 0)
+    return 0;
+  if (strncmp(name, "tap", 3) == 0)
+    return 0;
+  if (strncmp(name, "docker", 6) == 0)
+    return 0;
+  if (strncmp(name, "br-", 3) == 0)
+    return 0;
+
+  /* macOS specific */
+  if (strncmp(name, "utun", 4) == 0)
+    return 0;
+  if (strncmp(name, "llw", 3) == 0)
+    return 0; /* Apple low latency wifi */
+  if (strncmp(name, "awdl", 4) == 0)
+    return 0; /* Apple Wireless Direct Link */
+
+  /* Windows specific */
+  if (strstr(name, "Loopback") != NULL)
+    return 0;
+  if (strstr(name, "vEthernet") != NULL)
+    return 0;
+  if (strstr(name, "Wintun") != NULL)
+    return 0;
+
+  return 1;
+}
+
 static void generate_update(const ifmon_list_t *prev, const ifmon_list_t *curr,
                             int is_initial, ifmon_update_t *up) {
   memset(up, 0, sizeof(ifmon_update_t));
@@ -250,6 +285,8 @@ int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
                          iface->hw_addr);
             }
           }
+          if (!is_iface_allowed(iface->name))
+            continue;
           list->count++;
         }
       }
@@ -419,6 +456,8 @@ int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
           iface->name[nlen] = '\0';
           format_mac((uint8_t *)LLADDR(sdl), sdl->sdl_alen, iface->hw_addr);
         }
+        if (!is_iface_allowed(iface->name))
+          continue;
         list->count++;
       }
     } else if (rtm->rtm_type == RTM_NEWADDR) {
@@ -544,6 +583,9 @@ int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
 
       format_mac(curr->PhysicalAddress, curr->PhysicalAddressLength,
                  iface->hw_addr);
+
+      if (!is_iface_allowed(iface->name))
+        continue;
 
       for (IP_ADAPTER_UNICAST_ADDRESS *unicast = curr->FirstUnicastAddress;
            unicast != NULL; unicast = unicast->Next) {
