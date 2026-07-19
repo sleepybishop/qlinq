@@ -150,7 +150,8 @@ struct transport_t {
 
   /* stream open callback payload */
   quicly_stream_open_t stream_open;
-  ptls_verify_certificate_t verifier;
+  ptls_openssl_verify_certificate_t verifier;
+  bool verifier_initialized;
   quicly_receive_datagram_frame_t receive_datagram;
 
   /* sent object history cache for NACK retransmissions */
@@ -1116,6 +1117,11 @@ static int load_certificate_and_key(ptls_context_t *tlsctx,
                                     ptls_openssl_sign_certificate_t *sign_cert,
                                     const char *cert_file,
                                     const char *key_file) {
+  if (!cert_file || !key_file) {
+    fprintf(stderr, "certificate file and key file are required\n");
+    return -1;
+  }
+
   if (ptls_load_certificates(tlsctx, (char *)cert_file) != 0) {
     fprintf(stderr, "failed to load certificates\n");
     return -1;
@@ -1294,9 +1300,8 @@ transport_t *transport_create(const transport_config_t *config) {
   t->tls_ctx.cipher_suites = ptls_openssl_cipher_suites;
 
   t->stream_open.cb = on_stream_open;
-  t->verifier.cb = verify_certificate_cb;
-  t->verifier.algos = verify_algos;
   t->receive_datagram.cb = on_receive_datagram_frame;
+  t->verifier_initialized = false;
 
   t->quic_ctx = quicly_spec_context;
 
@@ -1355,13 +1360,52 @@ transport_t *transport_create(const transport_config_t *config) {
     fcntl(t->fds[i], F_SETFL, flags | O_NONBLOCK);
   }
 
-  if (t->is_server) {
+  if (t->is_server || (config->cert_file && config->key_file)) {
     if (load_certificate_and_key(&t->tls_ctx, &t->sign_cert, config->cert_file,
                                  config->key_file) != 0)
       return NULL;
-  } else {
-    t->tls_ctx.verify_certificate = &t->verifier;
+  }
 
+  if (config->verify_peer) {
+    X509_STORE *store = NULL;
+    if (config->ca_file) {
+      store = X509_STORE_new();
+      if (X509_STORE_load_locations(store, config->ca_file, NULL) != 1) {
+        fprintf(stderr, "failed to load CA certificates from %s\n",
+                config->ca_file);
+        X509_STORE_free(store);
+        return NULL;
+      }
+    }
+
+    /* ptls_openssl_init_verify_certificate will take its own reference to store
+     * (if provided), or load the system default certificates if store is NULL
+     */
+    if (ptls_openssl_init_verify_certificate(&t->verifier, store) != 0) {
+      fprintf(stderr, "failed to initialize certificate verifier\n");
+      if (store) {
+        X509_STORE_free(store);
+      }
+      return NULL;
+    }
+    if (store) {
+      X509_STORE_free(store); /* drop our local reference */
+    }
+
+    t->tls_ctx.verify_certificate = &t->verifier.super;
+    t->verifier_initialized = true;
+
+    if (t->is_server) {
+      t->tls_ctx.require_client_authentication = 1;
+    }
+  } else {
+    t->verifier.super.cb = verify_certificate_cb;
+    t->verifier.super.algos = verify_algos;
+    t->tls_ctx.verify_certificate = &t->verifier.super;
+    t->verifier_initialized = false;
+  }
+
+  if (!t->is_server) {
     for (size_t i = 0; i < t->num_remote_addrs; i++) {
       if (strchr(config->remote_hosts[i], ':')) {
         struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&t->remote_addrs[i];
@@ -1474,6 +1518,10 @@ void transport_destroy(transport_t *t) {
 
   if (t->fec_buf) {
     free(t->fec_buf);
+  }
+
+  if (t->verifier_initialized) {
+    ptls_openssl_dispose_verify_certificate(&t->verifier);
   }
 
   free(t);

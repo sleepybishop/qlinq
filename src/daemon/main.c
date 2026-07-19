@@ -186,6 +186,8 @@ int main(int argc, char **argv) {
 
   const char *cert_file = "t/assets/server.crt";
   const char *key_file = "t/assets/server.key";
+  const char *ca_file = NULL;
+  bool verify_peer = false;
   const char *socket_name = "bishlink-data";
 
   for (int i = 1; i < argc; i++) {
@@ -197,6 +199,10 @@ int main(int argc, char **argv) {
       cert_file = argv[++i];
     } else if (strcmp(argv[i], "--key") == 0 && i + 1 < argc) {
       key_file = argv[++i];
+    } else if (strcmp(argv[i], "--ca") == 0 && i + 1 < argc) {
+      ca_file = argv[++i];
+    } else if (strcmp(argv[i], "--verify-peer") == 0) {
+      verify_peer = true;
     } else if ((strcmp(argv[i], "--socket") == 0 || strcmp(argv[i], "-s") == 0) && i + 1 < argc) {
       socket_name = argv[++i];
     } else if (strcmp(argv[i], "--peer") == 0 && i + 1 < argc) {
@@ -225,6 +231,8 @@ int main(int argc, char **argv) {
     config.bind_hosts[config.num_bind_hosts++] = listen_host;
     config.cert_file = cert_file;
     config.key_file = key_file;
+    config.ca_file = ca_file;
+    config.verify_peer = verify_peer;
     
     daemon_transport_ctx_t *tctx = &ctx.transports[ctx.num_transports];
     tctx->daemon = &ctx;
@@ -258,6 +266,10 @@ int main(int argc, char **argv) {
     config.port = port;
     config.remote_hosts[config.num_remote_hosts++] = peer_ip;
     config.bind_hosts[config.num_bind_hosts++] = "0.0.0.0";
+    config.cert_file = cert_file;
+    config.key_file = key_file;
+    config.ca_file = ca_file;
+    config.verify_peer = verify_peer;
     
     daemon_transport_ctx_t *tctx = &ctx.transports[ctx.num_transports];
     tctx->daemon = &ctx;

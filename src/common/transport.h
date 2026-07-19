@@ -87,6 +87,8 @@ typedef struct {
   uint16_t port;
   const char *cert_file; /* required for server */
   const char *key_file;  /* required for server */
+  const char *ca_file;   /* CA bundle path for validating peer certificates */
+  bool verify_peer;      /* require and verify peer certificate (mTLS) */
   transport_callback_t callback;
   void *user_data;
   uint8_t simulated_loss_rate; /* 0 to 100 representing percentage of packets to
