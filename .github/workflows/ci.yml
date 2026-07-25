@@ -14,7 +14,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpulse-dev libx11-dev libxext-dev libssl-dev
+          sudo apt-get install -y libssl-dev
 
       - name: Configure loopback aliases
         run: |
@@ -26,11 +26,6 @@ jobs:
           sudo ip addr add 127.0.2.2/32 dev lo
           sudo ip addr add 127.0.3.2/32 dev lo
           sudo ip addr add 127.0.4.2/32 dev lo
-
-      - name: Generate test certificates
-        run: |
-          mkdir -p t/assets
-          openssl req -x509 -newkey rsa:2048 -keyout t/assets/server.key -out t/assets/server.crt -sha256 -days 365 -nodes -subj "/CN=localhost"
 
       - name: Run tests
         run: make check
