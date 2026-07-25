@@ -85,47 +85,43 @@ t/%.o: t/%.c
 deps/%.o: deps/%.c
 	$(CC) $(INCLUDES) $(CFLAGS) -w -c $< -o $@
 
-all: patch-quicly qlinqd qlinq-tund
+all: qlinqd qlinq-tund
 
-patch-quicly:
-
-unpatch-quicly:
-
-qlinqd: patch-quicly $(DAEMON_OBJS)
+qlinqd: $(DAEMON_OBJS)
 	$(CC) -o $@ $(DAEMON_OBJS) $(LDFLAGS)
 
 qlinq-tund: src/host/linux/tund.c
 	$(CC) $(CFLAGS_COMMON) $(INCLUDES) -o $@ src/host/linux/tund.c
 
-examples/data_multipath_benchmark: patch-quicly examples/data_multipath_benchmark.o $(COMMON_OBJS)
+examples/data_multipath_benchmark: examples/data_multipath_benchmark.o $(COMMON_OBJS)
 	$(CC) -o $@ examples/data_multipath_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
 
 t/00util/test_fec: t/00util/test_fec.o $(FEC_OBJS)
 	$(CC) -o $@ t/00util/test_fec.o $(FEC_OBJS) $(LDFLAGS)
 
-t/00util/test_transport: patch-quicly t/00util/test_transport.o $(COMMON_OBJS)
+t/00util/test_transport: t/00util/test_transport.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_transport.o $(COMMON_OBJS) $(LDFLAGS)
 
-t/00util/test_tund: patch-quicly t/00util/test_tund.o $(COMMON_OBJS)
+t/00util/test_tund: t/00util/test_tund.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_tund.o $(COMMON_OBJS) $(LDFLAGS)
 
-t/00util/test_benchmark: patch-quicly t/00util/test_benchmark.o $(COMMON_OBJS)
+t/00util/test_benchmark: t/00util/test_benchmark.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
 
-t/00util/test_tc_benchmark: patch-quicly t/00util/test_tc_benchmark.o $(COMMON_OBJS)
+t/00util/test_tc_benchmark: t/00util/test_tc_benchmark.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_tc_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
 
-t/00util/test_multipath: patch-quicly t/00util/test_multipath.o $(COMMON_OBJS)
+t/00util/test_multipath: t/00util/test_multipath.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_multipath.o $(COMMON_OBJS) $(LDFLAGS)
 
 benchmark: t/00util/test_benchmark
 	./t/00util/test_benchmark
 
-clean: unpatch-quicly
+clean: 
 	rm -f qlinqd qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_multipath t/00util/test_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 
-check: patch-quicly qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_multipath gencerts
+check: qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_multipath gencerts
 	prove -I. -v t/*.t
 
 t/assets/server.crt t/assets/server.key:
@@ -137,4 +133,4 @@ gencerts: t/assets/server.crt t/assets/server.key
 indent:
 	clang-format -style=LLVM -i src/common/*.c src/common/*.h src/host/linux/*.c examples/*.c t/00util/*.c
 
-.PHONY: all clean check patch-quicly unpatch-quicly benchmark indent gencerts
+.PHONY: all clean check benchmark indent gencerts

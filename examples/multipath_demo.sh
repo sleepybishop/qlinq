@@ -5,7 +5,7 @@ set -e
 
 # Compile the benchmark
 echo "Compiling data multipath benchmark..."
-make examples/data_multipath_benchmark
+make examples/data_multipath_benchmark gencerts
 
 # Run the benchmark in an unshared user/network namespace
 echo "Entering isolated namespace for multipath setup..."
