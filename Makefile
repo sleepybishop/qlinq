@@ -1,4 +1,4 @@
-# Makefile for bishlink
+# Makefile for qlinq
 
 CC = gcc
 ARCH = $(shell uname -m)
@@ -85,16 +85,16 @@ t/%.o: t/%.c
 deps/%.o: deps/%.c
 	$(CC) $(INCLUDES) $(CFLAGS) -w -c $< -o $@
 
-all: patch-quicly bishlinkd bishlink-tund
+all: patch-quicly qlinqd qlinq-tund
 
 patch-quicly:
 
 unpatch-quicly:
 
-bishlinkd: patch-quicly $(DAEMON_OBJS)
+qlinqd: patch-quicly $(DAEMON_OBJS)
 	$(CC) -o $@ $(DAEMON_OBJS) $(LDFLAGS)
 
-bishlink-tund: src/host/linux/tund.c
+qlinq-tund: src/host/linux/tund.c
 	$(CC) $(CFLAGS_COMMON) $(INCLUDES) -o $@ src/host/linux/tund.c
 
 examples/data_multipath_benchmark: patch-quicly examples/data_multipath_benchmark.o $(COMMON_OBJS)
@@ -122,10 +122,10 @@ benchmark: t/00util/test_benchmark
 	./t/00util/test_benchmark
 
 clean: unpatch-quicly
-	rm -f bishlinkd bishlink-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_multipath t/00util/test_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
+	rm -f qlinqd qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_multipath t/00util/test_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 
-check: patch-quicly bishlink-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_multipath gencerts
+check: patch-quicly qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_multipath gencerts
 	prove -I. -v t/*.t
 
 t/assets/server.crt t/assets/server.key:

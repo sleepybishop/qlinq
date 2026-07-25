@@ -169,7 +169,7 @@ int main(int argc, char **argv) {
   /* Rest of main remains unchanged... */
   setvbuf(stdout, NULL, _IONBF, 0);
   setvbuf(stderr, NULL, _IONBF, 0);
-  printf("starting bishlinkd peer mesh daemon...\n");
+  printf("starting qlinqd peer mesh daemon...\n");
 
   if (portable_socket_init() != 0) {
       fprintf(stderr, "failed to initialize sockets\n");
@@ -188,7 +188,7 @@ int main(int argc, char **argv) {
   const char *key_file = "t/assets/server.key";
   const char *ca_file = NULL;
   bool verify_peer = false;
-  const char *socket_name = "bishlink-data";
+  const char *socket_name = "qlinq-data";
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {

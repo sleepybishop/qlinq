@@ -1,10 +1,6 @@
 # Compiled binaries and intermediate build files
-bishlink-host
-bishlink-client
-bishlink-inputd
-bishlink-videod
-bishlink-audiod
-bishlink-tund
+qlinqd
+qlinq-tund
 t/00util/test_fec
 t/00util/test_transport
 t/00util/test_uds

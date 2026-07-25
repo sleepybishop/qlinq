@@ -189,7 +189,7 @@ static void run_benchmark(uint8_t loss_rate, moq_track_type_t track_type,
 int main(void) {
   srand(time(NULL));
 
-  printf("\n=================================== BISHLINK BENCHMARK REPORT "
+  printf("\n=================================== QLINQ BENCHMARK REPORT "
          "===================================\n");
   printf("| Type | Track            | Loss%% | Objects Sent | Delivery Rate | "
          "Avg Latency (RTT/2) |\n");

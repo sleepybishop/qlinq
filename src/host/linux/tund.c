@@ -34,7 +34,7 @@
 
 static bool mock_mode = false;
 static char dev_name[IFNAMSIZ] = "tun0";
-static char socket_name[128] = "bishlink-data";
+static char socket_name[128] = "qlinq-data";
 static char ip_addr[64] = "10.8.0.1/24";
 static uint8_t tund_priority = 1;
 static char track_name[64] = "";
@@ -339,7 +339,7 @@ int main(int argc, char **argv) {
   }
 
   printf(
-      "initializing bishlink tund (socket=%s interface=%s ip=%s mock=%s)...\n",
+      "initializing qlinq tund (socket=%s interface=%s ip=%s mock=%s)...\n",
       socket_name, dev_name, ip_addr, mock_mode ? "true" : "false");
 
   int tun_fd = -1;
@@ -363,7 +363,7 @@ int main(int argc, char **argv) {
   int uds_fd = -1;
 
   while (1) {
-    /* self-healing connection to bishlink UDS data socket */
+    /* self-healing connection to qlinq UDS data socket */
     if (uds_fd == -1) {
       uds_fd = socket(AF_UNIX, SOCK_STREAM, 0);
       if (uds_fd >= 0) {
@@ -388,7 +388,7 @@ int main(int argc, char **argv) {
           usleep(500 * 1000);
           continue;
         }
-        printf("connected to bishlink data socket\n");
+        printf("connected to qlinq data socket\n");
       }
     }
 

@@ -140,9 +140,9 @@ int main(void) {
 
   /* 3. setup UDS data pipes */
   server_ctx.data_pipe =
-      data_uds_create("bishlink-data", on_uds_packet, NULL, &server_ctx);
+      data_uds_create("qlinq-data", on_uds_packet, NULL, &server_ctx);
   client_ctx.data_pipe =
-      data_uds_create("bishlink-data-client", on_uds_packet, NULL, &client_ctx);
+      data_uds_create("qlinq-data-client", on_uds_packet, NULL, &client_ctx);
 
   /* 4. loop transport ticks until connected and subscribed */
   printf("connecting loopback QUIC sockets...\n");
@@ -164,8 +164,8 @@ int main(void) {
     close(log_fd);
 
     char *args[] = {
-        "./bishlink-tund", "--mock",     "--socket",    "bishlink-data", "-i",
-        "tun-host",        "-a",         "10.8.0.1/24", "--priority",    "high",
+        "./qlinq-tund",    "--mock",   "--socket", "qlinq-data", "-i",
+        "tun-host",        "-a",       "10.8.0.1/24", "--priority", "high",
         "--track",         "test-track", NULL};
     execv(args[0], args);
     exit(1);
@@ -178,10 +178,10 @@ int main(void) {
     dup2(log_fd, STDOUT_FILENO);
     close(log_fd);
 
-    char *args[] = {"./bishlink-tund",
+    char *args[] = {"./qlinq-tund",
                     "--mock",
                     "--socket",
-                    "bishlink-data-client",
+                    "qlinq-data-client",
                     "-i",
                     "tun-client",
                     "-a",
