@@ -1,6 +1,7 @@
 /* examples/data_multipath_benchmark.c */
 
 #include "transport.h"
+#include <arpa/inet.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -67,11 +68,26 @@ static void on_client_event(void *user_data, const transport_event_t *event) {
     break;
   case TRANSPORT_EVENT_OBJECT:
     if (strcmp(event->track_id.name, "data_benchmark") == 0) {
-      uint64_t fid = event->object.object_id;
-      if (fid < MAX_PACKETS) {
-        state->packets[fid].recv_time = get_time_ms();
-        state->packets[fid].arrived = true;
-        state->frames_received++;
+      size_t remaining = event->object.size;
+      const uint8_t *ptr = event->object.data;
+      while (remaining >= 2) {
+        uint16_t pkt_len;
+        memcpy(&pkt_len, ptr, 2);
+        pkt_len = ntohs(pkt_len);
+        if (remaining < 2 + (size_t)pkt_len) {
+          break;
+        }
+        if (pkt_len >= sizeof(uint64_t)) {
+          uint64_t fid;
+          memcpy(&fid, ptr + 2, sizeof(uint64_t));
+          if (fid < MAX_PACKETS) {
+            state->packets[fid].recv_time = get_time_ms();
+            state->packets[fid].arrived = true;
+            state->frames_received++;
+          }
+        }
+        ptr += 2 + pkt_len;
+        remaining -= 2 + pkt_len;
       }
     }
     break;
@@ -231,10 +247,15 @@ int main(int argc, char **argv) {
     }
 
     client_state.packets[f].send_time = get_time_ms();
+
+    uint64_t *payload_fid = (uint64_t *)frame_payload;
+    *payload_fid = f;
+
     moq_object_t obj = {
         .track_id = track,
         .group_id = 0,
         .object_id = f,
+        .priority = 2,
         .data = frame_payload,
         .size = PACKET_SIZE,
         .is_keyframe = (f % 30 == 0) /* keyframe every 30 packets */

@@ -83,7 +83,7 @@ t/%.o: t/%.c
 
 # Rule to compile third-party deps and suppress all warnings with -w
 deps/%.o: deps/%.c
-	$(CC) $(INCLUDES) $(CFLAGS) -w -c $< -o $@
+	$(CC) $(CFLAGS_COMMON) $(INCLUDES) $(CFLAGS) -w -c $< -o $@
 
 all: qlinqd qlinq-tund
 

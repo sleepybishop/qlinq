@@ -949,10 +949,12 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   uint16_t symbol_size = be16toh(hdr->symbol_size);
   uint32_t original_size = be32toh(hdr->original_size);
 
-  if (total_symbols > 16384 || symbol_size > 4096 || data_symbols > total_symbols)
+  if (total_symbols > 16384 || symbol_size > 4096 ||
+      data_symbols > total_symbols)
     return;
 
-  if (original_size > (uint32_t)data_symbols * symbol_size || original_size == 0)
+  if (original_size > (uint32_t)data_symbols * symbol_size ||
+      original_size == 0)
     return;
 
   if (payload.len < sizeof(fec_packet_header_t) + symbol_size)
@@ -978,7 +980,8 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     if (a->total_symbols > 0 && a->track_id == track_id &&
         a->group_id == group_id && a->object_id == object_id) {
       if (a->symbol_size != symbol_size || a->total_symbols != total_symbols ||
-          a->data_symbols != data_symbols || a->original_size != original_size) {
+          a->data_symbols != data_symbols ||
+          a->original_size != original_size) {
         return; /* malformed or malicious packet */
       }
       asm_slot = a;
@@ -1663,6 +1666,30 @@ void transport_tick(transport_t *t) {
     while (read(t->ifmon_pipe[0], &msg, sizeof(msg)) == sizeof(msg)) {
       if (msg.is_added) {
         if (t->num_fds < TRANSPORT_MAX_PATHS) {
+          /* Deduplicate: Check if this IP is already bound */
+          int is_duplicate = 0;
+          for (size_t i = 0; i < t->num_fds; i++) {
+            if (t->local_addrs[i].ss_family == msg.addr.ss_family) {
+              if (msg.addr.ss_family == AF_INET) {
+                struct sockaddr_in *s1 =
+                    (struct sockaddr_in *)&t->local_addrs[i];
+                struct sockaddr_in *s2 = (struct sockaddr_in *)&msg.addr;
+                if (s1->sin_addr.s_addr == s2->sin_addr.s_addr)
+                  is_duplicate = 1;
+              } else if (msg.addr.ss_family == AF_INET6) {
+                struct sockaddr_in6 *s1 =
+                    (struct sockaddr_in6 *)&t->local_addrs[i];
+                struct sockaddr_in6 *s2 = (struct sockaddr_in6 *)&msg.addr;
+                if (memcmp(&s1->sin6_addr, &s2->sin6_addr,
+                           sizeof(struct in6_addr)) == 0)
+                  is_duplicate = 1;
+              }
+            }
+          }
+          if (is_duplicate) {
+            continue;
+          }
+
           /* Check if the new IP address matches the client/server side of the
            * initially bound IP address */
           if (msg.addr.ss_family == AF_INET &&
@@ -2371,7 +2398,13 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
       target_reliability = 99;
     }
 
-    pathflow_optimize(t->num_fds, data_symbols, paths_array,
+    static _Thread_local pathflow_context_t *pathflow_ctx = NULL;
+    if (!pathflow_ctx) {
+      pathflow_ctx = calloc(1, sizeof(pathflow_context_t));
+    }
+    pathflow_ctx->offset = 0;
+
+    pathflow_optimize(pathflow_ctx, t->num_fds, data_symbols, paths_array,
                       FP_FROM_FLOAT(10.0f), target_reliability,
                       PATHFLOW_SOLVER_GREEDY);
 
