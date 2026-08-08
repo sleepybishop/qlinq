@@ -143,11 +143,14 @@ static void generate_update(const ifmon_list_t *prev, const ifmon_list_t *curr,
       }
     } else {
       int hw_changed = (strcmp(prev_if->hw_addr, curr_if->hw_addr) != 0);
+      int link_changed = (prev_if->is_up != curr_if->is_up);
 
       ifmon_iface_diff_t diff;
       memset(&diff, 0, sizeof(diff));
       diff.index = curr_if->index;
       diff.hw_addr_changed = hw_changed;
+      diff.link_state_changed = link_changed;
+      diff.is_up = curr_if->is_up;
 
       for (int c = 0; c < curr_if->addr_count; c++) {
         const ifmon_addr_t *ca = &curr_if->addrs[c];
@@ -195,7 +198,7 @@ static void generate_update(const ifmon_list_t *prev, const ifmon_list_t *curr,
         }
       }
 
-      if (hw_changed || diff.addrs_added_count > 0 ||
+      if (hw_changed || link_changed || diff.addrs_added_count > 0 ||
           diff.addrs_removed_count > 0) {
         if (up->modified_count < IFMON_MAX_INTERFACES) {
           up->modified[up->modified_count++] = diff;
@@ -272,6 +275,10 @@ int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
           ifmon_iface_t *iface = &list->ifaces[list->count];
           memset(iface, 0, sizeof(ifmon_iface_t));
           iface->index = ifi->ifi_index;
+          iface->is_up = ((ifi->ifi_flags & (IFF_UP | IFF_RUNNING)) ==
+                          (IFF_UP | IFF_RUNNING))
+                             ? 1
+                             : 0;
           strncpy(iface->hw_addr, "00:00:00:00:00:00", sizeof(iface->hw_addr));
 
           struct rtattr *rta = IFLA_RTA(ifi);
@@ -283,6 +290,12 @@ int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
             } else if (rta->rta_type == IFLA_ADDRESS) {
               format_mac((uint8_t *)RTA_DATA(rta), RTA_PAYLOAD(rta),
                          iface->hw_addr);
+            } else if (rta->rta_type == IFLA_OPERSTATE) {
+              uint8_t operstate = *(uint8_t *)RTA_DATA(rta);
+              if (operstate != 6 /* IF_OPER_UP */ &&
+                  operstate != 0 /* IF_OPER_UNKNOWN */) {
+                iface->is_up = 0;
+              }
             }
           }
           if (!is_iface_allowed(iface->name))

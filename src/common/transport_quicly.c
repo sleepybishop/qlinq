@@ -1224,6 +1224,35 @@ static void on_ifmon_update(const ifmon_update_t *update, void *userdata) {
 
   for (int i = 0; i < update->modified_count; i++) {
     const ifmon_iface_diff_t *diff = &update->modified[i];
+
+    if (diff->link_state_changed) {
+      for (int k = 0; k < update->interfaces->count; k++) {
+        const ifmon_iface_t *iface = &update->interfaces->ifaces[k];
+        if (iface->index == diff->index) {
+          for (int a_idx = 0; a_idx < iface->addr_count; a_idx++) {
+            const ifmon_addr_t *a = &iface->addrs[a_idx];
+            ifmon_pipe_msg_t msg = {0};
+            msg.index = diff->index;
+            msg.is_added = diff->is_up ? 1 : 0;
+            if (a->family == AF_INET) {
+              struct sockaddr_in *sin = (struct sockaddr_in *)&msg.addr;
+              sin->sin_family = AF_INET;
+              sin->sin_addr = a->ip.v4;
+              msg.addr_len = sizeof(*sin);
+            } else {
+              struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&msg.addr;
+              sin6->sin6_family = AF_INET6;
+              sin6->sin6_addr = a->ip.v6;
+              msg.addr_len = sizeof(*sin6);
+            }
+            ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
+            (void)w;
+          }
+          break;
+        }
+      }
+    }
+
     for (int j = 0; j < diff->addrs_added_count; j++) {
       const ifmon_addr_t *a = &diff->addrs_added[j];
       ifmon_pipe_msg_t msg = {0};

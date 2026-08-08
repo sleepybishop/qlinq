@@ -36,6 +36,7 @@ typedef struct ifmon_iface {
   uint32_t index;   /* platform interface index */
   char name[64];    /* interface name (null-terminated) */
   char hw_addr[18]; /* MAC as "AA:BB:CC:DD:EE:FF\0" */
+  int is_up;        /* 1 if interface is UP & RUNNING, 0 if link/carrier down */
   ifmon_addr_t addrs[IFMON_MAX_IPS_PER_IFACE];
   int addr_count;
 } ifmon_iface_t;
@@ -50,6 +51,8 @@ typedef struct ifmon_list {
 typedef struct ifmon_iface_diff {
   uint32_t index;
   int hw_addr_changed;
+  int link_state_changed; /* 1 if link state (is_up) changed */
+  int is_up;              /* new link state (1=UP, 0=DOWN) */
   ifmon_addr_t addrs_added[IFMON_MAX_IPS_PER_IFACE];
   int addrs_added_count;
   ifmon_addr_t addrs_removed[IFMON_MAX_IPS_PER_IFACE];
