@@ -4,6 +4,7 @@
 #include "rs.h"
 #include <nanorq_core.h>
 #include <nanorq_ops.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,11 +42,16 @@ fec_t *fec_create_ex(fec_type_t type, size_t data_symbols,
   f->symbol_size = symbol_size;
 
   if (type == FEC_REED_SOLOMON) {
+#ifndef _WIN32
+    static pthread_once_t rs_once = PTHREAD_ONCE_INIT;
+    pthread_once(&rs_once, reed_solomon_init);
+#else
     static bool rs_initialized = false;
     if (!rs_initialized) {
       reed_solomon_init();
       rs_initialized = true;
     }
+#endif
     f->rs = reed_solomon_new(data_symbols, parity_symbols);
     if (!f->rs) {
       free(f);

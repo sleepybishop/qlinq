@@ -8,11 +8,19 @@
 #include "portable_sockets.h"
 #include "transport.h"
 #include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+static volatile sig_atomic_t g_running = 1;
+
+static void handle_signal(int sig) {
+  (void)sig;
+  g_running = 0;
+}
 
 #define MAX_TRANSPORTS 16
 
@@ -189,7 +197,7 @@ static void daemon_tick(daemon_ctx_t *ctx) {
 /* run daemon loop driven by socket polling and quicly pacer timeouts */
 static void daemon_run(daemon_ctx_t *ctx) {
   printf("daemon is running. press ctrl+c to exit.\n");
-  while (ctx->running) {
+  while (ctx->running && g_running) {
     daemon_tick(ctx);
 
     int64_t now_ms = transport_get_time_ms();
@@ -234,12 +242,18 @@ static void daemon_run(daemon_ctx_t *ctx) {
       usleep(timeout_ms * 1000);
     }
   }
+  printf("\nshutting down daemon cleanly...\n");
 }
 
 int main(int argc, char **argv) {
-  /* Rest of main remains unchanged... */
   setvbuf(stdout, NULL, _IONBF, 0);
   setvbuf(stderr, NULL, _IONBF, 0);
+
+#ifndef _WIN32
+  signal(SIGINT, handle_signal);
+  signal(SIGTERM, handle_signal);
+#endif
+
   printf("starting qlinqd peer mesh daemon...\n");
 
   if (portable_socket_init() != 0) {

@@ -565,15 +565,16 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
 
       uint8_t alias = input.base[1];
       uint32_t group_id, object_id;
-      uint16_t missing_count;
+      uint16_t wire_missing_count;
       memcpy(&group_id, input.base + 2, 4);
       memcpy(&object_id, input.base + 6, 4);
-      memcpy(&missing_count, input.base + 10, 2);
+      memcpy(&wire_missing_count, input.base + 10, 2);
       group_id = be32toh(group_id);
       object_id = be32toh(object_id);
-      missing_count = be16toh(missing_count);
+      wire_missing_count = be16toh(wire_missing_count);
 
-      if (input.len < 12 + (size_t)missing_count * 2)
+      size_t nack_msg_len = 12 + (size_t)wire_missing_count * 2;
+      if (input.len < nack_msg_len)
         break;
 
       if (t->is_server && !conn->authenticated) {
@@ -581,8 +582,8 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
         break;
       }
 
-      if (missing_count > 256)
-        missing_count = 256;
+      uint16_t missing_count =
+          wire_missing_count > 256 ? 256 : wire_missing_count;
 
       moq_track_id_t resolved_track;
       if (find_subscription_by_alias(conn, alias, &resolved_track) == 0) {
@@ -608,68 +609,80 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
           uint8_t **data_blocks = calloc(data_symbols, sizeof(uint8_t *));
           uint8_t **parity_blocks = calloc(parity_symbols, sizeof(uint8_t *));
 
-          for (size_t i = 0; i < data_symbols; i++) {
-            data_blocks[i] = calloc(1, symbol_size);
-            size_t offset = i * symbol_size;
-            size_t chunk =
-                (offset < cached->size) ? (cached->size - offset) : 0;
-            if (chunk > symbol_size)
-              chunk = symbol_size;
-            if (chunk > 0) {
-              memcpy(data_blocks[i], cached->data + offset, chunk);
+          if (data_blocks && parity_blocks) {
+            bool alloc_failed = false;
+            for (size_t i = 0; i < data_symbols; i++) {
+              data_blocks[i] = calloc(1, symbol_size);
+              if (!data_blocks[i])
+                alloc_failed = true;
+              size_t offset = i * symbol_size;
+              size_t chunk =
+                  (offset < cached->size) ? (cached->size - offset) : 0;
+              if (chunk > symbol_size)
+                chunk = symbol_size;
+              if (chunk > 0 && data_blocks[i]) {
+                memcpy(data_blocks[i], cached->data + offset, chunk);
+              }
             }
+
+            for (size_t i = 0; i < parity_symbols; i++) {
+              parity_blocks[i] = calloc(1, symbol_size);
+              if (!parity_blocks[i])
+                alloc_failed = true;
+            }
+
+            if (!alloc_failed) {
+              fec_type_t fec_type =
+                  (total_symbols > 255) ? FEC_RAPTORQ : FEC_REED_SOLOMON;
+              fec_t *fec = get_cached_fec(t, fec_type, data_symbols,
+                                          parity_symbols, symbol_size);
+              if (fec) {
+                fec_encode(fec, (const uint8_t *const *)data_blocks,
+                           parity_blocks);
+              }
+
+              for (size_t i = 0; i < parity_symbols; i++) {
+                uint16_t s = data_symbols + i;
+
+                size_t pkt_len = sizeof(fec_packet_header_t) + symbol_size;
+                uint8_t pkt_buf[2048]; /* max datagram size */
+                fec_packet_header_t *hdr = (fec_packet_header_t *)pkt_buf;
+
+                hdr->track_id = alias;
+                hdr->is_keyframe = cached->is_keyframe ? 1 : 0;
+                hdr->priority = cached->priority;
+                hdr->group_id = htobe32((uint32_t)cached->group_id);
+                hdr->object_id = htobe32((uint32_t)cached->object_id);
+                hdr->symbol_index = htobe16((uint16_t)s);
+                hdr->total_symbols = htobe16((uint16_t)total_symbols);
+                hdr->data_symbols = htobe16((uint16_t)data_symbols);
+                hdr->symbol_size = htobe16((uint16_t)symbol_size);
+                hdr->original_size = htobe32((uint32_t)cached->size);
+                hdr->path_id = 0;
+                hdr->send_time_ns = htobe64(get_time_ns());
+
+                memcpy(pkt_buf + sizeof(fec_packet_header_t), parity_blocks[i],
+                       symbol_size);
+
+                ptls_iovec_t dgram = ptls_iovec_init(pkt_buf, pkt_len);
+                quicly_send_datagram_frames_path(conn->quic, 0, &dgram, 1);
+              }
+            }
+
+            for (size_t i = 0; i < data_symbols; i++) {
+              if (data_blocks[i])
+                free(data_blocks[i]);
+            }
+            for (size_t i = 0; i < parity_symbols; i++) {
+              if (parity_blocks[i])
+                free(parity_blocks[i]);
+            }
+            free(data_blocks);
+            free(parity_blocks);
           }
-
-          for (size_t i = 0; i < parity_symbols; i++) {
-            parity_blocks[i] = calloc(1, symbol_size);
-          }
-
-          fec_type_t fec_type =
-              (total_symbols > 255) ? FEC_RAPTORQ : FEC_REED_SOLOMON;
-          fec_t *fec = get_cached_fec(t, fec_type, data_symbols, parity_symbols,
-                                      symbol_size);
-          if (fec) {
-            fec_encode(fec, (const uint8_t *const *)data_blocks, parity_blocks);
-          }
-
-          for (size_t i = 0; i < parity_symbols; i++) {
-            uint16_t s = data_symbols + i;
-
-            size_t pkt_len = sizeof(fec_packet_header_t) + symbol_size;
-            uint8_t pkt_buf[2048]; /* max datagram size */
-            fec_packet_header_t *hdr = (fec_packet_header_t *)pkt_buf;
-
-            hdr->track_id = alias;
-            hdr->is_keyframe = cached->is_keyframe ? 1 : 0;
-            hdr->priority = cached->priority;
-            hdr->group_id = htobe32((uint32_t)cached->group_id);
-            hdr->object_id = htobe32((uint32_t)cached->object_id);
-            hdr->symbol_index = htobe16((uint16_t)s);
-            hdr->total_symbols = htobe16((uint16_t)total_symbols);
-            hdr->data_symbols = htobe16((uint16_t)data_symbols);
-            hdr->symbol_size = htobe16((uint16_t)symbol_size);
-            hdr->original_size = htobe32((uint32_t)cached->size);
-            hdr->path_id = 0;
-            hdr->send_time_ns = htobe64(get_time_ns());
-
-            memcpy(pkt_buf + sizeof(fec_packet_header_t), parity_blocks[i],
-                   symbol_size);
-
-            ptls_iovec_t dgram = ptls_iovec_init(pkt_buf, pkt_len);
-            quicly_send_datagram_frames_path(conn->quic, 0, &dgram, 1);
-          }
-
-          for (size_t i = 0; i < data_symbols; i++) {
-            free(data_blocks[i]);
-          }
-          for (size_t i = 0; i < parity_symbols; i++) {
-            free(parity_blocks[i]);
-          }
-          free(data_blocks);
-          free(parity_blocks);
         }
       }
-      quicly_streambuf_ingress_shift(stream, 12 + (size_t)missing_count * 2);
+      quicly_streambuf_ingress_shift(stream, nack_msg_len);
     } else {
       quicly_streambuf_ingress_shift(stream, 1);
     }
@@ -936,7 +949,10 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   uint16_t symbol_size = be16toh(hdr->symbol_size);
   uint32_t original_size = be32toh(hdr->original_size);
 
-  if (total_symbols > 16384 || symbol_size > 4096)
+  if (total_symbols > 16384 || symbol_size > 4096 || data_symbols > total_symbols)
+    return;
+
+  if (original_size > (uint32_t)data_symbols * symbol_size || original_size == 0)
     return;
 
   if (payload.len < sizeof(fec_packet_header_t) + symbol_size)
@@ -961,6 +977,10 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     frame_assembler_t *a = &tconn->assemblers[i];
     if (a->total_symbols > 0 && a->track_id == track_id &&
         a->group_id == group_id && a->object_id == object_id) {
+      if (a->symbol_size != symbol_size || a->total_symbols != total_symbols ||
+          a->data_symbols != data_symbols || a->original_size != original_size) {
+        return; /* malformed or malicious packet */
+      }
       asm_slot = a;
       break;
     }
@@ -1026,7 +1046,8 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   if (asm_slot->decoded)
     return;
 
-  if (symbol_index >= total_symbols)
+  if (symbol_index >= asm_slot->capacity_symbols ||
+      symbol_index >= total_symbols || symbol_index >= asm_slot->total_symbols)
     return;
 
   if (!asm_slot->received_mask[symbol_index]) {
@@ -1090,6 +1111,8 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
 
     if (success) {
       uint8_t *full_data = malloc(original_size);
+      if (!full_data)
+        return; /* out of memory */
       size_t bytes_left = original_size;
       for (size_t i = 0; i < data_symbols; i++) {
         size_t chunk = (bytes_left < symbol_size) ? bytes_left : symbol_size;
@@ -1386,15 +1409,19 @@ transport_t *transport_create(const transport_config_t *config) {
       t->local_addrs_len[i] = sizeof(struct sockaddr_in);
       t->fds[i] = socket(AF_INET, SOCK_DGRAM, 0);
     }
-    if (t->fds[i] < 0)
+    if (t->fds[i] < 0) {
+      transport_destroy(t);
       return NULL;
+    }
 
     int reuse = 1;
     setsockopt(t->fds[i], SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
     if (bind(t->fds[i], (struct sockaddr *)&t->local_addrs[i],
-             t->local_addrs_len[i]) != 0)
+             t->local_addrs_len[i]) != 0) {
+      transport_destroy(t);
       return NULL;
+    }
 
     configure_socket_buffers(t->fds[i]);
 
@@ -1404,8 +1431,10 @@ transport_t *transport_create(const transport_config_t *config) {
 
   if (t->is_server || (config->cert_file && config->key_file)) {
     if (load_certificate_and_key(&t->tls_ctx, &t->sign_cert, config->cert_file,
-                                 config->key_file) != 0)
+                                 config->key_file) != 0) {
+      transport_destroy(t);
       return NULL;
+    }
   }
 
   if (config->verify_peer) {
@@ -1416,6 +1445,7 @@ transport_t *transport_create(const transport_config_t *config) {
         fprintf(stderr, "failed to load CA certificates from %s\n",
                 config->ca_file);
         X509_STORE_free(store);
+        transport_destroy(t);
         return NULL;
       }
     }
@@ -1428,6 +1458,7 @@ transport_t *transport_create(const transport_config_t *config) {
       if (store) {
         X509_STORE_free(store);
       }
+      transport_destroy(t);
       return NULL;
     }
     if (store) {
@@ -1465,6 +1496,10 @@ transport_t *transport_create(const transport_config_t *config) {
     }
 
     transport_conn_t *conn = calloc(1, sizeof(transport_conn_t));
+    if (!conn) {
+      transport_destroy(t);
+      return NULL;
+    }
     conn->transport = t;
 
     int ret =
@@ -1472,8 +1507,11 @@ transport_t *transport_create(const transport_config_t *config) {
                        (struct sockaddr *)&t->remote_addrs[0],
                        (struct sockaddr *)&t->local_addrs[0], &t->next_cid,
                        ptls_iovec_init(NULL, 0), NULL, NULL, NULL);
-    if (ret != 0)
+    if (ret != 0) {
+      free(conn);
+      transport_destroy(t);
       return NULL;
+    }
 
     *quicly_get_data(conn->quic) = conn;
     t->client_conn = conn;

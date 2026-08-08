@@ -741,7 +741,7 @@ int ifmon_watch_start(ifmon_watcher_t *w, ifmon_callback_t cb, void *userdata) {
 }
 
 void ifmon_watch_stop(ifmon_watcher_t *w) {
-  if (!w)
+  if (!w || !w->running)
     return;
   w->running = 0;
   char c = 1;

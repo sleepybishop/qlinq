@@ -279,32 +279,35 @@ void data_uds_tick(data_uds_t *d) {
         uint8_t track_type = reg_hdr[0];
         uint8_t flags_val = reg_hdr[1];
         uint8_t name_len = reg_hdr[2];
-        char name[64];
-        size_t copy_len = (name_len < 63) ? name_len : 63;
-        if (read_exact_timeout(client_fd, name, name_len)) {
-          name[copy_len] = '\0';
-          int slot = -1;
-          for (int i = 0; i < MAX_UDS_CLIENTS; i++) {
-            if (!d->clients[i].active) {
-              slot = i;
-              break;
+        if (name_len > 63) {
+          CLOSE_SOCKET(client_fd);
+        } else {
+          char name[64];
+          if (read_exact_timeout(client_fd, name, name_len)) {
+            name[name_len] = '\0';
+            int slot = -1;
+            for (int i = 0; i < MAX_UDS_CLIENTS; i++) {
+              if (!d->clients[i].active) {
+                slot = i;
+                break;
+              }
             }
-          }
-          if (slot != -1) {
-            d->clients[slot].fd = client_fd;
-            d->clients[slot].track_id.type = (moq_track_type_t)track_type;
-            d->clients[slot].track_id.flags = flags_val;
-            strcpy(d->clients[slot].track_id.name, name);
-            d->clients[slot].active = true;
-            fprintf(stderr,
-                    "generic data UDS helper connected: track='%s', type=%d, "
-                    "flags=%d\n",
-                    name, track_type, flags_val);
+            if (slot != -1) {
+              d->clients[slot].fd = client_fd;
+              d->clients[slot].track_id.type = (moq_track_type_t)track_type;
+              d->clients[slot].track_id.flags = flags_val;
+              strcpy(d->clients[slot].track_id.name, name);
+              d->clients[slot].active = true;
+              fprintf(stderr,
+                      "generic data UDS helper connected: track='%s', type=%d, "
+                      "flags=%d\n",
+                      name, track_type, flags_val);
+            } else {
+              CLOSE_SOCKET(client_fd);
+            }
           } else {
             CLOSE_SOCKET(client_fd);
           }
-        } else {
-          CLOSE_SOCKET(client_fd);
         }
       } else {
         CLOSE_SOCKET(client_fd);
@@ -332,12 +335,20 @@ void data_uds_tick(data_uds_t *d) {
       } else if (!read_exact_timeout(client_fd, &priority, sizeof(priority))) {
         closed = true;
       } else {
-        if (payload_size > 0) {
+        if (payload_size > 16 * 1024 * 1024) { /* 16MB max payload safety cap */
+          closed = true;
+        } else if (payload_size > 0) {
           if (payload_size > d->payload_buf_capacity) {
-            d->payload_buf_capacity = payload_size;
-            d->payload_buf = realloc(d->payload_buf, payload_size);
+            uint8_t *new_buf = realloc(d->payload_buf, payload_size);
+            if (!new_buf) {
+              closed = true;
+            } else {
+              d->payload_buf = new_buf;
+              d->payload_buf_capacity = payload_size;
+            }
           }
-          if (!read_exact_timeout(client_fd, d->payload_buf, payload_size)) {
+          if (!closed &&
+              !read_exact_timeout(client_fd, d->payload_buf, payload_size)) {
             closed = true;
           }
         }
