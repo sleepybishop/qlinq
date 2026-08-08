@@ -979,8 +979,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     frame_assembler_t *a = &tconn->assemblers[i];
     if (a->total_symbols > 0 && a->track_id == track_id &&
         a->group_id == group_id && a->object_id == object_id) {
-      if (a->symbol_size != symbol_size || a->total_symbols != total_symbols ||
-          a->data_symbols != data_symbols ||
+      if (a->symbol_size != symbol_size || a->data_symbols != data_symbols ||
           a->original_size != original_size) {
         return; /* malformed or malicious packet */
       }
@@ -1049,8 +1048,15 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   if (asm_slot->decoded)
     return;
 
+  if (total_symbols > asm_slot->total_symbols) {
+    if (total_symbols > asm_slot->capacity_symbols) {
+      return;
+    }
+    asm_slot->total_symbols = total_symbols;
+  }
+
   if (symbol_index >= asm_slot->capacity_symbols ||
-      symbol_index >= total_symbols || symbol_index >= asm_slot->total_symbols)
+      symbol_index >= asm_slot->total_symbols)
     return;
 
   if (!asm_slot->received_mask[symbol_index]) {
