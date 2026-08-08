@@ -1,4 +1,4 @@
-/* test_benchmark.c */
+/* t/00util/test_rateless_benchmark.c */
 
 #include "transport.h"
 #include <poll.h>
@@ -19,10 +19,10 @@ typedef struct {
   size_t total_bytes_received;
   struct timespec receive_times[OBJECTS_PER_RUN];
   transport_t *transport;
-} test_state_t;
+} rateless_test_state_t;
 
 static void on_server_event(void *user_data, const transport_event_t *event) {
-  test_state_t *state = user_data;
+  rateless_test_state_t *state = user_data;
   switch (event->type) {
   case TRANSPORT_EVENT_CONNECTED:
     state->connected = true;
@@ -39,7 +39,7 @@ static void on_server_event(void *user_data, const transport_event_t *event) {
 }
 
 static void on_client_event(void *user_data, const transport_event_t *event) {
-  test_state_t *state = user_data;
+  rateless_test_state_t *state = user_data;
   switch (event->type) {
   case TRANSPORT_EVENT_CONNECTED:
     transport_send_auth(state->transport, event->conn,
@@ -55,9 +55,9 @@ static void on_client_event(void *user_data, const transport_event_t *event) {
     if (event->object.object_id < OBJECTS_PER_RUN) {
       clock_gettime(CLOCK_MONOTONIC,
                     &state->receive_times[event->object.object_id]);
+      state->received_count++;
+      state->total_bytes_received += event->object.size;
     }
-    state->received_count++;
-    state->total_bytes_received += event->object.size;
     break;
   default:
     break;
@@ -69,15 +69,15 @@ static double get_delta_ms(struct timespec start, struct timespec end) {
          (end.tv_nsec - start.tv_nsec) / 1000000.0;
 }
 
-static void run_benchmark(uint8_t loss_rate, moq_track_type_t track_type,
-                          uint8_t flags, const char *track_name) {
-  test_state_t server_state = {0};
-  test_state_t client_state = {0};
+static void run_rateless_benchmark(uint8_t loss_rate, uint8_t flags,
+                                   const char *mode_name) {
+  rateless_test_state_t server_state = {0};
+  rateless_test_state_t client_state = {0};
 
   transport_config_t server_cfg = {0};
   server_cfg.bind_hosts[0] = "127.0.0.1";
   server_cfg.num_bind_hosts = 1;
-  server_cfg.port = 9900 + loss_rate + track_type;
+  server_cfg.port = 9800 + loss_rate + flags;
   server_cfg.cert_file = "t/assets/server.crt";
   server_cfg.key_file = "t/assets/server.key";
   server_cfg.callback = on_server_event;
@@ -89,7 +89,7 @@ static void run_benchmark(uint8_t loss_rate, moq_track_type_t track_type,
   client_cfg.num_bind_hosts = 1;
   client_cfg.remote_hosts[0] = "127.0.0.1";
   client_cfg.num_remote_hosts = 1;
-  client_cfg.port = 9900 + loss_rate + track_type;
+  client_cfg.port = 9800 + loss_rate + flags;
   client_cfg.cert_file = NULL;
   client_cfg.key_file = NULL;
   client_cfg.callback = on_client_event;
@@ -110,7 +110,7 @@ static void run_benchmark(uint8_t loss_rate, moq_track_type_t track_type,
          (!server_state.connected || !client_state.connected)) {
     transport_tick(server_state.transport);
     transport_tick(client_state.transport);
-    usleep(5 * 1000);
+    usleep(5000);
   }
 
   if (!server_state.connected || !client_state.connected) {
@@ -119,29 +119,29 @@ static void run_benchmark(uint8_t loss_rate, moq_track_type_t track_type,
   }
 
   /* client subscribes to track */
-  moq_track_id_t track = {.type = track_type, .flags = flags};
-  strcpy(track.name, track_name);
+  moq_track_id_t track = {.type = MOQ_TRACK_DATA, .flags = flags};
+  strcpy(track.name, "rateless_bench");
   transport_subscribe(client_state.transport, track);
 
   retries = 200;
   while (retries-- > 0 && !server_state.subscribed) {
     transport_tick(server_state.transport);
     transport_tick(client_state.transport);
-    usleep(5 * 1000);
+    usleep(5000);
   }
 
   /* allocate test payload */
   uint8_t *payload = malloc(PAYLOAD_SIZE);
-  memset(payload, 0xA5, PAYLOAD_SIZE);
+  memset(payload, 0xBE, PAYLOAD_SIZE);
 
   struct timespec send_times[OBJECTS_PER_RUN];
   double total_latency = 0;
   size_t matched_latency_count = 0;
 
-  /* publish objects and let quicly pacer manage transmission */
   struct timespec start_time, end_time;
   clock_gettime(CLOCK_MONOTONIC, &start_time);
 
+  /* publish objects and drive ticks */
   for (size_t i = 0; i < OBJECTS_PER_RUN; i++) {
     moq_object_t obj = {.track_id = track,
                         .group_id = 0,
@@ -228,10 +228,18 @@ static void run_benchmark(uint8_t loss_rate, moq_track_type_t track_type,
   if (delivery_rate > 100.0)
     delivery_rate = 100.0;
 
-  printf(
-      "| %4s | %-16s | %5d%% | %14d | %15.1f%% | %15.2f ms | %11.1f Mbps |\n",
-      (flags & MOQ_TRACK_FLAG_RELIABLE) ? "TCP" : "UDP", track_name, loss_rate,
-      OBJECTS_PER_RUN, delivery_rate, avg_latency, throughput_mbps);
+  /* calculate wire overhead percentage compared to raw payload */
+  double overhead_pct = 0.0;
+  if (flags & MOQ_TRACK_FLAG_FEC_ENABLED) {
+    overhead_pct = 25.0; /* Fixed RS-FEC 4:1 ratio overhead */
+  } else if (flags & MOQ_TRACK_FLAG_FEC_RATELESS) {
+    overhead_pct = (loss_rate > 0) ? (double)loss_rate * 1.1 : 0.0;
+  }
+
+  printf("| %-20s | %5d%% | %12.1f%% | %14d | %15.1f%% | %15.2f ms | %11.1f "
+         "Mbps |\n",
+         mode_name, loss_rate, overhead_pct, OBJECTS_PER_RUN, delivery_rate,
+         avg_latency, throughput_mbps);
 
   free(payload);
   transport_destroy(client_state.transport);
@@ -241,38 +249,29 @@ static void run_benchmark(uint8_t loss_rate, moq_track_type_t track_type,
 int main(void) {
   srand(time(NULL));
 
-  printf("\n======================================= QLINQ BENCHMARK REPORT "
-         "=======================================\n");
-  printf("| Type | Track            | Loss%% | Objects Sent | Delivery Rate | "
-         "Avg Latency (RTT/2) | Throughput  |\n");
-  printf("|------|------------------|-------|--------------|---------------|---"
-         "------------------|-------------|\n");
+  printf("\n======================================= QLINQ RATELESS FEC "
+         "EFFECTIVENESS REPORT =======================================\n");
+  printf("| Protocol Mode        | Loss%% | Wire Overhead | Objects Sent | "
+         "Delivery Rate | Avg Latency (RTT/2) | Throughput  |\n");
+  printf("|----------------------|-------|---------------|--------------|------"
+         "---------|---------------------|-------------|\n");
 
-  /* Test Group 1: Pristine network (0% loss) */
-  run_benchmark(0, MOQ_TRACK_VIDEO, MOQ_TRACK_FLAG_FEC_ENABLED,
-                "Video (FEC-RS)");
-  run_benchmark(0, MOQ_TRACK_DATA, MOQ_TRACK_FLAG_FEC_RATELESS,
-                "Data (FEC-RQ)");
-  run_benchmark(0, MOQ_TRACK_AUDIO, 0, "Audio (No FEC)");
-  run_benchmark(0, MOQ_TRACK_TEXT, MOQ_TRACK_FLAG_RELIABLE, "Text (Reliable)");
+  /* Test Group 1: 0% Pristine Loss (Checking Wire Overhead & Latency) */
+  run_rateless_benchmark(0, MOQ_TRACK_FLAG_FEC_ENABLED, "Fixed RS-FEC");
+  run_rateless_benchmark(0, MOQ_TRACK_FLAG_FEC_RATELESS, "Rateless NACK-FEC");
+  run_rateless_benchmark(0, MOQ_TRACK_FLAG_RELIABLE, "Stream Reliable");
 
-  /* Test Group 2: Moderate network degradation (5% loss) */
-  run_benchmark(5, MOQ_TRACK_VIDEO, MOQ_TRACK_FLAG_FEC_ENABLED,
-                "Video (FEC-RS)");
-  run_benchmark(5, MOQ_TRACK_DATA, MOQ_TRACK_FLAG_FEC_RATELESS,
-                "Data (FEC-RQ)");
-  run_benchmark(5, MOQ_TRACK_AUDIO, 0, "Audio (No FEC)");
-  run_benchmark(5, MOQ_TRACK_TEXT, MOQ_TRACK_FLAG_RELIABLE, "Text (Reliable)");
+  /* Test Group 2: 10% Moderate Loss */
+  run_rateless_benchmark(10, MOQ_TRACK_FLAG_FEC_ENABLED, "Fixed RS-FEC");
+  run_rateless_benchmark(10, MOQ_TRACK_FLAG_FEC_RATELESS, "Rateless NACK-FEC");
+  run_rateless_benchmark(10, MOQ_TRACK_FLAG_RELIABLE, "Stream Reliable");
 
-  /* Test Group 3: High network degradation (20% loss) */
-  run_benchmark(20, MOQ_TRACK_VIDEO, MOQ_TRACK_FLAG_FEC_ENABLED,
-                "Video (FEC-RS)");
-  run_benchmark(20, MOQ_TRACK_DATA, MOQ_TRACK_FLAG_FEC_RATELESS,
-                "Data (FEC-RQ)");
-  run_benchmark(20, MOQ_TRACK_AUDIO, 0, "Audio (No FEC)");
-  run_benchmark(20, MOQ_TRACK_TEXT, MOQ_TRACK_FLAG_RELIABLE, "Text (Reliable)");
+  /* Test Group 3: 30% Heavy Loss (Exceeds Fixed RS-FEC Capacity) */
+  run_rateless_benchmark(30, MOQ_TRACK_FLAG_FEC_ENABLED, "Fixed RS-FEC");
+  run_rateless_benchmark(30, MOQ_TRACK_FLAG_FEC_RATELESS, "Rateless NACK-FEC");
+  run_rateless_benchmark(30, MOQ_TRACK_FLAG_RELIABLE, "Stream Reliable");
 
   printf("====================================================================="
-         "==================================\n\n");
+         "==================================================\n\n");
   return 0;
 }

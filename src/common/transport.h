@@ -30,12 +30,33 @@ typedef enum {
 
 #define MOQ_TRACK_FLAG_RELIABLE (1 << 0)
 #define MOQ_TRACK_FLAG_FEC_ENABLED (1 << 1)
+#define MOQ_TRACK_FLAG_FEC_RATELESS (1 << 2)
 
 typedef struct {
   moq_track_type_t type;
   uint8_t flags;
   char name[64];
 } moq_track_id_t;
+
+typedef enum {
+  MOQ_CTRL_MSG_NACK = 0x01,
+  MOQ_CTRL_MSG_ACK = 0x02,
+} moq_ctrl_msg_type_t;
+
+/* NACK control message struct */
+typedef struct __attribute__((packed)) {
+  uint8_t msg_type;
+  moq_track_id_t track_id;
+  uint64_t group_id;
+  uint16_t missing_count;
+} moq_nack_msg_t;
+
+/* ACK control message struct */
+typedef struct __attribute__((packed)) {
+  uint8_t msg_type;
+  moq_track_id_t track_id;
+  uint64_t group_id;
+} moq_ack_msg_t;
 
 /* represents an object (e.g. video frame or audio chunk) */
 typedef struct {
@@ -149,5 +170,17 @@ void transport_mock_iface_add(transport_t *t, const char *ip_addr);
 
 /* check if a track is ready for more data (application-layer backpressure) */
 bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id);
+
+/* get current time in milliseconds */
+int64_t transport_get_time_ms(void);
+
+/* query earliest timeout timestamp in milliseconds for pacer and timers */
+int64_t transport_get_first_timeout(transport_t *t);
+
+struct pollfd;
+
+/* collect socket file descriptors for polling */
+size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
+                              size_t max_fds);
 
 #endif /* TRANSPORT_H */

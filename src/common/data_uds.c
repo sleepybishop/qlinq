@@ -358,3 +358,28 @@ void data_uds_tick(data_uds_t *d) {
     }
   }
 }
+
+size_t data_uds_get_poll_fds(data_uds_t *d, struct pollfd *fds,
+                             size_t max_fds) {
+  if (!d || !fds)
+    return 0;
+
+  size_t count = 0;
+  if (d->listen_fd >= 0 && count < max_fds) {
+    fds[count].fd = d->listen_fd;
+    fds[count].events = POLLIN;
+    fds[count].revents = 0;
+    count++;
+  }
+
+  for (size_t i = 0; i < MAX_UDS_CLIENTS && count < max_fds; i++) {
+    if (d->clients[i].active && d->clients[i].fd >= 0 && count < max_fds) {
+      fds[count].fd = d->clients[i].fd;
+      fds[count].events = POLLIN;
+      fds[count].revents = 0;
+      count++;
+    }
+  }
+
+  return count;
+}

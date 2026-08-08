@@ -114,14 +114,23 @@ t/00util/test_tc_benchmark: t/00util/test_tc_benchmark.o $(COMMON_OBJS)
 t/00util/test_multipath: t/00util/test_multipath.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_multipath.o $(COMMON_OBJS) $(LDFLAGS)
 
+t/00util/test_multipath_nack: t/00util/test_multipath_nack.o $(COMMON_OBJS)
+	$(CC) -o $@ t/00util/test_multipath_nack.o $(COMMON_OBJS) $(LDFLAGS)
+
+t/00util/test_rateless_benchmark: t/00util/test_rateless_benchmark.o $(COMMON_OBJS)
+	$(CC) -o $@ t/00util/test_rateless_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
+
 benchmark: t/00util/test_benchmark
 	./t/00util/test_benchmark
 
+benchmark-rateless: t/00util/test_rateless_benchmark
+	./t/00util/test_rateless_benchmark
+
 clean: 
-	rm -f qlinqd qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_multipath t/00util/test_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
+	rm -f qlinqd qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 
-check: qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_multipath gencerts
+check: qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_multipath t/00util/test_multipath_nack gencerts
 	prove -I. -v t/*.t
 
 t/assets/server.crt t/assets/server.key:

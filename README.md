@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/sleepybishop/qlinq/actions/workflows/ci.yml/badge.svg)](https://github.com/sleepybishop/qlinq/actions/workflows/ci.yml)
 
-`qlinq` is a QUIC-based swiss army knife for different types of data streams. It combines a high-performance network link path manager with forward error correction and provides interfaces via tun devices or unix sockets.
+`qlinq` ("clink") is a QUIC-based swiss army knife for different types of data streams. It combines a high-performance network link path manager with forward error correction and provides interfaces via tun devices or unix sockets.
 
 ## Features
 

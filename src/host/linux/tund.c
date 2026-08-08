@@ -338,9 +338,8 @@ int main(int argc, char **argv) {
     snprintf(track_name, sizeof(track_name), "tund/%s", dev_name);
   }
 
-  printf(
-      "initializing qlinq tund (socket=%s interface=%s ip=%s mock=%s)...\n",
-      socket_name, dev_name, ip_addr, mock_mode ? "true" : "false");
+  printf("initializing qlinq tund (socket=%s interface=%s ip=%s mock=%s)...\n",
+         socket_name, dev_name, ip_addr, mock_mode ? "true" : "false");
 
   int tun_fd = -1;
   if (mock_mode) {

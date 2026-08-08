@@ -34,4 +34,9 @@ bool data_uds_send(data_uds_t *d, const moq_track_id_t *track_id,
 /* process listener and client fds in a non-blocking manner */
 void data_uds_tick(data_uds_t *d);
 
+struct pollfd;
+
+/* collect UDS file descriptors for polling */
+size_t data_uds_get_poll_fds(data_uds_t *d, struct pollfd *fds, size_t max_fds);
+
 #endif /* DATA_UDS_H */

@@ -164,9 +164,9 @@ int main(void) {
     close(log_fd);
 
     char *args[] = {
-        "./qlinq-tund",    "--mock",   "--socket", "qlinq-data", "-i",
-        "tun-host",        "-a",       "10.8.0.1/24", "--priority", "high",
-        "--track",         "test-track", NULL};
+        "./qlinq-tund", "--mock",     "--socket",    "qlinq-data", "-i",
+        "tun-host",     "-a",         "10.8.0.1/24", "--priority", "high",
+        "--track",      "test-track", NULL};
     execv(args[0], args);
     exit(1);
   }
@@ -178,19 +178,10 @@ int main(void) {
     dup2(log_fd, STDOUT_FILENO);
     close(log_fd);
 
-    char *args[] = {"./qlinq-tund",
-                    "--mock",
-                    "--socket",
-                    "qlinq-data-client",
-                    "-i",
-                    "tun-client",
-                    "-a",
-                    "10.8.0.2/24",
-                    "--priority",
-                    "low",
-                    "--track",
-                    "test-track",
-                    NULL};
+    char *args[] = {
+        "./qlinq-tund", "--mock",     "--socket",    "qlinq-data-client", "-i",
+        "tun-client",   "-a",         "10.8.0.2/24", "--priority",        "low",
+        "--track",      "test-track", NULL};
     execv(args[0], args);
     exit(1);
   }

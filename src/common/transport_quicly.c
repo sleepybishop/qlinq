@@ -35,9 +35,9 @@ static uint64_t get_time_ns(void) {
 }
 
 #define MAX_CONNECTIONS 32
-#define ASSEMBLER_CACHE_SIZE 16
+#define ASSEMBLER_CACHE_SIZE 128
 
-#define SENT_CACHE_SIZE 32
+#define SENT_CACHE_SIZE 256
 
 typedef struct {
   uint8_t track_id;
@@ -56,6 +56,7 @@ typedef struct {
   bool decoded;
   uint8_t priority;
   bool nack_sent;
+  int64_t last_nack_time_ms;
 } frame_assembler_t;
 
 #define ARENA_MAX_FALLBACKS 1024
@@ -269,6 +270,7 @@ struct transport_conn_t {
   /* incoming datagram assembler cache */
   frame_assembler_t assemblers[ASSEMBLER_CACHE_SIZE];
   size_t assembler_index;
+  uint32_t last_seen_object_id;
 };
 
 static int find_subscription_by_alias(const transport_conn_t *conn,
@@ -581,12 +583,6 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
 
       if (missing_count > 256)
         missing_count = 256;
-      uint16_t missing_indices[256];
-      for (uint16_t i = 0; i < missing_count; i++) {
-        uint16_t idx;
-        memcpy(&idx, input.base + 12 + i * 2, 2);
-        missing_indices[i] = be16toh(idx);
-      }
 
       moq_track_id_t resolved_track;
       if (find_subscription_by_alias(conn, alias, &resolved_track) == 0) {
@@ -605,8 +601,8 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
 
         if (cached) {
           size_t data_symbols = cached->data_symbols;
-          size_t total_symbols = cached->total_symbols;
-          size_t parity_symbols = total_symbols - data_symbols;
+          size_t parity_symbols = missing_count + 3;
+          size_t total_symbols = data_symbols + parity_symbols;
           size_t symbol_size = cached->symbol_size;
 
           uint8_t **data_blocks = calloc(data_symbols, sizeof(uint8_t *));
@@ -628,21 +624,16 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
             parity_blocks[i] = calloc(1, symbol_size);
           }
 
-          if (parity_symbols > 0) {
-            fec_type_t fec_type =
-                (total_symbols > 255) ? FEC_RAPTORQ : FEC_REED_SOLOMON;
-            fec_t *fec = get_cached_fec(t, fec_type, data_symbols,
-                                        parity_symbols, symbol_size);
-            if (fec) {
-              fec_encode(fec, (const uint8_t *const *)data_blocks,
-                         parity_blocks);
-            }
+          fec_type_t fec_type =
+              (total_symbols > 255) ? FEC_RAPTORQ : FEC_REED_SOLOMON;
+          fec_t *fec = get_cached_fec(t, fec_type, data_symbols, parity_symbols,
+                                      symbol_size);
+          if (fec) {
+            fec_encode(fec, (const uint8_t *const *)data_blocks, parity_blocks);
           }
 
-          for (size_t i = 0; i < missing_count; i++) {
-            uint16_t s = missing_indices[i];
-            if (s >= total_symbols)
-              continue;
+          for (size_t i = 0; i < parity_symbols; i++) {
+            uint16_t s = data_symbols + i;
 
             size_t pkt_len = sizeof(fec_packet_header_t) + symbol_size;
             uint8_t pkt_buf[2048]; /* max datagram size */
@@ -661,22 +652,19 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
             hdr->path_id = 0;
             hdr->send_time_ns = htobe64(get_time_ns());
 
-            if (s < data_symbols) {
-              memcpy(pkt_buf + sizeof(fec_packet_header_t), data_blocks[s],
-                     symbol_size);
-            } else {
-              memcpy(pkt_buf + sizeof(fec_packet_header_t),
-                     parity_blocks[s - data_symbols], symbol_size);
-            }
+            memcpy(pkt_buf + sizeof(fec_packet_header_t), parity_blocks[i],
+                   symbol_size);
 
             ptls_iovec_t dgram = ptls_iovec_init(pkt_buf, pkt_len);
-            quicly_send_datagram_frames(conn->quic, &dgram, 1);
+            quicly_send_datagram_frames_path(conn->quic, 0, &dgram, 1);
           }
 
-          for (size_t i = 0; i < data_symbols; i++)
+          for (size_t i = 0; i < data_symbols; i++) {
             free(data_blocks[i]);
-          for (size_t i = 0; i < parity_symbols; i++)
+          }
+          for (size_t i = 0; i < parity_symbols; i++) {
             free(parity_blocks[i]);
+          }
           free(data_blocks);
           free(parity_blocks);
         }
@@ -954,6 +942,19 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   if (payload.len < sizeof(fec_packet_header_t) + symbol_size)
     return;
 
+  if (resolved_track.type == MOQ_TRACK_DATA &&
+      object_id > tconn->last_seen_object_id + 1 &&
+      tconn->last_seen_object_id > 0) {
+    for (uint32_t missing_obj = tconn->last_seen_object_id + 1;
+         missing_obj < object_id; missing_obj++) {
+      uint16_t missing_idx = 0;
+      send_nack(tconn, track_id, group_id, missing_obj, &missing_idx, 1);
+    }
+  }
+  if (object_id > tconn->last_seen_object_id) {
+    tconn->last_seen_object_id = object_id;
+  }
+
   /* lookup active frame assembler cache */
   frame_assembler_t *asm_slot = NULL;
   for (size_t i = 0; i < ASSEMBLER_CACHE_SIZE; i++) {
@@ -1035,9 +1036,12 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     asm_slot->received_count++;
   }
 
-  if (resolved_track.type == MOQ_TRACK_DATA && !asm_slot->decoded &&
-      !asm_slot->nack_sent &&
-      asm_slot->received_count >= (asm_slot->data_symbols + 1) / 2) {
+  int64_t now_nack_ms = transport_get_time_ms();
+  if (resolved_track.type == MOQ_TRACK_DATA &&
+      (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) &&
+      !asm_slot->decoded &&
+      (!asm_slot->nack_sent ||
+       (now_nack_ms - asm_slot->last_nack_time_ms) > 10)) {
     uint16_t missing_count = 0;
     for (uint16_t i = 0; i < asm_slot->total_symbols; i++) {
       if (!asm_slot->received_mask[i]) {
@@ -1048,6 +1052,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
       send_nack(tconn, track_id, group_id, object_id, asm_slot->missing_indices,
                 missing_count);
       asm_slot->nack_sent = true;
+      asm_slot->last_nack_time_ms = now_nack_ms;
     }
   }
 
@@ -1261,6 +1266,12 @@ static void on_ifmon_update(const ifmon_update_t *update, void *userdata) {
   }
 }
 
+static void configure_socket_buffers(int fd) {
+  int buf_size = 2 * 1024 * 1024; /* 2mb buffer size */
+  setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+  setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+}
+
 transport_t *transport_create(const transport_config_t *config) {
   transport_t *t = calloc(1, sizeof(transport_t));
   if (!t)
@@ -1355,6 +1366,8 @@ transport_t *transport_create(const transport_config_t *config) {
     if (bind(t->fds[i], (struct sockaddr *)&t->local_addrs[i],
              t->local_addrs_len[i]) != 0)
       return NULL;
+
+    configure_socket_buffers(t->fds[i]);
 
     int flags = fcntl(t->fds[i], F_GETFL, 0);
     fcntl(t->fds[i], F_SETFL, flags | O_NONBLOCK);
@@ -1533,6 +1546,42 @@ void transport_tick(transport_t *t) {
   if (!t)
     return;
 
+  /* Sweep active assemblers for 10ms NACK retries */
+  int64_t now_nack_ms = transport_get_time_ms();
+  size_t active_conns = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
+  for (size_t c = 0; c < active_conns; c++) {
+    transport_conn_t *conn = t->is_server ? t->conns[c] : t->client_conn;
+    if (!conn || !conn->quic ||
+        quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
+      continue;
+    for (size_t i = 0; i < ASSEMBLER_CACHE_SIZE; i++) {
+      frame_assembler_t *asm_slot = &conn->assemblers[i];
+      if (asm_slot->total_symbols > 0 && !asm_slot->decoded &&
+          (!asm_slot->nack_sent ||
+           (now_nack_ms - asm_slot->last_nack_time_ms) > 10)) {
+        moq_track_id_t resolved_track;
+        if (find_subscription_by_alias(conn, asm_slot->track_id,
+                                       &resolved_track) == 0) {
+          if (!(resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS))
+            continue; /* Fixed RS-FEC does not send NACKs */
+        }
+        uint16_t missing_count = 0;
+        for (uint16_t s = 0; s < asm_slot->total_symbols; s++) {
+          if (!asm_slot->received_mask[s]) {
+            asm_slot->missing_indices[missing_count++] = s;
+          }
+        }
+        if (missing_count > 0) {
+          send_nack(conn, asm_slot->track_id, asm_slot->group_id,
+                    asm_slot->object_id, asm_slot->missing_indices,
+                    missing_count);
+          asm_slot->nack_sent = true;
+          asm_slot->last_nack_time_ms = now_nack_ms;
+        }
+      }
+    }
+  }
+
   /* Check for FEC grouping buffer timeout (3 milliseconds) */
   if (t->fec_buf_len > 0) {
     uint64_t now = ptls_get_time.cb(&ptls_get_time);
@@ -1563,6 +1612,7 @@ void transport_tick(transport_t *t) {
           if (fd >= 0) {
             int reuse = 1;
             setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+            configure_socket_buffers(fd);
             if (msg.addr.ss_family == AF_INET) {
               ((struct sockaddr_in *)&msg.addr)->sin_port =
                   t->is_server
@@ -1718,6 +1768,12 @@ void transport_tick(transport_t *t) {
           target = t->client_conn;
         }
 
+        if (target && target->authenticated && t->simulated_loss_rate > 0 &&
+            (rand() % 100) < t->simulated_loss_rate) {
+          continue; /* simulate packet loss on wire after connection is
+                       established */
+        }
+
         if (target) {
           quicly_receive(target->quic,
                          (struct sockaddr *)&t->local_addrs[fd_idx], psa,
@@ -1816,42 +1872,144 @@ void transport_tick(transport_t *t) {
         if (num_dgrams == 0)
           break;
 
-        for (size_t j = 0; j < num_dgrams; ++j) {
-          struct msghdr mess = {.msg_name = &dest.sa,
-                                .msg_namelen = quicly_get_socklen(&dest.sa),
-                                .msg_iov = &dgrams[j],
-                                .msg_iovlen = 1};
-          int out_fd = t->fds[0];
-          if (src.sa.sa_family == AF_INET) {
-            struct sockaddr_in *src_in = (struct sockaddr_in *)&src.sa;
-            for (size_t k = 0; k < t->num_fds; k++) {
-              if (t->local_addrs[k].ss_family == AF_INET) {
-                struct sockaddr_in *loc =
-                    (struct sockaddr_in *)&t->local_addrs[k];
-                if (loc->sin_addr.s_addr == src_in->sin_addr.s_addr) {
-                  out_fd = t->fds[k];
-                  break;
-                }
-              }
-            }
-          } else if (src.sa.sa_family == AF_INET6) {
-            struct sockaddr_in6 *src_in6 = (struct sockaddr_in6 *)&src.sa;
-            for (size_t k = 0; k < t->num_fds; k++) {
-              if (t->local_addrs[k].ss_family == AF_INET6) {
-                struct sockaddr_in6 *loc =
-                    (struct sockaddr_in6 *)&t->local_addrs[k];
-                if (memcmp(&loc->sin6_addr, &src_in6->sin6_addr,
-                           sizeof(struct in6_addr)) == 0) {
-                  out_fd = t->fds[k];
-                  break;
-                }
+        int out_fd = t->fds[0];
+        if (src.sa.sa_family == AF_INET) {
+          struct sockaddr_in *src_in = (struct sockaddr_in *)&src.sa;
+          for (size_t k = 0; k < t->num_fds; k++) {
+            if (t->local_addrs[k].ss_family == AF_INET) {
+              struct sockaddr_in *loc =
+                  (struct sockaddr_in *)&t->local_addrs[k];
+              if (loc->sin_addr.s_addr == src_in->sin_addr.s_addr) {
+                out_fd = t->fds[k];
+                break;
               }
             }
           }
+        } else if (src.sa.sa_family == AF_INET6) {
+          struct sockaddr_in6 *src_in6 = (struct sockaddr_in6 *)&src.sa;
+          for (size_t k = 0; k < t->num_fds; k++) {
+            if (t->local_addrs[k].ss_family == AF_INET6) {
+              struct sockaddr_in6 *loc =
+                  (struct sockaddr_in6 *)&t->local_addrs[k];
+              if (memcmp(&loc->sin6_addr, &src_in6->sin6_addr,
+                         sizeof(struct in6_addr)) == 0) {
+                out_fd = t->fds[k];
+                break;
+              }
+            }
+          }
+        }
 
+#ifdef __linux__
+        /* try sending via UDP GSO if we have multiple datagrams */
+        bool use_gso = false;
+        if (num_dgrams > 1) {
+          /* GSO requires all segments to be identical size (except possibly the
+           * last one) */
+          size_t gso_size = dgrams[0].iov_len;
+          use_gso = true;
+          for (size_t j = 0; j < num_dgrams - 1; j++) {
+            if (dgrams[j].iov_len != gso_size) {
+              use_gso = false;
+              break;
+            }
+          }
+
+          if (use_gso && gso_size > 0) {
+            /* coalesce segments into a contiguous scratch buffer */
+            static uint8_t gso_buf[65536];
+            size_t total_len = 0;
+            for (size_t j = 0; j < num_dgrams; j++) {
+              if (total_len + dgrams[j].iov_len > sizeof(gso_buf)) {
+                use_gso = false;
+                break;
+              }
+              memcpy(gso_buf + total_len, dgrams[j].iov_base,
+                     dgrams[j].iov_len);
+              total_len += dgrams[j].iov_len;
+            }
+
+            if (use_gso) {
+              struct msghdr msg = {0};
+              msg.msg_name = &dest.sa;
+              msg.msg_namelen = quicly_get_socklen(&dest.sa);
+              struct iovec iov = {.iov_base = gso_buf, .iov_len = total_len};
+              msg.msg_iov = &iov;
+              msg.msg_iovlen = 1;
+
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT 103
+#endif
+#ifndef SOL_UDP
+#define SOL_UDP 17
+#endif
+
+              uint8_t cmsg_buf[CMSG_SPACE(sizeof(uint16_t))];
+              memset(cmsg_buf, 0, sizeof(cmsg_buf));
+              msg.msg_control = cmsg_buf;
+              msg.msg_controllen = sizeof(cmsg_buf);
+
+              struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+              cmsg->cmsg_level = SOL_UDP;
+              cmsg->cmsg_type = UDP_SEGMENT;
+              cmsg->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+              uint16_t val = (uint16_t)gso_size;
+              memcpy(CMSG_DATA(cmsg), &val, sizeof(val));
+
+              ssize_t sret;
+              while ((sret = sendmsg(out_fd, &msg, 0)) == -1 && errno == EINTR)
+                ;
+
+              if (sret != -1) {
+                /* GSO write succeeded, skip sendmmsg fallback */
+                num_dgrams = 0;
+              } else {
+                /* GSO failed, will fallback to sendmmsg */
+                use_gso = false;
+              }
+            }
+          }
+        }
+
+        /* linux optimized path using sendmmsg */
+        struct mmsghdr msgs[64];
+        memset(msgs, 0, sizeof(msgs));
+        struct iovec iovs[64];
+        for (size_t j = 0; j < num_dgrams; ++j) {
+          iovs[j] = dgrams[j];
+          msgs[j].msg_hdr.msg_name = &dest.sa;
+          msgs[j].msg_hdr.msg_namelen = quicly_get_socklen(&dest.sa);
+          msgs[j].msg_hdr.msg_iov = &iovs[j];
+          msgs[j].msg_hdr.msg_iovlen = 1;
+        }
+
+        int sent_count = 0;
+        while (sent_count < (int)num_dgrams) {
+          int ret =
+              sendmmsg(out_fd, &msgs[sent_count], num_dgrams - sent_count, 0);
+          if (ret > 0) {
+            sent_count += ret;
+          } else {
+            if (ret < 0 && errno == EINTR) {
+              continue;
+            }
+            if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+              break;
+            }
+            if (ret < 0) {
+              fprintf(stderr, "sendmmsg failed: %s (errno=%d)\n",
+                      strerror(errno), errno);
+              break;
+            }
+          }
+        }
+#else
+        /* fallback using sendto loop */
+        for (size_t j = 0; j < num_dgrams; ++j) {
           ssize_t sret;
           while ((sret = sendto(out_fd, dgrams[j].iov_base, dgrams[j].iov_len,
-                                0, mess.msg_name, mess.msg_namelen)) == -1 &&
+                                0, &dest.sa, quicly_get_socklen(&dest.sa))) ==
+                     -1 &&
                  SOCKET_ERROR_CODE == SOCKET_EINTR)
             ;
           if (sret == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -1859,6 +2017,7 @@ void transport_tick(transport_t *t) {
                     errno);
           }
         }
+#endif
       } else if (send_res == QUICLY_ERROR_FREE_CONNECTION) {
         fprintf(stderr, "Connection %p freed (is_server=%d)\n", conn,
                 t->is_server);
@@ -1900,13 +2059,15 @@ void transport_tick(transport_t *t) {
 typedef struct {
   bool reliable;
   bool fec_enabled;
+  bool fec_rateless;
 } track_delivery_profile_t;
 
 /* get delivery profile based on track type and name */
 static track_delivery_profile_t get_track_profile(const moq_track_id_t *track) {
   track_delivery_profile_t profile = {
       .reliable = (track->flags & MOQ_TRACK_FLAG_RELIABLE) != 0,
-      .fec_enabled = (track->flags & MOQ_TRACK_FLAG_FEC_ENABLED) != 0};
+      .fec_enabled = (track->flags & MOQ_TRACK_FLAG_FEC_ENABLED) != 0,
+      .fec_rateless = (track->flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0};
   return profile;
 }
 
@@ -1950,7 +2111,7 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
                        obj->track_id.name) == 0) {
               track_delivery_profile_t profile =
                   get_track_profile(&conn->subscriptions[s].track_id);
-              if (profile.fec_enabled) {
+              if (profile.fec_enabled || profile.fec_rateless) {
                 use_fec = true;
                 break;
               }
@@ -1969,7 +2130,7 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
                 0) {
           track_delivery_profile_t profile =
               get_track_profile(&conn->subscriptions[s].track_id);
-          if (profile.fec_enabled) {
+          if (profile.fec_enabled || profile.fec_rateless) {
             use_fec = true;
             break;
           }
@@ -2004,7 +2165,7 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
       t->fec_buf_len = needed;
       t->fec_pkt_count++;
 
-      if (t->fec_pkt_count >= 4 || t->fec_buf_len >= 4000) {
+      if (t->fec_pkt_count >= 4 || t->fec_buf_len >= 16384) {
         flush_fec_buffer(t);
       }
       return true;
@@ -2626,4 +2787,48 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
   }
 
   return all_ready;
+}
+
+int64_t transport_get_time_ms(void) {
+  return (int64_t)ptls_get_time.cb(&ptls_get_time);
+}
+
+int64_t transport_get_first_timeout(transport_t *t) {
+  if (!t)
+    return INT64_MAX;
+
+  int64_t first_timeout = INT64_MAX;
+
+  if (t->client_conn && t->client_conn->quic) {
+    int64_t to = quicly_get_first_timeout(t->client_conn->quic);
+    if (to < first_timeout)
+      first_timeout = to;
+  }
+
+  for (size_t i = 0; i < t->conn_count; i++) {
+    if (t->conns[i] && t->conns[i]->quic) {
+      int64_t to = quicly_get_first_timeout(t->conns[i]->quic);
+      if (to < first_timeout)
+        first_timeout = to;
+    }
+  }
+
+  return first_timeout;
+}
+
+size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
+                              size_t max_fds) {
+  if (!t || !fds)
+    return 0;
+
+  size_t count = 0;
+  for (size_t i = 0; i < t->num_fds && count < max_fds; i++) {
+    if (t->fds[i] >= 0) {
+      fds[count].fd = t->fds[i];
+      fds[count].events = POLLIN;
+      fds[count].revents = 0;
+      count++;
+    }
+  }
+  return count;
 }

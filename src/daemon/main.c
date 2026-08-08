@@ -5,8 +5,9 @@
 #endif
 
 #include "data_uds.h"
-#include "transport.h"
 #include "portable_sockets.h"
+#include "transport.h"
+#include <poll.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,12 +33,18 @@ typedef struct daemon_ctx_s {
   char subscribe_tracks[16][64];
   size_t num_subscribe_tracks;
   bool use_reliable;
+  bool use_rateless;
 } daemon_ctx_t;
 
 static void subscribe_to_tracks(transport_t *t, daemon_ctx_t *ctx) {
   for (size_t i = 0; i < ctx->num_subscribe_tracks; i++) {
-    moq_track_id_t t_data = {.type = MOQ_TRACK_DATA,
-                             .flags = ctx->use_reliable ? MOQ_TRACK_FLAG_RELIABLE : MOQ_TRACK_FLAG_FEC_ENABLED};
+    uint8_t flags = MOQ_TRACK_FLAG_FEC_ENABLED;
+    if (ctx->use_reliable) {
+      flags = MOQ_TRACK_FLAG_RELIABLE;
+    } else if (ctx->use_rateless) {
+      flags = MOQ_TRACK_FLAG_FEC_RATELESS;
+    }
+    moq_track_id_t t_data = {.type = MOQ_TRACK_DATA, .flags = flags};
     strncpy(t_data.name, ctx->subscribe_tracks[i], sizeof(t_data.name) - 1);
     t_data.name[sizeof(t_data.name) - 1] = '\0';
     transport_subscribe(t, t_data);
@@ -85,18 +92,22 @@ static void on_transport_event(void *user_data,
     printf("peer disconnected\n");
     break;
   case TRANSPORT_EVENT_SUBSCRIBE:
-    printf("daemon: peer subscribed to track '%s' (type %d)\n", event->track_id.name, event->track_id.type);
+    printf("daemon: peer subscribed to track '%s' (type %d)\n",
+           event->track_id.name, event->track_id.type);
     break;
   case TRANSPORT_EVENT_UNSUBSCRIBE:
-    printf("daemon: peer unsubscribed from track '%s' (type %d)\n", event->track_id.name, event->track_id.type);
+    printf("daemon: peer unsubscribed from track '%s' (type %d)\n",
+           event->track_id.name, event->track_id.type);
     break;
   case TRANSPORT_EVENT_OBJECT:
     if (event->track_id.type == MOQ_TRACK_DATA) {
-      printf("daemon: received object from peer on track '%s', size=%zu, flags=%d, type=%d\n",
+      printf("daemon: received object from peer on track '%s', size=%zu, "
+             "flags=%d, type=%d\n",
              event->track_id.name, event->object.size, event->track_id.flags,
              event->track_id.type);
     }
-    if (ctx->data_pipe && event->track_id.type == MOQ_TRACK_DATA && (event->track_id.flags & MOQ_TRACK_FLAG_FEC_ENABLED)) {
+    if (ctx->data_pipe && event->track_id.type == MOQ_TRACK_DATA &&
+        (event->track_id.flags & MOQ_TRACK_FLAG_FEC_ENABLED)) {
       /* Extract datagram packets from aggregated symbol */
       size_t remaining = event->object.size;
       const uint8_t *ptr = event->object.data;
@@ -115,7 +126,8 @@ static void on_transport_event(void *user_data,
       }
     } else if (ctx->data_pipe) {
       /* Forward raw packet for reliable tracks */
-      printf("daemon: forwarding raw packet to UDS client, len=%zu\n", event->object.size);
+      printf("daemon: forwarding raw packet to UDS client, len=%zu\n",
+             event->object.size);
       data_uds_send(ctx->data_pipe, &event->track_id, event->object.data,
                     event->object.size, event->object.priority);
     }
@@ -145,7 +157,8 @@ static void on_data_packet(void *user_data, const moq_track_id_t *track_id,
   /* Broadcast to all peers */
   for (size_t i = 0; i < ctx->num_transports; i++) {
     if (ctx->transports[i].transport) {
-      printf("daemon: forwarding UDS packet to transport %zu, size=%zu, track='%s'\n",
+      printf("daemon: forwarding UDS packet to transport %zu, size=%zu, "
+             "track='%s'\n",
              i, size, track_id->name);
       transport_publish(ctx->transports[i].transport, &obj);
     }
@@ -165,6 +178,64 @@ static bool on_is_track_ready(void *user_data, const moq_track_id_t *track_id) {
   return true;
 }
 
+/* drive daemon event loop processing */
+static void daemon_tick(daemon_ctx_t *ctx) {
+  data_uds_tick(ctx->data_pipe);
+  for (size_t i = 0; i < ctx->num_transports; i++) {
+    transport_tick(ctx->transports[i].transport);
+  }
+}
+
+/* run daemon loop driven by socket polling and quicly pacer timeouts */
+static void daemon_run(daemon_ctx_t *ctx) {
+  printf("daemon is running. press ctrl+c to exit.\n");
+  while (ctx->running) {
+    daemon_tick(ctx);
+
+    int64_t now_ms = transport_get_time_ms();
+    int64_t earliest_timeout_ms = INT64_MAX;
+
+    for (size_t i = 0; i < ctx->num_transports; i++) {
+      if (ctx->transports[i].transport) {
+        int64_t to = transport_get_first_timeout(ctx->transports[i].transport);
+        if (to < earliest_timeout_ms) {
+          earliest_timeout_ms = to;
+        }
+      }
+    }
+
+    int timeout_ms = 10; /* default maximum poll timeout */
+    if (earliest_timeout_ms != INT64_MAX) {
+      int delta = (int)(earliest_timeout_ms - now_ms);
+      if (delta < 0) {
+        timeout_ms = 0;
+      } else if (delta < timeout_ms) {
+        timeout_ms = delta;
+      }
+    }
+
+    struct pollfd fds[64];
+    size_t num_fds = 0;
+
+    if (ctx->data_pipe) {
+      num_fds +=
+          data_uds_get_poll_fds(ctx->data_pipe, fds + num_fds, 64 - num_fds);
+    }
+    for (size_t i = 0; i < ctx->num_transports; i++) {
+      if (ctx->transports[i].transport) {
+        num_fds += transport_get_poll_fds(ctx->transports[i].transport,
+                                          fds + num_fds, 64 - num_fds);
+      }
+    }
+
+    if (num_fds > 0) {
+      poll(fds, num_fds, timeout_ms);
+    } else if (timeout_ms > 0) {
+      usleep(timeout_ms * 1000);
+    }
+  }
+}
+
 int main(int argc, char **argv) {
   /* Rest of main remains unchanged... */
   setvbuf(stdout, NULL, _IONBF, 0);
@@ -172,8 +243,8 @@ int main(int argc, char **argv) {
   printf("starting qlinqd peer mesh daemon...\n");
 
   if (portable_socket_init() != 0) {
-      fprintf(stderr, "failed to initialize sockets\n");
-      return 1;
+    fprintf(stderr, "failed to initialize sockets\n");
+    return 1;
   }
 
   daemon_ctx_t ctx = {0};
@@ -203,7 +274,9 @@ int main(int argc, char **argv) {
       ca_file = argv[++i];
     } else if (strcmp(argv[i], "--verify-peer") == 0) {
       verify_peer = true;
-    } else if ((strcmp(argv[i], "--socket") == 0 || strcmp(argv[i], "-s") == 0) && i + 1 < argc) {
+    } else if ((strcmp(argv[i], "--socket") == 0 ||
+                strcmp(argv[i], "-s") == 0) &&
+               i + 1 < argc) {
       socket_name = argv[++i];
     } else if (strcmp(argv[i], "--peer") == 0 && i + 1 < argc) {
       if (num_peers < MAX_TRANSPORTS - 1) {
@@ -211,10 +284,13 @@ int main(int argc, char **argv) {
       }
     } else if (strcmp(argv[i], "--track") == 0 && i + 1 < argc) {
       if (ctx.num_subscribe_tracks < 15) {
-        strncpy(ctx.subscribe_tracks[ctx.num_subscribe_tracks++], argv[++i], 63);
+        strncpy(ctx.subscribe_tracks[ctx.num_subscribe_tracks++], argv[++i],
+                63);
       }
     } else if (strcmp(argv[i], "--reliable") == 0) {
       ctx.use_reliable = true;
+    } else if (strcmp(argv[i], "--rateless") == 0) {
+      ctx.use_rateless = true;
     }
   }
 
@@ -233,7 +309,7 @@ int main(int argc, char **argv) {
     config.key_file = key_file;
     config.ca_file = ca_file;
     config.verify_peer = verify_peer;
-    
+
     daemon_transport_ctx_t *tctx = &ctx.transports[ctx.num_transports];
     tctx->daemon = &ctx;
     tctx->is_server = true;
@@ -262,7 +338,7 @@ int main(int argc, char **argv) {
       *colon = '\0';
       port = atoi(colon + 1);
     }
-    
+
     config.port = port;
     config.remote_hosts[config.num_remote_hosts++] = peer_ip;
     config.bind_hosts[config.num_bind_hosts++] = "0.0.0.0";
@@ -270,7 +346,7 @@ int main(int argc, char **argv) {
     config.key_file = key_file;
     config.ca_file = ca_file;
     config.verify_peer = verify_peer;
-    
+
     daemon_transport_ctx_t *tctx = &ctx.transports[ctx.num_transports];
     tctx->daemon = &ctx;
     tctx->is_server = false;
@@ -291,20 +367,14 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  ctx.data_pipe = data_uds_create(socket_name, on_data_packet, on_is_track_ready, &ctx);
+  ctx.data_pipe =
+      data_uds_create(socket_name, on_data_packet, on_is_track_ready, &ctx);
   if (!ctx.data_pipe) {
     fprintf(stderr, "failed to create UDS data pipe\n");
     return 1;
   }
 
-  printf("daemon is running. press ctrl+c to exit.\n");
-  while (ctx.running) {
-    data_uds_tick(ctx.data_pipe);
-    for (size_t i = 0; i < ctx.num_transports; i++) {
-      transport_tick(ctx.transports[i].transport);
-    }
-    usleep(3000); /* 3ms tick rate for optimal packet batching */
-  }
+  daemon_run(&ctx);
 
   data_uds_destroy(ctx.data_pipe);
   for (size_t i = 0; i < ctx.num_transports; i++) {
