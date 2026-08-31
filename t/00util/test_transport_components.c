@@ -5,9 +5,9 @@
 #include "transport_memory.h"
 #include "transport_paths.h"
 #include "transport_repair.h"
+#include "transport_repair_planner.h"
 #include "transport_scheduler.h"
 #include "transport_subscriptions.h"
-#include "transport_wire.h"
 
 #include "transport_udp.h"
 
@@ -242,6 +242,16 @@ int main(void) {
                 TRANSPORT_DEFAULT_MAX_AGGREGATE_REPAIR_REQUESTS_PER_SECOND &&
             resolved_limits.max_udp_payload_size == 1280,
         "default limits");
+  configured.max_connections = 1000;
+  CHECK(transport_limits_resolve(&configured, &resolved_limits, limit_error,
+                                 sizeof(limit_error)) &&
+            resolved_limits.max_connections == 1000,
+        "thousand-node connection limit");
+  configured.max_connections = TRANSPORT_HARD_MAX_CONNECTIONS + 1U;
+  CHECK(!transport_limits_resolve(&configured, &resolved_limits, limit_error,
+                                  sizeof(limit_error)),
+        "connection hard limit rejection");
+  configured.max_connections = 0;
   configured.max_aggregate_repair_requests_per_second = UINT16_MAX + 1U;
   CHECK(!transport_limits_resolve(&configured, &resolved_limits, limit_error,
                                   sizeof(limit_error)),
@@ -348,6 +358,184 @@ int main(void) {
             schedule.paths[0].x == 1 && round_robin == 1,
         "single-symbol round robin schedule");
 
+  transport_repair_planner_requester_t planner_requesters[2] = {0};
+  for (size_t i = 0; i < 2; i++) {
+    planner_requesters[i].member_id = i + 1U;
+    planner_requesters[i].deficit = 4;
+    planner_requesters[i].shared_delivery_probability_ppm = 1000000U;
+    planner_requesters[i].path_count = 1;
+    planner_requesters[i].paths[0] =
+        (transport_repair_planner_path_t){
+            .resource_id = 1,
+            .estimate = {.b = FP_FROM_INT(100), .p = 0, .l = 0, .q = 0},
+            .measurement_known = true};
+  }
+  transport_repair_planner_snapshot_t planner_snapshot = {
+      .version = TRANSPORT_REPAIR_PLANNER_VERSION,
+      .intent_id = 1,
+      .group_id = 10,
+      .object_id = 20,
+      .mode = TRANSPORT_REPAIR_MODE_RATELESS,
+      .symbol_size = 1000,
+      .deadline_ms = 1000,
+      .shared_rate_bytes_per_second = 1000,
+      .shared_resource_id = 1,
+      .cohort_member_count = 2,
+      .observation_window_ms = 500,
+      .observation_age_ms = 501,
+      .accepted_request_count = 1,
+      .suppressed_request_count = 1,
+      .requesters = planner_requesters,
+      .requester_count = 2};
+  transport_repair_planner_evaluation_t planner_evaluation;
+  CHECK(transport_repair_planner_evaluate(&planner_snapshot,
+                                          &planner_evaluation) &&
+            planner_evaluation.chosen.action ==
+                TRANSPORT_REPAIR_PLAN_ALL_UNICAST &&
+            planner_evaluation.all_unicast.aggregate_airtime_us <
+                planner_evaluation.all_shared.aggregate_airtime_us,
+        "shadow planner selects lower-cost requester unicast repair");
+
+  planner_snapshot.shared_rate_bytes_per_second = 100000;
+  planner_requesters[0].paths[0].estimate.b = FP_FROM_INT(1);
+  planner_requesters[1].paths[0].estimate.b = FP_FROM_INT(1);
+  CHECK(transport_repair_planner_evaluate(&planner_snapshot,
+                                          &planner_evaluation) &&
+            planner_evaluation.chosen.action ==
+                TRANSPORT_REPAIR_PLAN_ALL_SHARED &&
+            planner_evaluation.chosen.shared_symbols == 4,
+        "shadow planner preserves economical all-shared repair");
+
+  planner_requesters[0].deficit = 2;
+  planner_requesters[0].paths[0].estimate.b = FP_FROM_INT(1);
+  planner_requesters[1].deficit = 20;
+  planner_requesters[1].shared_delivery_probability_ppm = 100000U;
+  planner_requesters[1].paths[0].estimate.b = FP_FROM_INT(1000);
+  CHECK(transport_repair_planner_evaluate(&planner_snapshot,
+                                          &planner_evaluation) &&
+            planner_evaluation.chosen.action == TRANSPORT_REPAIR_PLAN_MIXED &&
+            planner_evaluation.chosen.shared_requesters == 1 &&
+            planner_evaluation.chosen.unicast_requesters == 1 &&
+            planner_evaluation.chosen_savings_vs_shared_ppm > 150000U,
+        "shadow planner finds a material mixed repair plan");
+
+  planner_snapshot.mode = TRANSPORT_REPAIR_MODE_INDEXED;
+  planner_snapshot.shared_rate_bytes_per_second = 100000;
+  memset(planner_requesters[0].requested_symbols, 0,
+         sizeof(planner_requesters[0].requested_symbols));
+  memset(planner_requesters[1].requested_symbols, 0,
+         sizeof(planner_requesters[1].requested_symbols));
+  planner_requesters[0].deficit = 2;
+  planner_requesters[0].shared_delivery_probability_ppm = 1000000U;
+  planner_requesters[0].requested_symbols[0] = UINT64_C(0x3);
+  planner_requesters[0].paths[0].estimate.b = FP_FROM_INT(1);
+  planner_requesters[1].deficit = 2;
+  planner_requesters[1].shared_delivery_probability_ppm = 1000000U;
+  planner_requesters[1].requested_symbols[0] = UINT64_C(0x6);
+  planner_requesters[1].paths[0].estimate.b = FP_FROM_INT(1);
+  CHECK(transport_repair_planner_evaluate(&planner_snapshot,
+                                          &planner_evaluation) &&
+            planner_evaluation.chosen.action ==
+                TRANSPORT_REPAIR_PLAN_ALL_SHARED &&
+            planner_evaluation.all_shared.shared_symbols == 3,
+        "indexed shadow cost uses the selected requester symbol union");
+
+  planner_snapshot.shared_resource_id = 0;
+  transport_repair_planner_evaluation_t planner_replay;
+  CHECK(transport_repair_planner_evaluate(&planner_snapshot,
+                                          &planner_evaluation) &&
+            transport_repair_planner_evaluate(&planner_snapshot,
+                                              &planner_replay) &&
+            planner_evaluation.chosen.uncertain &&
+            planner_evaluation.chosen.resource_count == 1 &&
+            planner_evaluation.chosen.action == planner_replay.chosen.action &&
+            planner_evaluation.chosen.aggregate_airtime_us ==
+                planner_replay.chosen.aggregate_airtime_us &&
+            planner_evaluation.chosen.physical_bytes ==
+                planner_replay.chosen.physical_bytes,
+        "unknown resources collapse conservatively and replay deterministically");
+  FILE *planner_record = tmpfile();
+  transport_repair_planner_snapshot_t recorded_snapshot;
+  transport_repair_planner_recorded_result_t recorded_result;
+  CHECK(planner_record &&
+            transport_repair_planner_record_write(
+                planner_record, &planner_snapshot, &planner_evaluation) &&
+            fflush(planner_record) == 0 && fseek(planner_record, 0, SEEK_SET) == 0 &&
+            transport_repair_planner_record_read(
+                planner_record, &recorded_snapshot, &recorded_result) &&
+            transport_repair_planner_evaluate(&recorded_snapshot,
+                                              &planner_replay) &&
+            recorded_result.action == planner_replay.chosen.action &&
+            recorded_result.aggregate_airtime_us ==
+                planner_replay.chosen.aggregate_airtime_us &&
+            recorded_result.physical_bytes ==
+                planner_replay.chosen.physical_bytes &&
+            recorded_result.shared_member_hash ==
+                planner_replay.chosen.shared_member_hash &&
+            recorded_result.feasible == planner_replay.chosen.feasible &&
+            recorded_result.uncertain == planner_replay.chosen.uncertain &&
+            recorded_result.approximate == planner_replay.chosen.approximate,
+        "versioned shadow record replays through the same evaluator");
+  CHECK(recorded_snapshot.observation_window_ms == 500 &&
+            recorded_snapshot.observation_age_ms == 501 &&
+            recorded_snapshot.accepted_request_count == 1 &&
+            recorded_snapshot.suppressed_request_count == 1,
+        "shadow record preserves observation provenance");
+  transport_repair_planner_record_destroy(&recorded_snapshot);
+  fclose(planner_record);
+
+  transport_repair_planner_requester_t *large_requesters =
+      calloc(1000, sizeof(*large_requesters));
+  CHECK(large_requesters != NULL, "thousand-requester planner allocation");
+  for (size_t i = 0; i < 1000; i++) {
+    large_requesters[i].member_id = i + 1U;
+    large_requesters[i].deficit = 1;
+    large_requesters[i].shared_delivery_probability_ppm = 1000000U;
+    large_requesters[i].path_count = 1;
+    large_requesters[i].paths[0] =
+        (transport_repair_planner_path_t){
+            .resource_id = 1,
+            .estimate = {.b = FP_FROM_INT(1), .p = 0, .l = 0, .q = 0},
+            .measurement_known = true};
+  }
+  transport_repair_planner_snapshot_t large_snapshot = {
+      .version = TRANSPORT_REPAIR_PLANNER_VERSION,
+      .intent_id = 1000,
+      .mode = TRANSPORT_REPAIR_MODE_RATELESS,
+      .symbol_size = 1000,
+      .deadline_ms = 10000,
+      .shared_rate_bytes_per_second = 1000000,
+      .shared_resource_id = 1,
+      .cohort_member_count = 1000,
+      .requesters = large_requesters,
+      .requester_count = 1000};
+  CHECK(transport_repair_planner_evaluate(&large_snapshot,
+                                          &planner_evaluation) &&
+            planner_evaluation.chosen.action ==
+                TRANSPORT_REPAIR_PLAN_ALL_SHARED &&
+            !planner_evaluation.chosen.uncertain &&
+            planner_evaluation.chosen.shared_requesters == 1000 &&
+            planner_evaluation.all_shared.resource_count == 1 &&
+            planner_evaluation.all_shared.resources[0].resource_id == 1 &&
+            planner_evaluation.all_shared.physical_bytes == 1000 &&
+            planner_evaluation.all_unicast.resource_count == 1 &&
+            planner_evaluation.all_unicast.resources[0].resource_id == 1 &&
+            planner_evaluation.all_unicast.physical_bytes == 1000000,
+        "thousand-requester planner counts a shared radio once and each "
+        "unicast transmission once");
+  for (size_t i = 0; i < 1000; i++)
+    large_requesters[i].paths[0].resource_id = 2;
+  CHECK(transport_repair_planner_evaluate(&large_snapshot,
+                                          &planner_evaluation) &&
+            planner_evaluation.all_shared.resource_count == 1 &&
+            planner_evaluation.all_shared.resources[0].resource_id == 1 &&
+            planner_evaluation.all_unicast.resource_count == 1 &&
+            planner_evaluation.all_unicast.resources[0].resource_id == 2 &&
+            planner_evaluation.all_unicast.physical_bytes == 1000000,
+        "thousand-requester planner keeps demonstrably independent multicast "
+        "and unicast resources separate");
+  free(large_requesters);
+
   const uint8_t object_data[] = {1, 2, 3, 4};
   moq_object_t object = {.track_id = track,
                          .group_id = 10,
@@ -356,27 +544,19 @@ int main(void) {
                          .size = sizeof(object_data),
                          .priority = 2};
   transport_sent_cache_t sent_cache = {0};
-  CHECK(transport_sent_cache_store(&sent_cache, &object, 3, 2, 2, true),
+  CHECK(transport_sent_cache_store(&sent_cache, &object, 3, 2, 2, false),
         "sent-object cache store");
   sent_object_cache_t *cached =
       transport_sent_cache_find(&sent_cache, &track, 10, 20);
   CHECK(cached && cached->size == sizeof(object_data) && cached->data[3] == 4,
         "sent-object cache roundtrip");
-  size_t next_cache_entry = sent_cache.next_entry;
-  CHECK(transport_sent_cache_store(&sent_cache, &object, 4, 2, 2, true) &&
-            sent_cache.next_entry == next_cache_entry &&
-            cached->total_symbols == 4,
-        "publication retry reuses sent-object cache identity");
-  const uint8_t conflicting_data[] = {4, 3, 2, 1};
-  object.data = conflicting_data;
-  CHECK(!transport_sent_cache_store(&sent_cache, &object, 4, 2, 2, true),
-        "conflicting sent-object identity rejected");
-  object.data = object_data;
-  moq_track_id_t different_profile = track;
-  different_profile.flags ^= MOQ_TRACK_FLAG_FEC_RATELESS;
-  CHECK(transport_sent_cache_find(&sent_cache, &different_profile, 10, 20) ==
-            NULL,
-        "sent-object cache includes track flags in identity");
+  CHECK(transport_sent_cache_release_through(&sent_cache, &track, 10, 20) ==
+                1 &&
+            transport_sent_cache_find(&sent_cache, &track, 10, 20) == NULL,
+        "sent-object cache checkpoint release");
+  CHECK(transport_sent_cache_store(&sent_cache, &object, 3, 2, 2, false),
+        "sent-object cache reuse after release");
+  cached = transport_sent_cache_find(&sent_cache, &track, 10, 20);
 
   uint16_t missing_symbol = 1;
   transport_repair_batch_t repair;
@@ -388,12 +568,6 @@ int main(void) {
             repair.symbols[0] == object_data[2],
         "repair returns requested data symbol");
   transport_repair_batch_destroy(&repair);
-  uint16_t parity_symbol = 2;
-  CHECK(transport_repair_build(&repair_fec_cache, cached, false, &parity_symbol,
-                               1, &repair) &&
-            repair.total_symbols == cached->total_symbols,
-        "repair preserves original FEC dimensions");
-  transport_repair_batch_destroy(&repair);
 
   moq_track_id_t rateless_track = {.type = MOQ_TRACK_DATA,
                                    .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
@@ -402,7 +576,7 @@ int main(void) {
   rateless_object.track_id = rateless_track;
   transport_sent_cache_t rateless_cache = {0};
   CHECK(transport_sent_cache_store(&rateless_cache, &rateless_object, 2, 2, 2,
-                                   true),
+                                   false),
         "rateless sent-object cache store");
   sent_object_cache_t *rateless_cached = transport_sent_cache_find(
       &rateless_cache, &rateless_track, object.group_id, object.object_id);
@@ -412,7 +586,7 @@ int main(void) {
             repair.count == 2 && repair.indices[0] == 2 &&
             repair.indices[1] == 3 && repair.total_symbols == 4 &&
             rateless_cached->next_repair_symbol == 2,
-        "rateless repair reserves fresh ESIs transactionally");
+        "rateless repair reserves fresh monotonic ESIs transactionally");
   uint8_t decode_data_0[2] = {1, 2};
   uint8_t decode_data_1[2] = {0};
   uint8_t decode_repair_0[2];
@@ -435,19 +609,50 @@ int main(void) {
   CHECK(transport_repair_build_rateless(&repair_fec_cache, rateless_cached, 3,
                                         &repair) &&
             repair.indices[0] == 4 && repair.indices[2] == 6 &&
+            rateless_cached->next_repair_symbol == 4 &&
             transport_repair_commit_rateless(rateless_cached, &repair, 1) &&
             rateless_cached->next_repair_symbol == 5,
         "partial admission leaves unused rateless ESIs available");
   transport_repair_batch_destroy(&repair);
-  rateless_cached->next_repair_symbol = QLINQ_FEC_MAX_TOTAL_SYMBOLS;
+  CHECK(transport_repair_build_rateless(&repair_fec_cache, rateless_cached, 2,
+                                        &repair) &&
+            repair.indices[0] == 5 && repair.indices[1] == 6 &&
+            transport_repair_commit_rateless(rateless_cached, &repair, 2) &&
+            rateless_cached->next_repair_symbol == 7,
+        "subsequent rateless repair begins after the admitted prefix");
+  transport_repair_batch_destroy(&repair);
+  rateless_cached->next_repair_symbol = QLINQ_FEC_MAX_TOTAL_SYMBOLS - 1U;
+  CHECK(transport_repair_build_rateless(&repair_fec_cache, rateless_cached, 4,
+                                        &repair) &&
+            repair.count == 1 &&
+            repair.indices[0] == QLINQ_FEC_MAX_TOTAL_SYMBOLS - 1U &&
+            rateless_cached->next_repair_symbol ==
+                QLINQ_FEC_MAX_TOTAL_SYMBOLS - 1U &&
+            transport_repair_commit_rateless(rateless_cached, &repair, 1) &&
+            rateless_cached->next_repair_symbol == QLINQ_FEC_MAX_TOTAL_SYMBOLS,
+        "rateless admission truncates safely at the ESI bound");
+  transport_repair_batch_destroy(&repair);
+  CHECK(!transport_repair_build_rateless(&repair_fec_cache, rateless_cached, 1,
+                                         &repair),
+        "rateless allocation reports ESI exhaustion");
   CHECK(transport_repair_build_systematic_fallback(
             &repair_fec_cache, rateless_cached, 4, &repair) &&
             repair.count == 2 && repair.indices[0] == 0 &&
-            repair.indices[1] == 1 &&
+            repair.indices[1] == 1 && repair.symbols[0] == object_data[0] &&
+            repair.symbols[2] == object_data[2] &&
+            rateless_cached->next_systematic_repair_symbol == 0 &&
             transport_repair_commit_systematic_fallback(rateless_cached,
                                                         &repair, 1) &&
             rateless_cached->next_systematic_repair_symbol == 1,
-        "ESI exhaustion falls back to systematic source symbols");
+        "ESI exhaustion falls back to admitted systematic source symbols");
+  transport_repair_batch_destroy(&repair);
+  CHECK(transport_repair_build_systematic_fallback(
+            &repair_fec_cache, rateless_cached, 2, &repair) &&
+            repair.indices[0] == 1 && repair.indices[1] == 0 &&
+            transport_repair_commit_systematic_fallback(rateless_cached,
+                                                        &repair, 2) &&
+            rateless_cached->next_systematic_repair_symbol == 1,
+        "systematic exhaustion fallback cycles across every source symbol");
   transport_repair_batch_destroy(&repair);
 
   transport_t negotiation_transport = {0};
@@ -464,12 +669,12 @@ int main(void) {
   CHECK(transport_get_effective_repair_mode(
             &negotiation_transport, &negotiation_conn, &rateless_track) ==
             TRANSPORT_REPAIR_MODE_RATELESS,
-        "rateless capability enables degree-of-freedom repair");
+        "rateless repair capability enables degree-of-freedom requests");
   negotiation_transport.repair_mode = TRANSPORT_REPAIR_MODE_INDEXED;
   CHECK(transport_get_effective_repair_mode(
             &negotiation_transport, &negotiation_conn, &rateless_track) ==
             TRANSPORT_REPAIR_MODE_INDEXED,
-        "indexed preference overrides rateless capability");
+        "explicit indexed preference overrides rateless capability");
 
   transport_repair_limiter_t limiter = {0};
   CHECK(transport_repair_limiter_take(&limiter, 4, 100) &&
@@ -479,21 +684,348 @@ int main(void) {
             !transport_repair_limiter_take(&limiter, 4, 100) &&
             transport_repair_limiter_take(&limiter, 4, 350),
         "repair limiter burst and smooth refill");
+  transport_repair_limiter_t cohort_limiter = {0};
+  size_t cohort_accepted = 0;
+  for (size_t receiver = 0; receiver < 1000; receiver++)
+    cohort_accepted += transport_repair_limiter_take(
+        &cohort_limiter,
+        TRANSPORT_DEFAULT_MAX_AGGREGATE_REPAIR_REQUESTS_PER_SECOND, 100);
+  CHECK(cohort_accepted ==
+            TRANSPORT_DEFAULT_MAX_AGGREGATE_REPAIR_REQUESTS_PER_SECOND,
+        "thousand-receiver repair burst is source bounded");
+  size_t cohort_recovered = 0;
+  for (size_t receiver = 0;
+       receiver < TRANSPORT_DEFAULT_MAX_AGGREGATE_REPAIR_REQUESTS_PER_SECOND;
+       receiver++)
+    cohort_recovered += transport_repair_limiter_take(
+        &cohort_limiter,
+        TRANSPORT_DEFAULT_MAX_AGGREGATE_REPAIR_REQUESTS_PER_SECOND, 1100);
+  CHECK(cohort_recovered ==
+            TRANSPORT_DEFAULT_MAX_AGGREGATE_REPAIR_REQUESTS_PER_SECOND,
+        "aggregate throttle refills and cannot permanently suppress recovery");
+
+  transport_repair_suppression_t suppression = {0};
+  uint16_t request_a[] = {1, 7};
+  uint16_t request_b[] = {1, 8};
+  uint64_t fingerprint_a =
+      transport_repair_request_fingerprint(0, request_a, 2);
+  uint64_t fingerprint_b =
+      transport_repair_request_fingerprint(0, request_b, 2);
+  CHECK(
+      transport_repair_request_fingerprint(QLINQ_WIRE_NACK_RATELESS, NULL, 3) !=
+          transport_repair_request_fingerprint(QLINQ_WIRE_NACK_RATELESS, NULL,
+                                               4),
+      "rateless suppression fingerprint includes requested deficit");
+  transport_repair_suppression_record(&suppression, 9, 10, fingerprint_a, 125);
+  CHECK(transport_repair_suppression_contains(&suppression, 9, 10,
+                                              fingerprint_a, 124) &&
+            !transport_repair_suppression_contains(&suppression, 9, 10,
+                                                   fingerprint_b, 124) &&
+            !transport_repair_suppression_contains(&suppression, 9, 10,
+                                                   fingerprint_a, 125),
+        "repair suppression is exact and expires");
   uint16_t unordered_request[] = {7, 1, 7};
   CHECK(transport_repair_normalize_indices(unordered_request, 3) == 2 &&
-            unordered_request[0] == 1 && unordered_request[1] == 7,
-        "repair request normalization sorts and deduplicates");
+            unordered_request[0] == 1 && unordered_request[1] == 7 &&
+            transport_repair_request_fingerprint(0, unordered_request, 2) ==
+                fingerprint_a,
+        "repair request normalization canonicalizes suppression keys");
+
   CHECK(transport_repair_build(&repair_fec_cache, cached, true, NULL, 0,
                                &repair) &&
             repair.count == cached->data_symbols,
         "whole-object repair is bounded data retransmission");
   transport_repair_batch_destroy(&repair);
+
+  transport_t *scheduler_transport = calloc(1, sizeof(*scheduler_transport));
+  CHECK(scheduler_transport != NULL, "repair scheduler allocation");
+  transport_flexicast_flow_t scheduler_flow = {
+      .active = true, .source = true, .track_id = cached->track_id};
+  uint16_t first_request[] = {3, 1};
+  uint16_t overlapping_request[] = {2, 3};
+  CHECK(transport_flexicast_schedule_repair(
+            scheduler_transport, &scheduler_flow, cached, 0,
+            TRANSPORT_REPAIR_MODE_INDEXED, false, first_request, 2, 100) &&
+            transport_flexicast_schedule_repair(
+                scheduler_transport, &scheduler_flow, cached, 2,
+                TRANSPORT_REPAIR_MODE_INDEXED, false, overlapping_request, 2,
+                105),
+        "repair requests enter aggregation holdoff");
+  transport_flexicast_pending_repair_t *pending =
+      &scheduler_flow.pending_repairs[0];
+  CHECK(
+      TRANSPORT_FLEXICAST_REPAIR_HOLDOFF_MS == QLINQ_FEC_NACK_DELAY_MS &&
+          scheduler_flow.pending_repair_count == 1 && pending->active &&
+          pending->ready_at_ms == 100 + TRANSPORT_FLEXICAST_REPAIR_HOLDOFF_MS &&
+          (pending->requested_symbols[0] &
+           ((UINT64_C(1) << 1U) | (UINT64_C(1) << 2U) | (UINT64_C(1) << 3U))) ==
+              ((UINT64_C(1) << 1U) | (UINT64_C(1) << 2U) |
+               (UINT64_C(1) << 3U)) &&
+          scheduler_transport->stats.repair_requests_merged == 1,
+      "repair aggregation spans minimum NACK backoff without extending holdoff");
+  CHECK(pending->intent_id != 0 && pending->retained_requesters == 2 &&
+            pending->retained_deficit_sum == 4 &&
+            pending->shared_useful_requesters == 2 &&
+            scheduler_flow.repair_requester_count == 2,
+        "repair aggregation retains bounded stable requester identities");
+  uint16_t reduced_request = 1;
+  CHECK(
+      transport_flexicast_schedule_repair(
+          scheduler_transport, &scheduler_flow, cached, 0,
+          TRANSPORT_REPAIR_MODE_INDEXED, false, &reduced_request, 1, 106) &&
+          pending->retained_requesters == 2 &&
+          pending->retained_deficit_sum == 3 &&
+          scheduler_transport->stats.repair_requester_updates == 1,
+      "repeat requester demand updates in place and records deficit progress");
+  sent_object_cache_t scheduled_object = *cached;
+  for (size_t i = 1; i < TRANSPORT_FLEXICAST_PENDING_REPAIRS; i++) {
+    scheduled_object.object_id = 100 + i;
+    CHECK(transport_flexicast_schedule_repair(
+              scheduler_transport, &scheduler_flow, &scheduled_object, i + 10U,
+              TRANSPORT_REPAIR_MODE_INDEXED, false, first_request, 2, 100),
+          "bounded repair pending set fill");
+  }
+  scheduled_object.object_id++;
+  CHECK(!transport_flexicast_schedule_repair(
+            scheduler_transport, &scheduler_flow, &scheduled_object, 100,
+            TRANSPORT_REPAIR_MODE_INDEXED, false, first_request, 2, 100) &&
+            scheduler_flow.pending_repair_count ==
+                TRANSPORT_FLEXICAST_PENDING_REPAIRS &&
+            scheduler_transport->stats.repair_queue_backpressure == 1,
+        "repair pending set rejects overflow with backpressure");
+  scheduler_transport->flexicast.flows = &scheduler_flow;
+  scheduler_transport->flexicast.capacity = 1;
+  scheduler_transport->repair_shadow_log = tmpfile();
+  CHECK(scheduler_transport->repair_shadow_log != NULL,
+        "shadow observation fixture log");
+  transport_flexicast_observe_repair_request(
+      scheduler_transport, &scheduler_flow, cached, 1,
+      TRANSPORT_REPAIR_MODE_INDEXED, false, first_request, 2,
+      TRANSPORT_FLEXICAST_OBS_ACCEPTED, 120);
+  transport_flexicast_observe_repair_request(
+      scheduler_transport, &scheduler_flow, cached, 2,
+      TRANSPORT_REPAIR_MODE_INDEXED, false, overlapping_request, 2,
+      TRANSPORT_FLEXICAST_OBS_SUPPRESSED, 130);
+  CHECK(scheduler_flow.shadow_observation_count == 1 &&
+            scheduler_flow.shadow_requester_count == 2 &&
+            scheduler_flow.shadow_observations[0].accepted_requests == 1 &&
+            scheduler_flow.shadow_observations[0].suppressed_requests == 1 &&
+            scheduler_flow.shadow_observations[0].ready_at_ms ==
+                120 + TRANSPORT_FLEXICAST_SHADOW_OBSERVATION_MS,
+        "shadow observation independently retains accepted and suppressed demand");
+  scheduler_flow.repair_queued[0] =
+      (transport_flexicast_queued_payload_t){.data = malloc(1),
+                                             .size = 1,
+                                             .group_id = cached->group_id,
+                                             .object_id = cached->object_id,
+                                             .symbol_index = 1};
+  scheduler_flow.repair_queued[1] =
+      (transport_flexicast_queued_payload_t){.data = malloc(1),
+                                             .size = 1,
+                                             .group_id = cached->group_id,
+                                             .object_id = 1000,
+                                             .symbol_index = 7};
+  CHECK(scheduler_flow.repair_queued[0].data &&
+            scheduler_flow.repair_queued[1].data,
+        "repair cancellation fixture allocation");
+  scheduler_flow.repair_queue_count = 2;
+  scheduler_flow.repair_queue_bytes = 2;
+  scheduled_object.object_id = 1000;
+  uint16_t already_queued = 7;
+  CHECK(transport_flexicast_schedule_repair(
+            scheduler_transport, &scheduler_flow, &scheduled_object, 101,
+            TRANSPORT_REPAIR_MODE_INDEXED, false, &already_queued, 1, 110) &&
+            scheduler_flow.pending_repair_count ==
+                TRANSPORT_FLEXICAST_PENDING_REPAIRS &&
+            scheduler_transport->stats.repair_requests_merged == 3,
+        "materialized repair suppresses duplicate scheduling");
+  CHECK(transport_flexicast_cancel_repairs_through(
+            scheduler_transport, &cached->track_id, cached->group_id,
+            cached->object_id) == 4 &&
+            scheduler_flow.pending_repair_count ==
+                TRANSPORT_FLEXICAST_PENDING_REPAIRS - 1U &&
+            scheduler_flow.repair_queue_count == 1 &&
+            scheduler_flow.repair_queue_bytes == 1 &&
+            scheduler_flow.repair_queued[0].object_id == 1000 &&
+            scheduler_transport->stats.repair_packets_cancelled == 1 &&
+            scheduler_transport->stats.repair_pending_symbols_cancelled == 3,
+        "checkpoint release cancels and compacts obsolete repairs");
+  scheduler_flow.recent_repairs[0] =
+      (transport_flexicast_recent_repair_t){.active = true,
+                                            .group_id = cached->group_id,
+                                            .object_id = 2000,
+                                            .symbol_index = 9,
+                                            .expires_at_ms = 200};
+  scheduled_object.object_id = 2000;
+  uint16_t recently_sent = 9;
+  CHECK(transport_flexicast_schedule_repair(
+            scheduler_transport, &scheduler_flow, &scheduled_object, 102,
+            TRANSPORT_REPAIR_MODE_INDEXED, false, &recently_sent, 1, 150) &&
+            scheduler_flow.pending_repair_count ==
+                TRANSPORT_FLEXICAST_PENDING_REPAIRS - 1U &&
+            transport_flexicast_schedule_repair(
+                scheduler_transport, &scheduler_flow, &scheduled_object, 102,
+                TRANSPORT_REPAIR_MODE_INDEXED, false, &recently_sent, 1, 201) &&
+            scheduler_flow.pending_repair_count ==
+                TRANSPORT_FLEXICAST_PENDING_REPAIRS,
+        "recent physical repair delays but does not prevent reissue");
+  CHECK(transport_flexicast_cancel_track_repairs(scheduler_transport,
+                                                 &cached->track_id) > 0 &&
+            scheduler_flow.pending_repair_count == 0 &&
+            scheduler_flow.shadow_observation_count == 0 &&
+            scheduler_flow.shadow_requester_count == 0 &&
+            scheduler_flow.repair_queue_count == 0 &&
+            scheduler_flow.repair_queue_bytes == 0 &&
+            scheduler_transport->stats.repair_packets_cancelled == 2,
+        "track release cancels all remaining repair work");
+
+  transport_flexicast_flow_t rateless_flow = {
+      .active = true, .source = true, .track_id = rateless_track};
+  rateless_cached->next_repair_symbol = rateless_cached->total_symbols;
+  CHECK(transport_flexicast_schedule_repair(
+            scheduler_transport, &rateless_flow, rateless_cached, 201,
+            TRANSPORT_REPAIR_MODE_RATELESS, false, NULL, 3, 300) &&
+            transport_flexicast_schedule_repair(
+                scheduler_transport, &rateless_flow, rateless_cached, 202,
+                TRANSPORT_REPAIR_MODE_RATELESS, false, NULL, 5, 305) &&
+            rateless_flow.pending_repair_count == 1 &&
+            rateless_flow.pending_repairs[0].requested_dof == 5 &&
+            scheduler_transport->stats.repair_requests_merged >= 3,
+        "rateless aggregation takes the maximum receiver deficit");
+
+  transport_flexicast_flow_t covered_rateless_flow = {.active = true,
+                                                      .source = true,
+                                                      .track_id =
+                                                          rateless_track,
+                                                      .repair_queue_count = 3};
+  for (size_t i = 0; i < covered_rateless_flow.repair_queue_count; i++) {
+    covered_rateless_flow.repair_queued[i].group_id = object.group_id;
+    covered_rateless_flow.repair_queued[i].object_id = object.object_id;
+    covered_rateless_flow.repair_queued[i].repair_mode =
+        TRANSPORT_REPAIR_MODE_RATELESS;
+  }
+  bool duplicates_bounded = true;
+  for (size_t i = 0; i < 1000; i++)
+    duplicates_bounded &= transport_flexicast_schedule_repair(
+        scheduler_transport, &covered_rateless_flow, rateless_cached, i + 1U,
+        TRANSPORT_REPAIR_MODE_RATELESS, false, NULL, 3, 310);
+  CHECK(duplicates_bounded && covered_rateless_flow.pending_repair_count == 0 &&
+            covered_rateless_flow.repair_queue_count == 3,
+        "queued rateless degrees of freedom bound duplicate requests");
+
+  transport_flexicast_flow_t mixed_mode_flow = {
+      .active = true, .source = true, .track_id = rateless_track};
+  uint16_t mixed_index = 1;
+  CHECK(transport_flexicast_schedule_repair(
+            scheduler_transport, &mixed_mode_flow, rateless_cached, 301,
+            TRANSPORT_REPAIR_MODE_INDEXED, false, &mixed_index, 1, 320) &&
+            transport_flexicast_schedule_repair(
+                scheduler_transport, &mixed_mode_flow, rateless_cached, 302,
+                TRANSPORT_REPAIR_MODE_RATELESS, false, NULL, 2, 320) &&
+            mixed_mode_flow.pending_repair_count == 2 &&
+            mixed_mode_flow.pending_repairs[0].mode !=
+                mixed_mode_flow.pending_repairs[1].mode,
+        "mixed-capability members retain separate repair intents");
+
+  transport_flexicast_flow_t concentrated_flow = {
+      .active = true, .source = true, .track_id = rateless_track};
+  bool concentrated_bounded = true;
+  for (size_t member = 1;
+       member <= TRANSPORT_FLEXICAST_REPAIR_REQUESTERS + 176U; member++)
+    concentrated_bounded &= transport_flexicast_schedule_repair(
+        scheduler_transport, &concentrated_flow, rateless_cached, member,
+        TRANSPORT_REPAIR_MODE_RATELESS, false, NULL, 3, 400);
+  pending = &concentrated_flow.pending_repairs[0];
+  CHECK(concentrated_bounded && concentrated_flow.pending_repair_count == 1 &&
+            concentrated_flow.repair_requester_count ==
+                TRANSPORT_FLEXICAST_REPAIR_REQUESTERS &&
+            concentrated_flow.repair_requester_capacity ==
+                TRANSPORT_FLEXICAST_REPAIR_REQUESTERS &&
+            pending->retained_requesters ==
+                TRANSPORT_FLEXICAST_REPAIR_REQUESTERS &&
+            pending->overflow_requests == 176 &&
+            pending->overflow_deficit_sum == 176U * 3U &&
+            pending->requested_dof == 3,
+        "concentrated 1,000-plus member demand retains a bounded sparse sample "
+        "without inflating rateless repair");
+  scheduler_transport->flexicast.flows = &concentrated_flow;
+  scheduler_transport->flexicast.capacity = 1;
+  CHECK(transport_flexicast_cancel_track_repairs(scheduler_transport,
+                                                 &rateless_track) == 3 &&
+            concentrated_flow.repair_requester_count == 0,
+        "repair checkpoint expiry releases requester records with the intent");
+
+  transport_flexicast_flow_t dispersed_flow = {
+      .active = true, .source = true, .track_id = cached->track_id};
+  bool dispersed_bounded = true;
+  for (size_t member = 1; member <= 1000; member++) {
+    scheduled_object = *cached;
+    scheduled_object.object_id =
+        5000U + member % TRANSPORT_FLEXICAST_PENDING_REPAIRS;
+    uint16_t missing_symbol = (uint16_t)(member % 8U);
+    dispersed_bounded &= transport_flexicast_schedule_repair(
+        scheduler_transport, &dispersed_flow, &scheduled_object, member,
+        TRANSPORT_REPAIR_MODE_INDEXED, false, &missing_symbol, 1, 500);
+  }
+  CHECK(dispersed_bounded &&
+            dispersed_flow.pending_repair_count ==
+                TRANSPORT_FLEXICAST_PENDING_REPAIRS &&
+            dispersed_flow.repair_requester_count == 1000 &&
+            dispersed_flow.repair_requester_capacity <=
+                TRANSPORT_FLEXICAST_REPAIR_REQUESTERS,
+        "dispersed thousand-member loss scales with active demand and bounded "
+        "intents");
+  for (size_t member = 1001; member <= 1050; member++) {
+    scheduled_object = *cached;
+    scheduled_object.object_id =
+        5000U + member % TRANSPORT_FLEXICAST_PENDING_REPAIRS;
+    uint16_t missing_symbol = (uint16_t)(member % 8U);
+    dispersed_bounded &= transport_flexicast_schedule_repair(
+        scheduler_transport, &dispersed_flow, &scheduled_object, member,
+        TRANSPORT_REPAIR_MODE_INDEXED, false, &missing_symbol, 1, 501);
+  }
+  CHECK(dispersed_bounded &&
+            dispersed_flow.repair_requester_count ==
+                TRANSPORT_FLEXICAST_REPAIR_REQUESTERS &&
+            scheduler_transport->stats.repair_requester_overflow >= 202 &&
+            scheduler_transport->stats.repair_requester_records_peak ==
+                TRANSPORT_FLEXICAST_REPAIR_REQUESTERS,
+        "requester metadata overflow preserves aggregate repair scheduling");
+  scheduler_transport->flexicast.flows = &dispersed_flow;
+  CHECK(transport_flexicast_cancel_track_repairs(scheduler_transport,
+                                                 &cached->track_id) > 0 &&
+            dispersed_flow.repair_requester_count == 0,
+        "dispersed requester state expires at checkpoint release");
+
+  free(scheduler_flow.repair_requesters);
+  free(rateless_flow.repair_requesters);
+  free(covered_rateless_flow.repair_requesters);
+  free(mixed_mode_flow.repair_requesters);
+  free(concentrated_flow.repair_requesters);
+  free(dispersed_flow.repair_requesters);
+  fclose(scheduler_transport->repair_shadow_log);
+  free(scheduler_transport);
+
   transport_fec_cache_destroy(&repair_fec_cache);
-  transport_sent_cache_destroy(&rateless_cache);
   transport_sent_cache_destroy(&sent_cache);
+  transport_sent_cache_destroy(&rateless_cache);
 
   transport_sent_cache_t bounded_cache = {0};
-  for (uint64_t object_id = 0; object_id < TRANSPORT_SENT_CACHE_SIZE;
+  object.object_id = 0;
+  CHECK(transport_sent_cache_store(&bounded_cache, &object, 3, 2, 2, false),
+        "bounded sent-object cache initial insert");
+  sent_object_cache_t *retry_entry = transport_sent_cache_find(
+      &bounded_cache, &object.track_id, object.group_id, object.object_id);
+  CHECK(retry_entry &&
+            transport_sent_cache_store(&bounded_cache, &object, 4, 2, 2,
+                                       false) &&
+            transport_sent_cache_find(&bounded_cache, &object.track_id,
+                                      object.group_id, object.object_id) ==
+                retry_entry &&
+            retry_entry->total_symbols == 4 &&
+            retry_entry->next_repair_symbol == 4,
+        "partial publication retry updates one recovery-cache entry");
+  for (uint64_t object_id = 1; object_id < TRANSPORT_SENT_CACHE_SIZE;
        object_id++) {
     object.object_id = object_id;
     CHECK(transport_sent_cache_store(&bounded_cache, &object, 3, 2, 2, false),
