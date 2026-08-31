@@ -6,6 +6,13 @@ wrapper in `qlinq.h` adds owned events and named streams; see
 split into small internal modules with one-way dependencies toward shared data
 types and the wire codec.
 
+Applications that link qlinq should use this API directly. `qlinq-app` is the
+reference direct consumer: it drives `transport_tick`, integrates
+`transport_get_poll_fds` and `transport_get_first_timeout`, publishes with
+`transport_publish_ex`, and consumes callbacks without a Unix-socket hop. The
+`data_uds` interface remains a daemon adapter for out-of-process packet devices
+such as `qlinq-tund`, not the primary application API.
+
 | Module | Responsibility |
 | --- | --- |
 | `qlinq.c` | Application contexts, endpoints, named streams and owned event queues |
@@ -21,6 +28,7 @@ types and the wire codec.
 | `transport_subscriptions.c` | Track/alias lookup, allocation, and stream binding |
 | `transport_memory.c` | Packet arena and FEC assembler allocation ownership |
 | `transport_fec_state.c` | Reusable FEC contexts and sent-object repair cache |
+| `transport_flexicast.c` | Cohort binding, reference-counted IPv4/IPv6 SSM membership, native multicast or packet replication, physical-send accounting, token-bucket execution, and fallback |
 | `transport_paths.c` | QUIC-path mapping and physical-path selection |
 | `transport_repair.c` | Bounded NACK symbol reconstruction |
 | `transport_scheduler.c` | Per-connection path and redundancy planning |
@@ -76,25 +84,73 @@ the scope ID.
   kernel. Quicly is not asked for another batch unless every possible output
   socket has room for one complete batch.
 - `transport_wire` is the only code that reads or writes multibyte wire fields.
+- Quicly owns Flexicast negotiation and frames, packet protection, the shared
+  packet-number/replay spaces, ACK aggregation, per-receiver delivery state,
+  loss retirement, and the pluggable multicast congestion-controller API.
+  qlinq binds Flow IDs to authenticated subscriptions and owns FEC, endpoint
+  choice, membership lifetime, controller selection, physical-send cost,
+  bounded pacing queues, and fallback.
+- Flexicast membership is capacity-driven rather than machine-word-driven.
+  Quicly keeps a hash-indexed dynamic slot table, a multiword active-member
+  bitmap, and one contiguous pending-ACK bitmap slab for the sent window. qlinq
+  mirrors the authenticated connection cohort with a dense, hash-indexed table
+  sized from `limits.max_connections`. Both built-in controllers allocate to
+  the same flow capacity. The supported hard ceiling is 16,384 members, and
+  the test gate exercises 1,000 members including safe slot reuse while a
+  packet is outstanding. The conservative controller uses indexed rate and
+  feedback-deadline heaps, so feedback and churn update the limiting receiver
+  in `O(log N)`. Native multicast sends use cached listener counts and one
+  delivery epoch instead of walking the cohort; receiver ACKs clear epoch debt
+  individually.
 - Path measurements and scheduler state belong to a connection; one client's
   RTT, loss, or telemetry must never determine another client's schedule.
 - Incoming FEC assemblers share a 64 MiB transport-wide memory budget and each
-  connection has eight active assembler slots. Growth must fit both the old
-  buffers and their replacements within that budget until copying completes.
-  Rejected growth preserves partial data; reusing existing capacity requires
-  no additional allocation allowance.
-- NACK handling sends at most 64 requested symbols per repair and accepts at
-  most 16 repair requests per connection per second. An exact NACK is coalesced
-  while its reliable frame remains retained, including partial ACKs and later
-  ACKed ranges behind a missing prefix. Once released, a lost repair response
-  can trigger another request. Queue pressure defers NACKs without spending
-  rate tokens or consuming essential-control reserves. Outbound requests also
-  share `max_aggregate_nack_requests_per_second` across all peers (default 16,
-  maximum 65535). This token bucket permits a one-second burst, then refills
-  continuously; zero configuration selects the default. Recovery rotates its
-  starting peer after an admitted or coalesced request, and pauses request
-  scans until the aggregate budget refills. Assembler expiration continues
-  during that pause. These limits are local policy, not wire negotiation.
+  connection has eight active assembler slots.
+- NACK handling sends at most 64 requested symbols per repair. Smooth token
+  buckets accept at most 16 requests per connection per second by default and
+  at most 256 requests per source transport per second, independent of cohort
+  size. `max_repair_requests_per_second` and
+  `max_aggregate_repair_requests_per_second` configure those failsafes.
+- Outbound NACKs use the same per-connection request ceiling. Missing objects
+  remain pending until repair data arrives, so either a local or source-wide
+  ceiling can defer work without creating an unrecoverable hole.
+- A NACK from an active Flexicast member produces repair symbols on its shared
+  Flexicast flow, not on the requester's data socket. Those symbols therefore
+  use the existing protected packet-number space, pacer, physical-airtime
+  accounting, and pluggable congestion controller. Exact feedback is
+  suppressed for 250 milliseconds in a bounded 64-entry fingerprint cache.
+  Accepted feedback then enters a separate 64-object repair-intent table:
+  requests for the same object are unioned during a fixed 25 ms holdoff aligned
+  with the minimum randomized NACK backoff, so complementary receiver losses
+  become one bounded repair batch rather than repeated batches. Symbols already
+  materialized in the repair queue remain
+  part of the suppression state until physically sent. Once the entire
+  checkpoint cohort acknowledges an object range, qlinq cancels pending and
+  queued repairs for that range while releasing the matching source cache.
+- Rateless-coded tracks negotiate a separate rateless-repair capability.
+  `auto` selects constant-size degree-of-freedom feedback when that capability
+  is present and falls back to indexed missing-ESI feedback for legacy peers;
+  callers can force indexed repair with `transport_config_t.repair_mode`.
+  Indexed aggregation takes the bounded union of ESIs. Rateless aggregation
+  takes the maximum receiver deficit and allocates fresh monotonic RaptorQ ESIs
+  from the maximum initially emitted symbol. Mixed-capability members may use
+  both repair modes on one protected flow without conflating their intents.
+- Materialized repairs use a dedicated 128-packet queue while ordinary data
+  retains its 256-packet queue. Both queues share the configured per-socket
+  byte budget. A repair receives priority after 250 ms without repair service;
+  while both queues remain backlogged, subsequent repairs require three bytes
+  of data airtime credit per byte of repair airtime (a 25% repair share). The
+  repair queue drains without that ratio when no new data is waiting, ensuring
+  finite transfers can complete.
+- Flexicast receivers spread initial and repeated feedback over a deterministic
+  25--250 ms window seeded independently per process. The first shared repair
+  cancels pending whole-object feedback and narrows later symbol NACKs. Ordinary
+  unicast recovery retains the 25 ms delay. This adapts multicast backoff,
+  suppression, aggregation, and failsafe-budget concepts without exposing
+  another protocol's wire semantics through Quicly.
+- Production transports seed that feedback window from the operating system.
+  Reproducible scenario harnesses may provide an explicit local seed; the seed
+  is neither sent on the wire nor used for packet protection.
 - Event payload pointers are borrowed and valid only during the callback.
 - The creating thread owns a transport. Callbacks run synchronously on that
   thread and may call non-driving APIs; recursive ticks, callback destruction,
@@ -123,33 +179,50 @@ UDP payload. Received objects preserve the subscribed track flags; applications
 recognize grouped FEC data when either FEC flag is present.
 
 Finite rateless publishers call `transport_finish_track` after their final
-application record. Publication assigns internal FEC object IDs, emits a
-rolling checkpoint every 32 objects, and sends a reliable completion
-watermark. Receivers keep at most eight missing-window bitmaps and retry one
-absent object at a time. Cumulative ACKs release source repair-cache entries;
-if eight windows remain unacknowledged, publication reports backpressure rather
-than evicting recoverable objects. The source cache also has a configurable
-`max_recovery_cache_bytes` payload budget, defaulting to 16 MiB, and admits new
-objects only when both byte and entry limits can be met without evicting
-protected objects. Configuration must hold a maximum FEC object and one
-32-object recovery window at the grouped publication size. Completed cumulative
-checkpoints and repeated final watermarks retire obsolete receiver gaps and
-partial objects through the acknowledged object ID, preserving other groups,
-tracks, and later objects.
+application record. Publication owns per-track internal FEC object numbering;
+the finish call flushes a partial group and queues a reliable completion
+watermark on every eligible control stream. A negotiated rolling checkpoint is
+also queued every 32 FEC objects. Receive-side protocol state retains up to
+eight missing-window bitmaps and retries one absent object at a time rather than
+injecting an entire repair window into a constrained radio queue. Reliable
+completion ACKs let an all-capable receiver cohort release cached source
+objects; eight unacknowledged windows instead produce publication backpressure.
+This recovery lifecycle belongs in qlinq because it describes
+application-track/FEC object lifetime, while Quicly continues to own delivery
+and protection of the reliable control bytes.
 
 `transport_get_stats` reports protocol errors, handshake and reconnect counts,
-publication outcomes, FEC and repair pressure, thread-contract violations, UDP
-would-block/errors, and current/peak egress occupancy.
+publication outcomes, FEC outcomes, thread-contract violations, UDP
+would-block/errors, current/peak egress occupancy, Flexicast queue/rate
+pressure, selected congestion controller and its current rate/burst/limiting
+receiver, repair requests, suppressed, merged, or source-throttled feedback,
+repair batches, repair queue pressure and age, shared repair symbols and
+physical repair airtime, indexed-versus-rateless request counts, rateless
+symbols, ESI exhaustion, completed-object replay suppression, and kernel
+membership joins/leaves.
+Completion watermark, rolling checkpoint, ACK, cache-release, and cache-
+backpressure counts are also reported so finite-flow experiments can
+distinguish recovery-window behavior from ordinary gap repair.
+Controller output telemetry also reports rate increases and reductions, floor
+entries and exits, ACK and other growth, loss/RTT/ECN/timeout/rate-limit/other
+reductions, and growth freezes caused by external load. Quicly attributes these
+transport-generic controller decisions; qlinq aggregates them with transfer,
+recovery-tail, repair-debt, and physical-send measurements without teaching
+Quicly about objects or NACK semantics.
 `transport_get_conn_stats` adds stable connection IDs, negotiated limits,
-authentication state, total active subscriptions across both directions, and
-receive counters. Stream statistics include retained bytes, frames, vector
-capacity, their peaks, blocked writes, and control failures. Cache statistics
-include current and peak payload bytes and entry counts; repair counters
-separate coalesced requests from deferred requests.
-Checkpoint, completion, ACK, cache-release, cache-backpressure, pending-window,
-and oldest-unacknowledged-age counters expose bounded recovery behavior.
+authentication state, subscriptions, and receive counters.
 
 Component-level tests cover these ownership and lookup boundaries. End-to-end
 tests cover connection establishment, authentication, reliable streams,
 datagrams, FEC/NACK recovery, IPv4/IPv6 mutual TLS, reconnect after peer
-restart, live interface removal, and multipath behavior.
+restart, live interface removal, multipath behavior, protected Flexicast fanout,
+multicast pacing, and shared kernel-membership teardown.
+
+`transport_unsubscribe` queues the reliable qlinq unsubscribe, immediately
+releases the receiver flow and its reference-counted kernel SSM membership,
+and permits a later subscribe to negotiate a fresh flow. The source rekeys any
+subscribers that remain in the cohort. `make check-flexicast-netns` is an
+optional Linux integration test that uses root/CAP_NET_ADMIN or unprivileged
+user namespaces to create isolated network namespaces and a bridge. It
+validates native IPv4 and IPv6 fan-out plus kernel rejection of multicast
+traffic from the wrong source.

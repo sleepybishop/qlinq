@@ -37,7 +37,7 @@ a 20-byte metadata header followed by application data.
 | 7 | Reliable track object | Object metadata followed by object bytes |
 | 8 | NACK | NACK descriptor |
 | 9 | HELLO | Capability and resource-limit advertisement |
-| 10 | Reserved | Experimental Flexicast branch; rejected here |
+| 10 | Flexicast binding | Flow ID, key epoch, and track alias |
 | 11 | Track completion | Alias, group ID, and final FEC object ID |
 | 12 | Recovery checkpoint | Alias, group ID, first and final FEC object IDs |
 | 13 | Recovery checkpoint ACK | Alias, group ID, and final FEC object ID |
@@ -63,12 +63,122 @@ The HELLO payload is 20 bytes:
 
 Defined capabilities are reliable objects (`0x01`), datagrams (`0x02`),
 Reed-Solomon FEC (`0x04`), rateless FEC (`0x08`), multipath (`0x10`),
-application authentication (`0x20`), rolling recovery checkpoints (`0x80`),
-and degree-of-freedom rateless repair (`0x100`). Unknown capability bits,
-duplicate HELLO frames, a peer with the
-wrong role, or an application frame before HELLO are protocol errors. Each
-connection uses the lower local/peer object, subscription, and UDP-payload
-limits.
+application authentication (`0x20`), and experimental Flexicast datagrams
+(`0x40`). Rolling recovery checkpoints and completion acknowledgements use
+`0x80`; true rateless repair requests use `0x100`. Unknown capability bits,
+duplicate HELLO frames, a peer with the wrong role, or an application frame
+before HELLO are protocol errors. Each connection uses the lower local/peer
+object, subscription, and UDP-payload limits.
+
+## Experimental Flexicast control
+
+Flexicast is opt-in and currently applies only to unreliable track datagrams.
+Reliable objects remain ordinary per-connection QUIC streams. The implemented
+backend protects one packet using a flow-wide packet-number space and traffic
+secret. With an IPv4 SSM source policy, it sends those bytes once to the
+announced multicast group; receivers join the group before returning JOIN.
+Without that policy, or when local multicast submission fails, qlinq replicates
+the identical bytes to READY members over the existing UDP sockets. Both paths
+share group security, replay protection, FEC fanout, and acknowledgement
+aggregation.
+
+If a receiver cannot join the announced group, it accepts the announcement but
+withholds JOIN. The source therefore keeps that subscriber on its ordinary
+authenticated unicast data path instead of treating the local membership error
+as a connection protocol failure.
+
+Membership changes rotate the flow secret using a higher-sequence `FC_KEY` and
+keep packet numbers monotonic across epochs. Members temporarily return to
+ordinary unicast until they acknowledge the new epoch with READY. A member that
+has at least 32 unacknowledged packets for one second is sent LEAVE and demoted
+to ordinary unicast; stale PATH_ACK frames already queued before demotion are
+silently ignored.
+
+Receiver SSM memberships are keyed by address family, source address, group
+address, UDP port, and interface index. Multiple Flexicast flows using that
+tuple share one kernel membership. IPv4 uses `IP_ADD_SOURCE_MEMBERSHIP` and
+`IP_DROP_SOURCE_MEMBERSHIP`; IPv6 uses the RFC 3678
+`MCAST_JOIN_SOURCE_GROUP` and `MCAST_LEAVE_SOURCE_GROUP` API. The final flow
+drops the membership, and transport shutdown explicitly drops all remaining
+memberships before closing the family-specific multicast sockets. IPv4 groups
+must be in `232/8`; IPv6 groups must be in the RFC 4607 `ff3x::/32` SSM range.
+
+An application unsubscribe sends the existing reliable `UNSUBSCRIBE` control
+frame and retires the receiver's Flexicast flow immediately. A redundant
+`FC_STATE(LEAVE)` accelerates source-side removal; a late `LEAVE` for an already
+retired source flow is ignored. Re-subscribing starts the bind/announce/join/key
+exchange again, so it is also the explicit retry after a route or interface
+outage has been repaired.
+
+Rateless data receivers retain a bounded 256-object completed-delivery window.
+Repair or redundant symbols for an object in that window are discarded before
+assembler allocation, so a completed object produces exactly one application
+event. Objects older than the window are treated as expired rather than being
+resurrected by very late repair traffic.
+
+Checkpoint-capable rateless publishers send a reliable 28-byte
+`TRACK_CHECKPOINT` after every 32 internal FEC objects. Its payload is the
+one-byte track alias, one-byte flags, two reserved zero bytes, and the 64-bit
+group, first-object, and final-object IDs. The `BASELINE` flag (`0x01`) tells a
+late subscriber where its recovery obligation begins without requesting the
+older window. The receiver retains at most eight outstanding 32-object
+windows and requests absent objects one at a time every 500 milliseconds;
+partially assembled objects continue using symbol-level NACKs. Once every
+object in a window has been delivered, it returns a reliable 17-byte
+`TRACK_CHECKPOINT_ACK`.
+
+When a finite publisher finishes, it flushes grouped data and sends the existing
+17-byte `TRACK_END`. For checkpoint-capable peers this is the final checkpoint
+and is acknowledged through the same ACK frame; older peers retain the final
+32-object recovery behavior without sending an ACK. The source protects cached
+objects from ring eviction while an all-capable subscribed cohort has
+unacknowledged windows. It releases a window only after every member has
+acknowledged it. A late subscriber starts after the latest emitted checkpoint,
+and unsubscribe or connection teardown removes the member from the cohort.
+Eight unacknowledged windows exhaust the 256-object repair cache and apply
+publication backpressure rather than silently overwriting recoverable data.
+
+The source holds Flexicast payloads in bounded plaintext queues until a
+per-flow token bucket permits transmission. Ordinary data is limited to 256
+packets and repair data to 128 packets; the two queues share the configured
+per-socket egress byte budget. A pluggable Quicly controller
+produces the logical flow rate, burst, inflight target, limiting receiver, and
+next feedback timeout. qlinq executes that output and accounts for physical
+cost: replicated-unicast transmission charges one packet per recipient, while
+native multicast charges one packet total. The `multicast` controller follows
+the limiting receiver with conservative additive growth and multiplicative
+reduction. The `adaptive` controller adds flat-loss baseline learning,
+queue-delay and ECN classification, active-sender-aware growth, median-rate
+catch-up, and recovery probes for radio-oriented meshes. The controller name is
+an implementation profile, not a wire negotiation value. qlinq also reports
+transport-generic queued external work, age, and physical-airtime share. That
+signal freezes adaptive growth while work is outstanding; it does not reduce
+the total path rate, because doing so would also starve the repair service that
+must clear the signal.
+
+The initial receiver ACK in each key epoch is immediate so short flows produce
+feedback. Subsequent packets are acknowledged as ranges after the negotiated
+delay or packet-frequency threshold, reducing control-path fan-in without
+sacrificing startup liveness. Queue exhaustion is reported as publication
+backpressure, and token and controller deadlines participate in
+`transport_get_first_timeout`. Queuing plaintext ensures a payload delayed
+across an epoch change is protected only with the current flow key. Permanent
+native-send errors immediately use the identical protected packet on the
+replicated-unicast path; only transient would-block errors enter the UDP egress
+queue.
+
+Flexicast capability, endpoint announcement, member state, and key exchange use
+the transport parameter and `FC_ANNOUNCE`, `FC_STATE`, and `FC_KEY` frames from
+`draft-navarre-quic-flexicast-02`. The qlinq binding payload is 16 bytes: alias,
+three reserved zero bytes, 64-bit Flow ID, and 32-bit key epoch. It carries only
+the application metadata absent from `FC_ANNOUNCE`. Receivers return multicast
+packet acknowledgements in MPQUIC `PATH_ACK` frames on their unicast connection,
+using the Flow ID as `path_id` as specified by the Flexicast draft.
+
+The protected Flexicast packet format below this control protocol is private
+and experimental. It is implemented in the Quicly fork so header protection,
+AEAD, shared packet numbers, anti-replay state, and per-member ACK accounting
+stay transport invariants rather than qlinq publication policy.
 
 A track descriptor contains alias, track type, flags, one-byte name length,
 and up to 63 name bytes. A NACK descriptor contains alias, a flags byte,
@@ -81,26 +191,25 @@ In indexed mode, the count is followed by that many 16-bit missing ESIs. A
 whole-object request has a zero count. In rateless mode, the 20-byte descriptor
 has no ESI list: the count is the number of additional degrees of freedom. A
 rateless whole-object request has a zero count because the source derives the
-initial deficit from the cached object's source-symbol count. Peers without
-the rateless-repair capability continue using indexed NACKs.
+initial bounded deficit from the cached object's source-symbol count. Peers
+without the rateless-repair capability continue using indexed NACKs for a
+rateless-coded track.
 
-The source emits fresh monotonic RaptorQ ESIs and commits only those admitted
-to its bounded datagram queue. Once the 1,024-symbol ESI namespace is
-exhausted, it cycles retained systematic symbols so recovery remains possible
-without unbounded sender state. Per-peer and source-wide token buckets bound
-repair request load.
-
-Checkpoint-capable rateless publishers send a reliable 28-byte recovery
-checkpoint after every 32 internal FEC objects. The receiver retains at most
-eight outstanding windows and requests absent objects one at a time every 500
-milliseconds. Once every object in a window is delivered, it returns a
-reliable 17-byte cumulative checkpoint ACK.
-
-`transport_finish_track` flushes grouped data and sends a 17-byte track
-completion marker. For checkpoint-capable peers it is the final checkpoint and
-uses the same ACK. The source protects cached objects from eviction until every
-subscribed capable peer has acknowledged them; a full 256-object protected
-cache applies publication backpressure instead of discarding repair state.
+NACK frames remain reliable and private to each receiver's QUIC connection.
+For an active Flexicast member, the resulting FEC repair datagrams are sent on
+the protected group flow so one physical repair can satisfy the cohort. A
+bounded randomized receiver backoff lets an earlier shared repair suppress
+later feedback without making NACK contents visible to peers. The source
+suppresses exact repeats for 250 milliseconds and enforces both per-peer and
+aggregate request token buckets. During a fixed 25 ms holdoff aligned with the
+minimum randomized NACK backoff, indexed requests are combined by bounded union
+while rateless requests are combined by maximum remaining deficit. At most 64
+repair intents can await aggregation and at most
+64 symbols are materialized per batch. Rateless repair uses fresh monotonic
+RaptorQ ESIs and stops cleanly at the 1,024-symbol implementation bound. A
+materialized symbol suppresses duplicate scheduling until it is sent, and an
+all-receiver checkpoint ACK cancels obsolete queued repairs through the
+acknowledged object.
 
 Reliable-object metadata contains an alias, keyframe flag, priority, one
 reserved zero byte, 64-bit group ID, and 64-bit object ID. Each unidirectional
