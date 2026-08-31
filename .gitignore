@@ -2,10 +2,9 @@
 qlinqd
 qlinq-app
 qlinq-tund
-qlinq-tun
-libqlinq.a
 t/00util/test_fec
 t/00util/test_transport
+t/00util/test_flexicast_transport
 t/00util/test_uds
 t/00util/test_audio
 t/00util/test_inputd
@@ -48,6 +47,7 @@ logs/
 crash-*
 examples/data_multipath_benchmark
 tmp/
+
 .tmp.dprobes.h
 
 t/00util/test_egress_errors
