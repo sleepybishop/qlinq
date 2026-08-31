@@ -28,29 +28,23 @@ static bool refill_limiter(transport_repair_limiter_t *limiter,
     limiter->last_refill_ms = now_ms;
   }
 
-  return true;
-}
-
-uint64_t transport_repair_limiter_wait_ms(transport_repair_limiter_t *limiter,
-                                          size_t requests_per_second,
-                                          int64_t now_ms) {
-  if (!refill_limiter(limiter, requests_per_second, now_ms))
-    return UINT64_MAX;
-  if (limiter->tokens_milli >= 1000U)
-    return 0;
-  uint64_t missing = 1000U - limiter->tokens_milli;
-  return (missing + requests_per_second - 1U) / requests_per_second;
-}
-
-bool transport_repair_limiter_take(transport_repair_limiter_t *limiter,
-                                   size_t requests_per_second, int64_t now_ms) {
-  if (!refill_limiter(limiter, requests_per_second, now_ms))
-    return false;
-
   if (limiter->tokens_milli < 1000U)
     return false;
   limiter->tokens_milli -= 1000U;
   return true;
+}
+
+uint64_t transport_repair_request_fingerprint(uint8_t flags,
+                                              const uint16_t *indices,
+                                              size_t count) {
+  uint64_t hash = UINT64_C(1469598103934665603);
+  hash = (hash ^ flags) * UINT64_C(1099511628211);
+  hash = (hash ^ count) * UINT64_C(1099511628211);
+  for (size_t i = 0; indices && i < count; i++) {
+    hash = (hash ^ (indices[i] >> 8)) * UINT64_C(1099511628211);
+    hash = (hash ^ (indices[i] & 0xffU)) * UINT64_C(1099511628211);
+  }
+  return hash;
 }
 
 size_t transport_repair_normalize_indices(uint16_t *indices, size_t count) {
@@ -70,6 +64,39 @@ size_t transport_repair_normalize_indices(uint16_t *indices, size_t count) {
     if (unique == 0 || indices[i] != indices[unique - 1U])
       indices[unique++] = indices[i];
   return unique;
+}
+
+bool transport_repair_suppression_contains(
+    const transport_repair_suppression_t *suppression, uint64_t group_id,
+    uint64_t object_id, uint64_t request_fingerprint, int64_t now_ms) {
+  if (!suppression)
+    return false;
+  for (size_t i = 0; i < TRANSPORT_REPAIR_SUPPRESSION_ENTRIES; i++) {
+    const transport_repair_suppression_entry_t *entry =
+        &suppression->entries[i];
+    if (entry->active && entry->expires_at_ms > now_ms &&
+        entry->group_id == group_id && entry->object_id == object_id &&
+        entry->request_fingerprint == request_fingerprint)
+      return true;
+  }
+  return false;
+}
+
+void transport_repair_suppression_record(
+    transport_repair_suppression_t *suppression, uint64_t group_id,
+    uint64_t object_id, uint64_t request_fingerprint, int64_t expires_at_ms) {
+  if (!suppression)
+    return;
+  transport_repair_suppression_entry_t *entry =
+      &suppression->entries[suppression->next_entry];
+  *entry = (transport_repair_suppression_entry_t){
+      .active = true,
+      .group_id = group_id,
+      .object_id = object_id,
+      .request_fingerprint = request_fingerprint,
+      .expires_at_ms = expires_at_ms};
+  suppression->next_entry =
+      (suppression->next_entry + 1U) % TRANSPORT_REPAIR_SUPPRESSION_ENTRIES;
 }
 
 void transport_repair_batch_destroy(transport_repair_batch_t *batch) {
@@ -223,6 +250,7 @@ bool transport_repair_build_rateless(transport_fec_cache_t *fec_cache,
     count = available;
   if (count == 0)
     return false;
+
   uint16_t indices[TRANSPORT_REPAIR_MAX_SYMBOLS];
   for (size_t i = 0; i < count; i++)
     indices[i] = (uint16_t)(object->next_repair_symbol + i);

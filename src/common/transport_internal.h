@@ -6,9 +6,11 @@
 #include "transport.h"
 #include "transport_egress.h"
 #include "transport_fec_state.h"
+#include "transport_flexicast.h"
 #include "transport_memory.h"
 #include "transport_paths.h"
 #include "transport_repair.h"
+#include "transport_repair_planner.h"
 #include "transport_subscriptions.h"
 
 #include "picotls.h"
@@ -16,15 +18,45 @@
 #include "quicly.h"
 
 #include <pthread.h>
+#include <stdio.h>
 #include <stdatomic.h>
 
 #define QLINQ_FEC_ASSEMBLER_TIMEOUT_MS 2000
 #define QLINQ_FEC_NACK_DELAY_MS 25
-#define QLINQ_FEC_REPAIR_DEDUP_MS 25
+#define QLINQ_FEC_MULTICAST_NACK_BACKOFF_MAX_MS 250
+#define QLINQ_FEC_REPAIR_SUPPRESSION_MS 250
 #define QLINQ_FEC_COMPLETION_RETRY_MS 500
-#define QLINQ_CONNECTION_CACHE_SLOTS 256U
+#define QLINQ_RECOVERY_WINDOW_OBJECTS 32U
+#define QLINQ_RECOVERY_MAX_WINDOWS 8U
+#define QLINQ_RECOVERY_HISTORY_OBJECTS                                         \
+  (QLINQ_RECOVERY_WINDOW_OBJECTS * QLINQ_RECOVERY_MAX_WINDOWS)
 #define QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY 256U
-#define QLINQ_COMPLETED_OBJECTS 256U
+
+typedef struct {
+  bool active;
+  uint64_t group_id;
+  uint64_t first_object_id;
+  uint64_t final_object_id;
+  uint32_t missing_mask;
+  uint8_t cursor;
+  int64_t last_request_ms;
+} transport_recovery_window_t;
+
+typedef struct {
+  uint64_t last_seen;
+  bool seen_initialized;
+  uint64_t pending_base;
+  uint32_t pending_mask;
+  uint64_t group_id;
+  int64_t detected_at_ms;
+  uint64_t largest_delivered;
+  uint64_t delivered_mask[QLINQ_RECOVERY_HISTORY_OBJECTS / 64U];
+  bool delivered_initialized;
+  bool checkpoint_initialized;
+  bool shared_delivery;
+  uint64_t last_checkpoint_object_id;
+  transport_recovery_window_t recovery_windows[QLINQ_RECOVERY_MAX_WINDOWS];
+} transport_object_gap_state_t;
 
 typedef struct {
   moq_track_id_t track_id;
@@ -35,6 +67,18 @@ typedef struct {
   uint64_t checkpoint_group_id;
   uint64_t last_checkpoint_object_id;
 } transport_fec_track_state_t;
+
+typedef struct {
+  bool participating;
+  bool retired;
+  bool sent_initialized;
+  uint64_t sent_group_id;
+  uint64_t sent_object_id;
+  int64_t oldest_unacked_sent_at_ms;
+  bool acked_initialized;
+  uint64_t acked_group_id;
+  uint64_t acked_object_id;
+} transport_checkpoint_ack_state_t;
 
 struct transport_t {
   transport_callback_t callback;
@@ -91,15 +135,12 @@ struct transport_t {
   ptls_openssl_verify_certificate_t verifier;
   bool verifier_initialized;
   quicly_receive_datagram_frame_t receive_datagram;
+  quicly_receive_flexicast_frame_t receive_flexicast;
+  quicly_receive_flexicast_ack_t receive_flexicast_ack;
 
   transport_sent_cache_t sent_cache;
-  transport_repair_mode_t repair_mode;
-  transport_repair_limiter_t aggregate_repair_limiter;
-  transport_repair_limiter_t aggregate_nack_limiter;
-  int64_t aggregate_nack_retry_at_ms;
-  size_t recovery_conn_cursor;
-  uint32_t fec_assembler_timeout_ms;
   uint8_t simulated_loss_rate;
+  uint8_t simulated_flexicast_feedback_loss_rate;
   arena_t arena;
 
   uint8_t *fec_buf;
@@ -115,7 +156,35 @@ struct transport_t {
   ifmon_watcher_t ifmon_w;
   int ifmon_pipe[2];
   transport_fec_cache_t fec_cache;
+  transport_repair_limiter_t aggregate_repair_limiter;
+  transport_repair_mode_t repair_mode;
+  uint64_t repair_feedback_nonce;
+  FILE *repair_shadow_log;
+  uint64_t repair_shadow_deadline_ms;
   size_t assembler_memory_bytes;
+  transport_flexicast_registry_t flexicast;
+  uint64_t flexicast_retired_flow_ids[TRANSPORT_FLEXICAST_MAX_FLOWS];
+  uint32_t flexicast_retired_flow_epochs[TRANSPORT_FLEXICAST_MAX_FLOWS];
+  size_t flexicast_retired_flow_count;
+  size_t flexicast_retired_flow_next;
+  bool flexicast_enabled;
+  transport_flexicast_cc_mode_t flexicast_cc_mode;
+  uint64_t flexicast_cc_startup_rate;
+  uint64_t flexicast_cc_minimum_rate;
+  uint64_t flexicast_cc_maximum_rate;
+  uint64_t flexicast_cc_aggregate_rate_limit;
+  uint32_t flexicast_cc_feedback_timeout_ms;
+  transport_flexicast_repair_route_t flexicast_repair_route;
+  bool flexicast_native_source;
+  int flexicast_fds[2]; /* IPv4, IPv6 */
+  uint16_t flexicast_receive_ports[2];
+  struct sockaddr_storage flexicast_group_addr;
+  socklen_t flexicast_group_addr_len;
+  int flexicast_interface_family;
+  struct in_addr flexicast_interface_v4;
+  struct in6_addr flexicast_interface_v6;
+  uint32_t flexicast_interface_index;
+  bool flexicast_interface_set;
 };
 
 struct transport_conn_t {
@@ -158,11 +227,7 @@ struct transport_conn_t {
   size_t round_robin_path;
   transport_repair_limiter_t repair_request_limiter;
   transport_repair_limiter_t nack_request_limiter;
-  int64_t last_repair_ms;
-  uint64_t last_repair_group_id;
-  uint64_t last_repair_object_id;
-  uint8_t last_repair_alias;
-  uint8_t last_repair_flags;
+  transport_checkpoint_ack_state_t checkpoint_acks[UINT8_MAX + 1U];
 };
 
 /* Master identity is stable across path changes and CID rotation. A cache hit

@@ -23,7 +23,13 @@ typedef struct {
   uint16_t total_symbols;
   uint16_t data_symbols;
   uint16_t symbol_size;
+  /* First never-emitted ESI for true rateless repair. It advances only and is
+   * bounded by QLINQ_FEC_MAX_TOTAL_SYMBOLS at the repair layer. */
   uint16_t next_repair_symbol;
+  /* Systematic source-symbol cursor used after the bounded repair ESI
+   * namespace is exhausted. Cycling the retained source object preserves
+   * correctness through an arbitrarily long outage without reusing a repair
+   * ESI or requiring unbounded receiver state. */
   uint16_t next_systematic_repair_symbol;
   /* Retain unconfirmed recovery obligations until explicit release. */
   bool recovery_protected;

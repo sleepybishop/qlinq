@@ -53,9 +53,8 @@ static qlinq_wire_result_t check_envelope(const uint8_t *src, size_t len,
 }
 
 bool qlinq_wire_frame_type_is_known(uint8_t type) {
-  return (type >= QLINQ_WIRE_SUBSCRIBE && type <= QLINQ_WIRE_HELLO) ||
-         (type >= QLINQ_WIRE_TRACK_END &&
-          type <= QLINQ_WIRE_TRACK_CHECKPOINT_ACK);
+  return type >= QLINQ_WIRE_SUBSCRIBE &&
+         type <= QLINQ_WIRE_TRACK_CHECKPOINT_ACK;
 }
 
 qlinq_wire_result_t
@@ -413,6 +412,37 @@ qlinq_wire_result_t qlinq_wire_decode_hello(const uint8_t *src, size_t len,
       (hello->capabilities & ~QLINQ_WIRE_CAP_KNOWN) != 0)
     return QLINQ_WIRE_INVALID;
   return QLINQ_WIRE_OK;
+}
+
+qlinq_wire_result_t
+qlinq_wire_encode_flexicast_bind(uint8_t *dst, size_t capacity,
+                                 const qlinq_wire_flexicast_bind_t *bind) {
+  if (!dst || !bind)
+    return QLINQ_WIRE_INVALID;
+  if (capacity < QLINQ_WIRE_FLEXICAST_BIND_SIZE)
+    return QLINQ_WIRE_TOO_LARGE;
+  if (bind->flow_id == 0 || bind->key_epoch == 0)
+    return QLINQ_WIRE_INVALID;
+  dst[0] = bind->alias;
+  dst[1] = 0;
+  dst[2] = 0;
+  dst[3] = 0;
+  write_u64(dst + 4, bind->flow_id);
+  write_u32(dst + 12, bind->key_epoch);
+  return QLINQ_WIRE_OK;
+}
+
+qlinq_wire_result_t
+qlinq_wire_decode_flexicast_bind(const uint8_t *src, size_t len,
+                                 qlinq_wire_flexicast_bind_t *bind) {
+  if (!src || !bind || len != QLINQ_WIRE_FLEXICAST_BIND_SIZE || src[1] != 0 ||
+      src[2] != 0 || src[3] != 0)
+    return QLINQ_WIRE_INVALID;
+  bind->alias = src[0];
+  bind->flow_id = read_u64(src + 4);
+  bind->key_epoch = read_u32(src + 12);
+  return bind->flow_id != 0 && bind->key_epoch != 0 ? QLINQ_WIRE_OK
+                                                    : QLINQ_WIRE_INVALID;
 }
 
 qlinq_wire_result_t

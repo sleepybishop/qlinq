@@ -11,8 +11,6 @@
 #ifndef TRANSPORT_H
 #define TRANSPORT_H
 
-#include "quicly/constants.h"
-
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -35,8 +33,22 @@ typedef enum {
 #define MOQ_TRACK_FLAG_FEC_RATELESS (1 << 2)
 
 typedef enum {
-  /* AUTO prefers degree-of-freedom repair for a rateless track when the peer
-   * advertises support, otherwise it uses indexed repair. */
+  TRANSPORT_FLEXICAST_CC_MULTICAST = 0,
+  TRANSPORT_FLEXICAST_CC_ADAPTIVE = 1
+} transport_flexicast_cc_mode_t;
+
+/* Experiment control for measuring repair counterfactuals inside an explicitly
+ * enabled Flexicast flow. SHARED is the production behavior. UNICAST never
+ * selects itself automatically; it sends requested repair over each member's
+ * authenticated ordinary QUIC connection. */
+typedef enum {
+  TRANSPORT_FLEXICAST_REPAIR_SHARED = 0,
+  TRANSPORT_FLEXICAST_REPAIR_UNICAST = 1
+} transport_flexicast_repair_route_t;
+
+typedef enum {
+  /* AUTO uses rateless repair for a rateless-coded track when the peer
+   * advertises support, otherwise indexed repair. */
   TRANSPORT_REPAIR_MODE_AUTO = 0,
   TRANSPORT_REPAIR_MODE_INDEXED = 1,
   TRANSPORT_REPAIR_MODE_RATELESS = 2
@@ -156,7 +168,7 @@ typedef void (*transport_callback_t)(void *user_data,
 #define TRANSPORT_DEFAULT_RECONNECT_INITIAL_DELAY_MS 250U
 #define TRANSPORT_DEFAULT_RECONNECT_MAX_DELAY_MS 30000U
 
-#define TRANSPORT_HARD_MAX_CONNECTIONS 1024U
+#define TRANSPORT_HARD_MAX_CONNECTIONS 16384U
 #define TRANSPORT_HARD_MAX_SUBSCRIPTIONS 256U
 #define TRANSPORT_HARD_MAX_ASSEMBLERS 8U
 #define TRANSPORT_HARD_MAX_EGRESS_PACKETS 65536U
@@ -166,6 +178,8 @@ typedef struct {
   size_t max_subscriptions_per_connection; /* independently in each direction */
   size_t max_assemblers_per_connection;
   size_t max_repair_requests_per_second;
+  /* Source-wide failsafe. This remains independent of receiver count so a
+   * large cohort cannot multiply the per-peer repair ceiling. */
   size_t max_aggregate_repair_requests_per_second;
   /* Receiver-wide outbound NACK budget, shared by all peers. */
   size_t max_aggregate_nack_requests_per_second;
@@ -189,12 +203,11 @@ typedef struct {
 #define TRANSPORT_MAX_FEC_OBJECT_SIZE (1024U * 1024U)
 #define TRANSPORT_MAX_FEC_RECORD_SIZE UINT16_MAX
 
-#define TRANSPORT_APP_ERROR_PROTOCOL                                           \
-  QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0x100U)
-#define TRANSPORT_APP_ERROR_AUTHENTICATION                                     \
-  QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0x101U)
-#define TRANSPORT_APP_ERROR_RESOURCE_LIMIT                                     \
-  QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0x102U)
+/* Quicly's public close API expects application errors in its tagged error
+ * namespace; it subtracts the tag before encoding the QUIC close frame. */
+#define TRANSPORT_APP_ERROR_PROTOCOL 0x30100U
+#define TRANSPORT_APP_ERROR_AUTHENTICATION 0x30101U
+#define TRANSPORT_APP_ERROR_RESOURCE_LIMIT 0x30102U
 
 typedef struct {
   /* For clients, bind_hosts[i] uses remote_hosts[i]. When exactly one remote
@@ -210,7 +223,8 @@ typedef struct {
   size_t num_remote_hosts;
   uint16_t port;
   /* QUIC control-session idle timeout in milliseconds. Zero keeps Quicly's
-   * default. */
+   * default. Long-lived multicast recovery sessions should set this beyond
+   * their maximum checkpoint/recovery deadline. */
   uint64_t quic_idle_timeout_ms;
   /* FEC assembler inactivity timeout. Zero selects 2000 ms. */
   uint32_t fec_assembler_timeout_ms;
@@ -236,7 +250,43 @@ typedef struct {
   bool reconnect_enabled;
   uint32_t reconnect_initial_delay_ms;
   uint32_t reconnect_max_delay_ms;
+  /* Test/emulation fault injection: percentage of Flexicast PATH_ACK attempts
+   * to suppress while ordinary QUIC control traffic continues normally. */
+  uint8_t simulated_flexicast_feedback_loss_rate;
+  /* Enables the experimental Flexicast DATAGRAM path. Reliable tracks remain
+   * ordinary QUIC streams. */
+  bool enable_flexicast;
+  /* Optional native IPv4 or IPv6 source-specific multicast policy. Sources
+   * announce this numeric multicast address and UDP port; receivers learn both
+   * through FC_ANNOUNCE. flexicast_interface is a numeric local address used
+   * for multicast egress and membership. A source must set all three fields;
+   * receivers may set only flexicast_interface to override route selection.
+   * With no group configured, one protected packet is replicated over the
+   * existing unicast UDP sockets. */
+  const char *flexicast_group;
+  uint16_t flexicast_group_port;
+  const char *flexicast_interface;
+  /* Multicast-specific congestion controller. Zero selects the conservative
+   * multicast controller. Rate values are bytes per second; zero selects the
+   * controller profile default. */
+  transport_flexicast_cc_mode_t flexicast_cc_mode;
+  uint64_t flexicast_cc_startup_rate;
+  uint64_t flexicast_cc_minimum_rate;
+  uint64_t flexicast_cc_maximum_rate;
+  uint64_t flexicast_cc_aggregate_rate_limit;
+  uint32_t flexicast_cc_feedback_timeout_ms;
+  transport_flexicast_repair_route_t flexicast_repair_route;
+  /* Local receiver preference for rateless-coded tracks. AUTO is the default
+   * and remains interoperable with peers that only support indexed NACKs. */
   transport_repair_mode_t repair_mode;
+  /* Optional deterministic seed for multicast repair-feedback timers. Zero
+   * uses an operating-system random seed. Intended for reproducible scenario
+   * comparisons; it does not affect protocol interoperability. */
+  uint64_t repair_feedback_seed;
+  /* Optional M4 shadow-planner record. The planner never changes traffic;
+   * record repair-planner snapshots. */
+  const char *repair_shadow_log_file;
+  uint64_t repair_shadow_deadline_ms;
   transport_limits_t limits; /* zero fields select documented defaults */
 } transport_config_t;
 
@@ -266,19 +316,21 @@ transport_publish_result_t transport_publish_ex(transport_t *t,
  * or had no eligible recipients. */
 bool transport_publish(transport_t *t, const moq_object_t *obj);
 
-/* Flush buffered rateless data and reliably announce the last internal FEC
- * object, allowing receivers to discover a wholly unseen tail. */
+/* Flush buffered rateless data and reliably announce its final internal FEC
+ * object. Receivers use the watermark to request any wholly unseen tail
+ * objects. Calling this function more than once is safe. */
 bool transport_finish_track(transport_t *t, moq_track_id_t track_id);
 
 /* subscribe to a media track (client-side) */
 bool transport_subscribe(transport_t *t, moq_track_id_t track_id);
-
-/* Subscribe one authenticated connection. The compatibility wrapper above
- * broadcasts to every eligible server connection. */
+/* Subscribe one authenticated connection. This is useful to direct API users
+ * serving multiple peers; transport_subscribe broadcasts to every eligible
+ * connection for compatibility. */
 bool transport_subscribe_conn(transport_t *t, transport_conn_t *conn,
                               moq_track_id_t track_id);
 
-/* Queue an unsubscribe frame and release the matching local subscription. */
+/* unsubscribe from a media track. Once the reliable control frame is queued,
+ * local Flexicast state and kernel SSM membership are released immediately. */
 bool transport_unsubscribe(transport_t *t, moq_track_id_t track_id);
 
 /* request a video keyframe from the publisher (client-side) */
@@ -368,6 +420,7 @@ typedef struct {
   uint64_t repair_rateless_requests_received;
   uint64_t repair_requests_throttled;
   uint64_t repair_requests_aggregate_throttled;
+  uint64_t repair_requests_suppressed;
   uint64_t repair_requests_sent;
   uint64_t repair_indexed_requests_sent;
   uint64_t repair_rateless_requests_sent;
@@ -377,6 +430,31 @@ typedef struct {
   uint64_t repair_symbols_sent;
   uint64_t repair_rateless_symbols_sent;
   uint64_t repair_rateless_exhausted;
+  uint64_t repair_multicast_symbols_sent;
+  uint64_t repair_requests_merged;
+  uint64_t repair_requester_records_peak;
+  uint64_t repair_requester_overflow;
+  uint64_t repair_requester_updates;
+  uint64_t repair_requester_records_expired;
+  uint64_t repair_shadow_plans_evaluated;
+  uint64_t repair_shadow_all_shared;
+  uint64_t repair_shadow_all_unicast;
+  uint64_t repair_shadow_mixed;
+  uint64_t repair_shadow_uncertain;
+  uint64_t repair_shadow_infeasible;
+  uint64_t repair_shadow_log_errors;
+  uint64_t repair_shadow_last_airtime_us;
+  uint64_t repair_shadow_last_physical_bytes;
+  uint32_t repair_shadow_last_savings_ppm;
+  uint64_t repair_shadow_observation_overflow;
+  uint64_t repair_unicast_symbols_sent;
+  uint64_t repair_unicast_payload_bytes_queued;
+  uint64_t repair_batches_emitted;
+  uint64_t repair_queue_backpressure;
+  uint64_t repair_packets_cancelled;
+  uint64_t repair_pending_symbols_cancelled;
+  uint64_t repair_physical_bytes_sent;
+  uint64_t flexicast_physical_bytes_sent;
   uint64_t track_ends_sent;
   uint64_t track_ends_received;
   uint64_t recovery_checkpoints_sent;
@@ -389,6 +467,50 @@ typedef struct {
   size_t recovery_cache_entries, recovery_cache_peak_entries;
   size_t recovery_checkpoints_pending;
   uint64_t recovery_oldest_checkpoint_age_ms;
+  uint64_t flexicast_packets_sent;
+  uint64_t flexicast_native_packets_sent;
+  uint64_t flexicast_packets_received;
+  uint64_t flexicast_multicast_datagrams_received;
+  uint64_t flexicast_multicast_datagrams_rejected;
+  uint64_t flexicast_acks_received;
+  uint64_t flexicast_fallbacks;
+  uint64_t flexicast_rekeys;
+  uint64_t flexicast_rekey_members;
+  uint64_t flexicast_rekey_batched_changes;
+  uint64_t flexicast_feedback_fallbacks;
+  uint64_t flexicast_paced_packets;
+  uint64_t flexicast_pacing_delays;
+  uint64_t flexicast_pacing_backpressure;
+  uint64_t flexicast_pacing_dropped;
+  uint64_t flexicast_pacing_rate_bytes_per_second;
+  transport_flexicast_cc_mode_t flexicast_cc_mode;
+  uint64_t flexicast_cc_rate_bytes_per_second;
+  uint64_t flexicast_cc_burst_bytes;
+  uint64_t flexicast_cc_limiting_member;
+  uint64_t flexicast_cc_rate_increase_events;
+  uint64_t flexicast_cc_rate_reduction_events;
+  uint64_t flexicast_cc_floor_entry_events;
+  uint64_t flexicast_cc_floor_exit_events;
+  uint64_t flexicast_cc_ack_growth_events;
+  uint64_t flexicast_cc_other_growth_events;
+  uint64_t flexicast_cc_loss_reduction_events;
+  uint64_t flexicast_cc_rtt_reduction_events;
+  uint64_t flexicast_cc_ecn_reduction_events;
+  uint64_t flexicast_cc_timeout_reduction_events;
+  uint64_t flexicast_cc_rate_limit_reduction_events;
+  uint64_t flexicast_cc_other_reduction_events;
+  uint64_t flexicast_cc_external_load_growth_freeze_events;
+  size_t flexicast_queued_packets;
+  size_t flexicast_queued_bytes;
+  size_t repair_queued_packets;
+  size_t repair_queued_bytes;
+  size_t repair_pending_objects;
+  uint64_t repair_oldest_age_ms;
+  uint64_t flexicast_membership_joins;
+  uint64_t flexicast_membership_leaves;
+  size_t flexicast_active_memberships;
+  size_t flexicast_active_flows;
+  size_t flexicast_active_members;
   uint64_t events_emitted;
   uint64_t api_thread_violations;
   uint64_t recursive_tick_rejections;
@@ -438,6 +560,8 @@ bool transport_get_conn_stats(transport_t *t, transport_conn_t *conn,
                               transport_conn_stats_t *stats);
 uint32_t transport_get_conn_id(transport_t *t, transport_conn_t *conn);
 
+/* Returns the negotiated repair semantics for this connection and track.
+ * Rateless tracks fall back to indexed repair with legacy peers. */
 transport_repair_mode_t
 transport_get_effective_repair_mode(transport_t *t, transport_conn_t *conn,
                                     const moq_track_id_t *track_id);
