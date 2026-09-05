@@ -1,6 +1,7 @@
 # Compiled binaries and intermediate build files
 qlinqd
 qlinq-app
+qlinq-cast
 qlinq-tund
 t/00util/test_fec
 t/00util/test_transport

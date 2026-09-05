@@ -10,6 +10,8 @@
 - **Multipath Link Aggregation**: Dynamic path discovery, performance scheduling, and failover across multiple interfaces (Wi-Fi, Ethernet, Satcom, Cellular).
 - **Forward Error Correction**: Recover lost packets on high-loss links without retransmission latency.
 - **mTLS Authentication**: Full mutual TLS authentication support using custom or system trusted root authorities.
+- **Finite Fanout**: `qlinq-cast` streams files or pipelines to a confirmed
+  receiver cohort with ordered recovery and explicit completion.
 - **Experimental Flexicast Fanout**: One encrypted unreliable-track packet can
   reach many authenticated subscribers with shared replay protection and
   aggregate acknowledgements. Enable it on every participating daemon with
@@ -41,11 +43,12 @@ git submodule update --init --recursive
 make
 ```
 
-This produces three main binaries and an embeddable transport library:
+This produces four main binaries and an embeddable transport library:
 
 - `qlinqd`: The background peer-to-peer network daemon.
 - `qlinq-app`: A direct `transport.h` send/receive and mesh test tool; it does
   not use the daemon's Unix data socket.
+- `qlinq-cast`: A finite file/stdin fan-out tool built on the native streams api.
 - `qlinq-tund`: The lightweight virtual TUN/TAP interface controller.
 - `libqlinq.a`: The in-process library.
 
