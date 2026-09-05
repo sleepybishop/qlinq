@@ -74,7 +74,8 @@ NANORQ_OBJS = $(NANORQ_SRCS:.c=.o)
 PATHFLOW_OBJS = $(PATHFLOW_SRCS:.c=.o)
 IFMON_OBJS = $(IFMON_SRCS:.c=.o)
 
-TRANSPORT_OBJS = src/common/transport_config.o \
+TRANSPORT_OBJS = src/common/cli_parse.o \
+              src/common/transport_config.o \
               src/common/qlinq.o \
               src/common/transport_egress.o \
               src/common/transport_fec_state.o \

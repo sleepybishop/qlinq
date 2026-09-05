@@ -2354,16 +2354,15 @@ bool transport_get_stats(transport_t *t, transport_stats_t *stats) {
       stats->flexicast_active_members +=
           transport_flexicast_listening_members(flow);
     stats->flexicast_queued_packets +=
-        flow->queue_count + flow->repair_queue_count;
+        flow->data_queue.count + flow->repair_queue.count;
     stats->flexicast_queued_bytes +=
-        flow->queue_bytes + flow->repair_queue_bytes;
-    stats->repair_queued_packets += flow->repair_queue_count;
-    stats->repair_queued_bytes += flow->repair_queue_bytes;
+        flow->data_queue.bytes + flow->repair_queue.bytes;
+    stats->repair_queued_packets += flow->repair_queue.count;
+    stats->repair_queued_bytes += flow->repair_queue.bytes;
     stats->repair_pending_objects += flow->pending_repair_count;
-    for (size_t i = 0; i < flow->repair_queue_count; i++) {
-      size_t slot = (flow->repair_queue_head + i) %
-                    TRANSPORT_FLEXICAST_REPAIR_QUEUE_CAPACITY;
-      int64_t enqueued = flow->repair_queued[slot].enqueued_at_ms;
+    for (size_t i = 0; i < flow->repair_queue.count; i++) {
+      size_t slot = (flow->repair_queue.head + i) % flow->repair_queue.capacity;
+      int64_t enqueued = flow->repair_queue.entries[slot].enqueued_at_ms;
       if (enqueued > 0 && now_ms > enqueued &&
           (uint64_t)(now_ms - enqueued) > stats->repair_oldest_age_ms)
         stats->repair_oldest_age_ms = (uint64_t)(now_ms - enqueued);

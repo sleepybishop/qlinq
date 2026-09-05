@@ -4,6 +4,7 @@
 #define _DEFAULT_SOURCE
 #endif
 
+#include "cli_parse.h"
 #include "portable_sockets.h"
 #include "transport.h"
 
@@ -47,9 +48,7 @@ typedef struct {
   transport_t *transport;
   transport_config_t config;
   char remote_host[256];
-  int64_t next_reconnect_at;
   bool is_server;
-  bool reconnect_pending;
 } app_transport_t;
 
 struct app_ctx_s {
@@ -111,8 +110,15 @@ struct app_ctx_s {
 };
 
 static volatile sig_atomic_t app_running = 1;
+static volatile sig_atomic_t reload_credentials_requested = 0;
 
 static void handle_signal(int sig) {
+#ifdef SIGHUP
+  if (sig == SIGHUP) {
+    reload_credentials_requested = 1;
+    return;
+  }
+#endif
   (void)sig;
   app_running = 0;
 }
@@ -128,7 +134,8 @@ static void show_help(FILE *out, const char *program) {
       "disables)\n"
       "  --idle-timeout-ms MS          QUIC control-session idle timeout\n"
       "  --bind ADDRESS                numeric local address\n"
-      "  --cert FILE --key FILE        local TLS identity\n"
+      "  --cert FILE --key FILE        TLS identity; required for listeners "
+      "and verified peers\n"
       "  --ca FILE                     peer CA bundle\n"
       "  --auth-token TOKEN            application authentication token\n"
       "  --insecure-no-verify          test-only certificate bypass\n"
@@ -137,8 +144,10 @@ static void show_help(FILE *out, const char *program) {
       "  --max-aggregate-repairs N     source-wide repair requests/second\n"
       "  --repair-feedback-seed N      deterministic scenario feedback seed\n"
       "  --repair-shadow-file FILE     record M4 repair-planner snapshots\n"
-      "  --repair-shadow-deadline MS   planner resource horizon (default 1000)\n"
-      "  --loss PERCENT                simulated inbound packet loss\n\n"
+      "  --repair-shadow-deadline MS   planner resource horizon (default "
+      "1000)\n"
+      "  --loss PERCENT                test-only simulated inbound packet "
+      "loss\n\n"
       "Data:\n"
       "  --track NAME                  track name (default qlinq-app/data)\n"
       "  --mode datagram|fec|rateless|reliable\n"
@@ -149,9 +158,11 @@ static void show_help(FILE *out, const char *program) {
       "  --count N                     stop reading after N records\n"
       "  --receive-count N             exit after receiving N records\n"
       "  --leave-after-ms MS           leave after MS of active membership\n"
-      "  --late-join                   begin ordered output at first object seen\n"
+      "  --late-join                   begin ordered output at first object "
+      "seen\n"
       "  --wait-subscribers N          initial subscribers before sending\n"
-      "  --wait-members N              initial Flexicast members before sending\n"
+      "  --wait-members N              initial Flexicast members before "
+      "sending\n"
       "  --start-delay-ms MS           delay sending after readiness\n"
       "  --interval-ms MS              minimum interval between records\n"
       "  --one-shot                    exit after input drains\n"
@@ -171,57 +182,10 @@ static void show_help(FILE *out, const char *program) {
       "  --flexicast-cc-min-rate BYTES_PER_SECOND\n"
       "  --flexicast-cc-max-rate BYTES_PER_SECOND\n"
       "  --flexicast-cc-aggregate-rate BYTES_PER_SECOND\n"
-      "  --flexicast-cc-feedback-timeout MS\n",
+      "  --flexicast-cc-feedback-timeout MS\n\n"
+      "Signals:\n"
+      "  SIGHUP                         reload --cert and --key atomically\n",
       program);
-}
-
-static bool parse_u64(const char *text, uint64_t maximum, uint64_t *value) {
-  char *end = NULL;
-  unsigned long long parsed;
-  if (!text || !text[0] || text[0] == '-' || !value)
-    return false;
-  errno = 0;
-  parsed = strtoull(text, &end, 10);
-  if (errno != 0 || !end || *end != '\0' || parsed > maximum)
-    return false;
-  *value = (uint64_t)parsed;
-  return true;
-}
-
-static bool parse_peer(const char *endpoint, char *host, size_t host_capacity,
-                       uint16_t *port) {
-  const char *start = endpoint, *port_text = NULL;
-  size_t host_len;
-  uint64_t parsed_port;
-  if (!endpoint || !endpoint[0] || !host || host_capacity == 0 || !port)
-    return false;
-  host_len = strlen(endpoint);
-  if (endpoint[0] == '[') {
-    const char *closing = strchr(endpoint + 1, ']');
-    if (!closing || (closing[1] != '\0' && closing[1] != ':'))
-      return false;
-    start = endpoint + 1;
-    host_len = (size_t)(closing - start);
-    if (closing[1] == ':')
-      port_text = closing + 2;
-  } else {
-    const char *first = strchr(endpoint, ':');
-    const char *last = strrchr(endpoint, ':');
-    if (first && first == last) {
-      host_len = (size_t)(first - endpoint);
-      port_text = first + 1;
-    }
-  }
-  if (host_len == 0 || host_len >= host_capacity)
-    return false;
-  if (port_text) {
-    if (!parse_u64(port_text, UINT16_MAX, &parsed_port) || parsed_port == 0)
-      return false;
-    *port = (uint16_t)parsed_port;
-  }
-  memcpy(host, start, host_len);
-  host[host_len] = '\0';
-  return true;
 }
 
 static void subscribe(app_transport_t *transport, transport_conn_t *conn) {
@@ -285,15 +249,13 @@ static bool write_received_object(app_ctx_t *app,
   if (!app->reorder_initialized) {
     app->reorder_initialized = true;
     app->reorder_group_id = event->object.group_id;
-    app->reorder_next_object_id =
-        app->late_join ? event->object.object_id : 0;
+    app->reorder_next_object_id = app->late_join ? event->object.object_id : 0;
   }
   if (event->object.group_id != app->reorder_group_id)
     return false;
   if (event->object.object_id < app->reorder_next_object_id)
     return true;
-  uint64_t distance =
-      event->object.object_id - app->reorder_next_object_id;
+  uint64_t distance = event->object.object_id - app->reorder_next_object_id;
   if (distance >= APP_REORDER_OBJECTS ||
       event->object.size > APP_REORDER_MAX_BYTES - app->reorder_bytes)
     return false;
@@ -343,7 +305,6 @@ static void on_transport_event(void *user_data,
   app_ctx_t *app = transport->app;
   switch (event->type) {
   case TRANSPORT_EVENT_CONNECTED:
-    transport->reconnect_pending = false;
     if (app->verbose)
       fprintf(stderr, "qlinq-app: peer connected\n");
     if (!transport->is_server &&
@@ -391,13 +352,17 @@ static void on_transport_event(void *user_data,
     break;
   case TRANSPORT_EVENT_DISCONNECTED:
     if (app->verbose)
-      fprintf(stderr, "qlinq-app: peer disconnected\n");
-    if (!transport->is_server && app->reconnect_ms != 0) {
-      reset_reorder(app);
-      transport->reconnect_pending = true;
-      transport->next_reconnect_at =
-          transport_get_time_ms() + app->reconnect_ms;
-    }
+      fprintf(stderr,
+              "qlinq-app: peer disconnected origin=%s class=%s code=%" PRIu64
+              " raw=%" PRId64 " reason=%s\n",
+              event->disconnect.remote ? "remote" : "local",
+              event->disconnect.application_error ? "application"
+              : event->disconnect.raw_error >= 0  ? "transport"
+                                                  : "internal",
+              event->disconnect.error_code, event->disconnect.raw_error,
+              event->disconnect.reason && event->disconnect.reason[0]
+                  ? event->disconnect.reason
+                  : "none");
     break;
   case TRANSPORT_EVENT_OBJECT_LOST:
     if (app->verbose)
@@ -443,10 +408,9 @@ static bool transports_ready(app_ctx_t *app) {
       return false;
   app->publication_ready = true;
   int64_t now = transport_get_time_ms();
-  app->publication_ready_at =
-      app->start_delay_ms > (uint64_t)(INT64_MAX - now)
-          ? INT64_MAX
-          : now + (int64_t)app->start_delay_ms;
+  app->publication_ready_at = app->start_delay_ms > (uint64_t)(INT64_MAX - now)
+                                  ? INT64_MAX
+                                  : now + (int64_t)app->start_delay_ms;
   return app->start_delay_ms == 0;
 }
 
@@ -580,160 +544,130 @@ static void finish_input_track(app_ctx_t *app, int64_t now) {
   app->eof_at = now;
 }
 
+#define APP_SUMMED_TRANSPORT_STATS(X)                                          \
+  X(uint64_t, packets, flexicast_packets_sent)                                 \
+  X(uint64_t, acks, flexicast_acks_received)                                   \
+  X(uint64_t, repair_requests, repair_requests_sent)                           \
+  X(uint64_t, repair_indexed_requests_sent, repair_indexed_requests_sent)      \
+  X(uint64_t, repair_rateless_requests_sent, repair_rateless_requests_sent)    \
+  X(uint64_t, repair_indexed_requests_received,                                \
+    repair_indexed_requests_received)                                          \
+  X(uint64_t, repair_rateless_requests_received,                               \
+    repair_rateless_requests_received)                                         \
+  X(uint64_t, repair_requests_deferred, repair_requests_deferred)              \
+  X(uint64_t, repair_symbols, repair_symbols_sent)                             \
+  X(uint64_t, repair_rateless_symbols_sent, repair_rateless_symbols_sent)      \
+  X(uint64_t, repair_rateless_exhausted, repair_rateless_exhausted)            \
+  X(uint64_t, repair_multicast_symbols, repair_multicast_symbols_sent)         \
+  X(uint64_t, repair_requests_suppressed, repair_requests_suppressed)          \
+  X(uint64_t, repair_requests_aggregate_throttled,                             \
+    repair_requests_aggregate_throttled)                                       \
+  X(uint64_t, repair_requests_merged, repair_requests_merged)                  \
+  X(uint64_t, repair_requester_overflow, repair_requester_overflow)            \
+  X(uint64_t, repair_requester_updates, repair_requester_updates)              \
+  X(uint64_t, repair_requester_records_expired,                                \
+    repair_requester_records_expired)                                          \
+  X(uint64_t, repair_shadow_plans, repair_shadow_plans_evaluated)              \
+  X(uint64_t, repair_shadow_all_shared, repair_shadow_all_shared)              \
+  X(uint64_t, repair_shadow_all_unicast, repair_shadow_all_unicast)            \
+  X(uint64_t, repair_shadow_mixed, repair_shadow_mixed)                        \
+  X(uint64_t, repair_shadow_uncertain, repair_shadow_uncertain)                \
+  X(uint64_t, repair_shadow_infeasible, repair_shadow_infeasible)              \
+  X(uint64_t, repair_shadow_log_errors, repair_shadow_log_errors)              \
+  X(uint64_t, repair_shadow_observation_overflow,                              \
+    repair_shadow_observation_overflow)                                        \
+  X(uint64_t, repair_unicast_symbols, repair_unicast_symbols_sent)             \
+  X(uint64_t, repair_unicast_payload_bytes,                                    \
+    repair_unicast_payload_bytes_queued)                                       \
+  X(uint64_t, repair_batches_emitted, repair_batches_emitted)                  \
+  X(uint64_t, repair_queue_backpressure, repair_queue_backpressure)            \
+  X(uint64_t, repair_packets_cancelled, repair_packets_cancelled)              \
+  X(uint64_t, repair_pending_symbols_cancelled,                                \
+    repair_pending_symbols_cancelled)                                          \
+  X(uint64_t, repair_physical_bytes, repair_physical_bytes_sent)               \
+  X(uint64_t, flexicast_physical_bytes, flexicast_physical_bytes_sent)         \
+  X(uint64_t, flexicast_feedback_fallbacks, flexicast_feedback_fallbacks)      \
+  X(size_t, repair_queued_packets, repair_queued_packets)                      \
+  X(size_t, repair_queued_bytes, repair_queued_bytes)                          \
+  X(size_t, repair_pending_objects, repair_pending_objects)                    \
+  X(uint64_t, duplicate_objects, fec_duplicate_objects_suppressed)             \
+  X(uint64_t, track_ends_sent, track_ends_sent)                                \
+  X(uint64_t, track_ends_received, track_ends_received)                        \
+  X(uint64_t, checkpoints_sent, recovery_checkpoints_sent)                     \
+  X(uint64_t, checkpoints_received, recovery_checkpoints_received)             \
+  X(uint64_t, checkpoint_acks_sent, recovery_checkpoint_acks_sent)             \
+  X(uint64_t, checkpoint_acks_received, recovery_checkpoint_acks_received)     \
+  X(uint64_t, recovery_cache_releases, recovery_cache_releases)                \
+  X(uint64_t, recovery_cache_backpressure, recovery_cache_backpressure)        \
+  X(size_t, recovery_checkpoints_pending, recovery_checkpoints_pending)        \
+  X(uint64_t, flexicast_rekeys, flexicast_rekeys)                              \
+  X(uint64_t, flexicast_rekey_members, flexicast_rekey_members)                \
+  X(uint64_t, flexicast_rekey_batched_changes,                                 \
+    flexicast_rekey_batched_changes)                                           \
+  X(uint64_t, flexicast_membership_joins, flexicast_membership_joins)          \
+  X(uint64_t, flexicast_membership_leaves, flexicast_membership_leaves)        \
+  X(uint64_t, flexicast_fallbacks, flexicast_fallbacks)                        \
+  X(size_t, active_connections, active_connections)                            \
+  X(size_t, assembler_memory_bytes, assembler_memory_bytes)                    \
+  X(size_t, egress_peak_packets, egress_peak_packets)                          \
+  X(size_t, egress_peak_bytes, egress_peak_bytes)                              \
+  X(size_t, active_flows, flexicast_active_flows)                              \
+  X(size_t, active_memberships, flexicast_active_memberships)                  \
+  X(uint64_t, cc_rate_increases, flexicast_cc_rate_increase_events)            \
+  X(uint64_t, cc_rate_reductions, flexicast_cc_rate_reduction_events)          \
+  X(uint64_t, cc_floor_entries, flexicast_cc_floor_entry_events)               \
+  X(uint64_t, cc_floor_exits, flexicast_cc_floor_exit_events)                  \
+  X(uint64_t, cc_ack_growth, flexicast_cc_ack_growth_events)                   \
+  X(uint64_t, cc_other_growth, flexicast_cc_other_growth_events)               \
+  X(uint64_t, cc_loss_reductions, flexicast_cc_loss_reduction_events)          \
+  X(uint64_t, cc_rtt_reductions, flexicast_cc_rtt_reduction_events)            \
+  X(uint64_t, cc_ecn_reductions, flexicast_cc_ecn_reduction_events)            \
+  X(uint64_t, cc_timeout_reductions, flexicast_cc_timeout_reduction_events)    \
+  X(uint64_t, cc_rate_limit_reductions,                                        \
+    flexicast_cc_rate_limit_reduction_events)                                  \
+  X(uint64_t, cc_other_reductions, flexicast_cc_other_reduction_events)        \
+  X(uint64_t, cc_external_load_growth_freezes,                                 \
+    flexicast_cc_external_load_growth_freeze_events)                           \
+  X(size_t, members, flexicast_active_members)                                 \
+  X(size_t, queued, flexicast_queued_packets)
+
 static void print_stats(app_ctx_t *app, int64_t now, bool force) {
   if (!force && (app->stats_ms == 0 || now < app->next_stats_at))
     return;
   if (app->stats_ms == 0 && !app->stats_output)
     return;
-  uint64_t packets = 0, acks = 0, rate = 0, repair_requests = 0;
-  uint64_t repair_symbols = 0, duplicate_objects = 0;
-  uint64_t repair_multicast_symbols = 0, repair_requests_suppressed = 0;
-  uint64_t repair_requests_aggregate_throttled = 0;
-  uint64_t repair_requests_merged = 0, repair_batches_emitted = 0;
+#define DECLARE_STAT(type, name, field) type name = 0;
+  APP_SUMMED_TRANSPORT_STATS(DECLARE_STAT)
+#undef DECLARE_STAT
+  uint64_t rate = 0;
   uint64_t repair_requester_records_peak = 0;
-  uint64_t repair_requester_overflow = 0, repair_requester_updates = 0;
-  uint64_t repair_requester_records_expired = 0;
-  uint64_t repair_shadow_plans = 0, repair_shadow_all_shared = 0;
-  uint64_t repair_shadow_all_unicast = 0, repair_shadow_mixed = 0;
-  uint64_t repair_shadow_uncertain = 0, repair_shadow_infeasible = 0;
-  uint64_t repair_shadow_log_errors = 0, repair_shadow_last_airtime_us = 0;
+  uint64_t repair_shadow_last_airtime_us = 0;
   uint64_t repair_shadow_last_physical_bytes = 0;
   uint32_t repair_shadow_last_savings_ppm = 0;
-  uint64_t repair_shadow_observation_overflow = 0;
-  uint64_t repair_unicast_symbols = 0, repair_unicast_payload_bytes = 0;
-  uint64_t repair_queue_backpressure = 0, repair_physical_bytes = 0;
-  uint64_t flexicast_physical_bytes = 0, repair_oldest_age_ms = 0;
-  uint64_t repair_packets_cancelled = 0;
-  uint64_t repair_pending_symbols_cancelled = 0;
-  uint64_t repair_indexed_requests_sent = 0;
-  uint64_t repair_rateless_requests_sent = 0;
-  uint64_t repair_indexed_requests_received = 0;
-  uint64_t repair_rateless_requests_received = 0;
-  uint64_t repair_rateless_symbols_sent = 0;
-  uint64_t repair_rateless_exhausted = 0;
-  uint64_t flexicast_feedback_fallbacks = 0;
-  uint64_t track_ends_sent = 0, track_ends_received = 0;
-  uint64_t checkpoints_sent = 0, checkpoints_received = 0;
-  uint64_t checkpoint_acks_sent = 0, checkpoint_acks_received = 0;
-  uint64_t recovery_cache_releases = 0, recovery_cache_backpressure = 0;
+  uint64_t repair_oldest_age_ms = 0;
   uint64_t recovery_oldest_checkpoint_age_ms = 0;
-  uint64_t flexicast_rekeys = 0, flexicast_rekey_members = 0;
-  uint64_t flexicast_rekey_batched_changes = 0;
-  uint64_t flexicast_membership_joins = 0;
-  uint64_t flexicast_membership_leaves = 0, flexicast_fallbacks = 0;
-  uint64_t repair_requests_deferred = 0;
-  uint64_t cc_rate_increases = 0, cc_rate_reductions = 0;
-  uint64_t cc_floor_entries = 0, cc_floor_exits = 0;
-  uint64_t cc_ack_growth = 0, cc_other_growth = 0;
-  uint64_t cc_loss_reductions = 0, cc_rtt_reductions = 0;
-  uint64_t cc_ecn_reductions = 0, cc_timeout_reductions = 0;
-  uint64_t cc_rate_limit_reductions = 0, cc_other_reductions = 0;
-  uint64_t cc_external_load_growth_freezes = 0;
-  size_t members = 0, queued = 0, repair_queued_packets = 0;
-  size_t repair_queued_bytes = 0, repair_pending_objects = 0;
-  size_t recovery_checkpoints_pending = 0, active_connections = 0;
-  size_t assembler_memory_bytes = 0, egress_peak_packets = 0;
-  size_t egress_peak_bytes = 0, active_flows = 0, active_memberships = 0;
   for (size_t i = 0; i < app->num_transports; i++) {
     transport_stats_t stats = {0};
     if (!app->transports[i].transport ||
         !transport_get_stats(app->transports[i].transport, &stats))
       continue;
-    packets += stats.flexicast_packets_sent;
-    acks += stats.flexicast_acks_received;
-    repair_requests += stats.repair_requests_sent;
-    repair_indexed_requests_sent += stats.repair_indexed_requests_sent;
-    repair_rateless_requests_sent += stats.repair_rateless_requests_sent;
-    repair_indexed_requests_received += stats.repair_indexed_requests_received;
-    repair_rateless_requests_received +=
-        stats.repair_rateless_requests_received;
-    repair_requests_deferred += stats.repair_requests_deferred;
-    repair_symbols += stats.repair_symbols_sent;
-    repair_rateless_symbols_sent += stats.repair_rateless_symbols_sent;
-    repair_rateless_exhausted += stats.repair_rateless_exhausted;
-    repair_multicast_symbols += stats.repair_multicast_symbols_sent;
-    repair_requests_suppressed += stats.repair_requests_suppressed;
-    repair_requests_aggregate_throttled +=
-        stats.repair_requests_aggregate_throttled;
-    repair_requests_merged += stats.repair_requests_merged;
+#define ACCUMULATE_STAT(type, name, field) name += stats.field;
+    APP_SUMMED_TRANSPORT_STATS(ACCUMULATE_STAT)
+#undef ACCUMULATE_STAT
     if (stats.repair_requester_records_peak > repair_requester_records_peak)
       repair_requester_records_peak = stats.repair_requester_records_peak;
-    repair_requester_overflow += stats.repair_requester_overflow;
-    repair_requester_updates += stats.repair_requester_updates;
-    repair_requester_records_expired += stats.repair_requester_records_expired;
-    repair_shadow_plans += stats.repair_shadow_plans_evaluated;
-    repair_shadow_all_shared += stats.repair_shadow_all_shared;
-    repair_shadow_all_unicast += stats.repair_shadow_all_unicast;
-    repair_shadow_mixed += stats.repair_shadow_mixed;
-    repair_shadow_uncertain += stats.repair_shadow_uncertain;
-    repair_shadow_infeasible += stats.repair_shadow_infeasible;
-    repair_shadow_log_errors += stats.repair_shadow_log_errors;
-    repair_shadow_observation_overflow +=
-        stats.repair_shadow_observation_overflow;
-    repair_unicast_symbols += stats.repair_unicast_symbols_sent;
-    repair_unicast_payload_bytes +=
-        stats.repair_unicast_payload_bytes_queued;
     if (stats.repair_shadow_last_airtime_us != 0) {
       repair_shadow_last_airtime_us = stats.repair_shadow_last_airtime_us;
       repair_shadow_last_physical_bytes =
           stats.repair_shadow_last_physical_bytes;
       repair_shadow_last_savings_ppm = stats.repair_shadow_last_savings_ppm;
     }
-    repair_batches_emitted += stats.repair_batches_emitted;
-    repair_queue_backpressure += stats.repair_queue_backpressure;
-    repair_packets_cancelled += stats.repair_packets_cancelled;
-    repair_pending_symbols_cancelled += stats.repair_pending_symbols_cancelled;
-    repair_physical_bytes += stats.repair_physical_bytes_sent;
-    flexicast_physical_bytes += stats.flexicast_physical_bytes_sent;
-    flexicast_feedback_fallbacks += stats.flexicast_feedback_fallbacks;
-    repair_queued_packets += stats.repair_queued_packets;
-    repair_queued_bytes += stats.repair_queued_bytes;
-    repair_pending_objects += stats.repair_pending_objects;
     if (stats.repair_oldest_age_ms > repair_oldest_age_ms)
       repair_oldest_age_ms = stats.repair_oldest_age_ms;
-    duplicate_objects += stats.fec_duplicate_objects_suppressed;
-    track_ends_sent += stats.track_ends_sent;
-    track_ends_received += stats.track_ends_received;
-    checkpoints_sent += stats.recovery_checkpoints_sent;
-    checkpoints_received += stats.recovery_checkpoints_received;
-    checkpoint_acks_sent += stats.recovery_checkpoint_acks_sent;
-    checkpoint_acks_received += stats.recovery_checkpoint_acks_received;
-    recovery_cache_releases += stats.recovery_cache_releases;
-    recovery_cache_backpressure += stats.recovery_cache_backpressure;
-    recovery_checkpoints_pending += stats.recovery_checkpoints_pending;
     if (stats.recovery_oldest_checkpoint_age_ms >
         recovery_oldest_checkpoint_age_ms)
       recovery_oldest_checkpoint_age_ms =
           stats.recovery_oldest_checkpoint_age_ms;
-    flexicast_rekeys += stats.flexicast_rekeys;
-    flexicast_rekey_members += stats.flexicast_rekey_members;
-    flexicast_rekey_batched_changes +=
-        stats.flexicast_rekey_batched_changes;
-    flexicast_membership_joins += stats.flexicast_membership_joins;
-    flexicast_membership_leaves += stats.flexicast_membership_leaves;
-    flexicast_fallbacks += stats.flexicast_fallbacks;
-    active_connections += stats.active_connections;
-    assembler_memory_bytes += stats.assembler_memory_bytes;
-    egress_peak_packets += stats.egress_peak_packets;
-    egress_peak_bytes += stats.egress_peak_bytes;
-    active_flows += stats.flexicast_active_flows;
-    active_memberships += stats.flexicast_active_memberships;
-    cc_rate_increases += stats.flexicast_cc_rate_increase_events;
-    cc_rate_reductions += stats.flexicast_cc_rate_reduction_events;
-    cc_floor_entries += stats.flexicast_cc_floor_entry_events;
-    cc_floor_exits += stats.flexicast_cc_floor_exit_events;
-    cc_ack_growth += stats.flexicast_cc_ack_growth_events;
-    cc_other_growth += stats.flexicast_cc_other_growth_events;
-    cc_loss_reductions += stats.flexicast_cc_loss_reduction_events;
-    cc_rtt_reductions += stats.flexicast_cc_rtt_reduction_events;
-    cc_ecn_reductions += stats.flexicast_cc_ecn_reduction_events;
-    cc_timeout_reductions += stats.flexicast_cc_timeout_reduction_events;
-    cc_rate_limit_reductions += stats.flexicast_cc_rate_limit_reduction_events;
-    cc_other_reductions += stats.flexicast_cc_other_reduction_events;
-    cc_external_load_growth_freezes +=
-        stats.flexicast_cc_external_load_growth_freeze_events;
-    members += stats.flexicast_active_members;
-    queued += stats.flexicast_queued_packets;
     if (stats.flexicast_cc_rate_bytes_per_second != 0 &&
         (rate == 0 || stats.flexicast_cc_rate_bytes_per_second < rate))
       rate = stats.flexicast_cc_rate_bytes_per_second;
@@ -791,16 +725,14 @@ static void print_stats(app_ctx_t *app, int64_t now, bool force) {
     fprintf(app->stats_output,
             "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
             "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
-            "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
+            "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
+            "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
+            "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
+            "\t%" PRIu64 "\t%" PRId64 "\t%" PRId64 "\t%" PRId64 "\t%" PRIu64
+            "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
+            "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%u\t%" PRIu64 "\t%" PRIu64
+            "\t%" PRIu64 "\t%zu\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
             "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
-            "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
-            "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
-            "\t%" PRIu64 "\t%" PRId64 "\t%" PRId64 "\t%" PRId64
-            "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
-            "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
-            "\t%" PRIu64 "\t%u\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
-            "\t%zu\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
-            "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
             "\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\n",
             repair_packets_cancelled, repair_pending_symbols_cancelled,
             flexicast_feedback_fallbacks, repair_indexed_requests_sent,
@@ -811,28 +743,27 @@ static void print_stats(app_ctx_t *app, int64_t now, bool force) {
             repair_requester_records_expired, cc_rate_increases,
             cc_rate_reductions, cc_floor_entries, cc_floor_exits, cc_ack_growth,
             cc_other_growth, cc_loss_reductions, cc_rtt_reductions,
-            cc_ecn_reductions, cc_timeout_reductions,
-            cc_rate_limit_reductions, cc_other_reductions,
-            cc_external_load_growth_freezes, now, app->track_finished_at,
-            app->receive_done_at, repair_shadow_plans,
+            cc_ecn_reductions, cc_timeout_reductions, cc_rate_limit_reductions,
+            cc_other_reductions, cc_external_load_growth_freezes, now,
+            app->track_finished_at, app->receive_done_at, repair_shadow_plans,
             repair_shadow_all_shared, repair_shadow_all_unicast,
             repair_shadow_mixed, repair_shadow_uncertain,
             repair_shadow_infeasible, repair_shadow_log_errors,
-            repair_shadow_last_airtime_us,
-            repair_shadow_last_physical_bytes,
-            repair_shadow_last_savings_ppm,
-            repair_shadow_observation_overflow, repair_unicast_symbols,
-            repair_unicast_payload_bytes, recovery_checkpoints_pending,
-            recovery_oldest_checkpoint_age_ms, flexicast_rekeys,
-            flexicast_rekey_members, flexicast_rekey_batched_changes,
-            flexicast_membership_joins, flexicast_membership_leaves,
-            flexicast_fallbacks, active_connections, assembler_memory_bytes,
-            egress_peak_packets, egress_peak_bytes, active_flows,
-            active_memberships);
+            repair_shadow_last_airtime_us, repair_shadow_last_physical_bytes,
+            repair_shadow_last_savings_ppm, repair_shadow_observation_overflow,
+            repair_unicast_symbols, repair_unicast_payload_bytes,
+            recovery_checkpoints_pending, recovery_oldest_checkpoint_age_ms,
+            flexicast_rekeys, flexicast_rekey_members,
+            flexicast_rekey_batched_changes, flexicast_membership_joins,
+            flexicast_membership_leaves, flexicast_fallbacks,
+            active_connections, assembler_memory_bytes, egress_peak_packets,
+            egress_peak_bytes, active_flows, active_memberships);
     fflush(app->stats_output);
   }
   app->next_stats_at = now + app->stats_ms;
 }
+
+#undef APP_SUMMED_TRANSPORT_STATS
 
 static void format_bytes(double bytes, char *output, size_t capacity) {
   static const char *const units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
@@ -866,12 +797,14 @@ static void print_pv(app_ctx_t *app, int64_t now, bool force) {
       if (!transport_get_path_stats(transport, path, &stats))
         break;
       pv_path_t *previous = &app->pv_paths[transport_index][path];
-      bool same_path = previous->initialized &&
-                       previous->interface_index == stats.interface_index &&
-                       strcmp(previous->local_address, stats.local_address) == 0;
-      uint64_t sent_delta = same_path && stats.bytes_sent >= previous->bytes_sent
-                                ? stats.bytes_sent - previous->bytes_sent
-                                : stats.bytes_sent;
+      bool same_path =
+          previous->initialized &&
+          previous->interface_index == stats.interface_index &&
+          strcmp(previous->local_address, stats.local_address) == 0;
+      uint64_t sent_delta =
+          same_path && stats.bytes_sent >= previous->bytes_sent
+              ? stats.bytes_sent - previous->bytes_sent
+              : stats.bytes_sent;
       uint64_t received_delta =
           same_path && stats.bytes_received >= previous->bytes_received
               ? stats.bytes_received - previous->bytes_received
@@ -918,30 +851,11 @@ static void drive(app_ctx_t *app) {
     if (app->transports[i].transport)
       transport_tick(app->transports[i].transport);
   int64_t now = transport_get_time_ms();
-  for (size_t i = 0; i < app->num_transports; i++) {
-    app_transport_t *entry = &app->transports[i];
-    if (entry->is_server || !entry->reconnect_pending ||
-        now < entry->next_reconnect_at)
-      continue;
-    if (entry->transport) {
-      transport_destroy(entry->transport);
-      entry->transport = NULL;
-    }
-    entry->reconnect_pending = false;
-    entry->transport = transport_create(&entry->config);
-    if (!entry->transport) {
-      entry->reconnect_pending = true;
-      entry->next_reconnect_at = now + app->reconnect_ms;
-    } else if (app->verbose) {
-      fprintf(stderr, "qlinq-app: reconnecting to peer\n");
-    }
-  }
   load_input(app, now);
   publish_pending(app, now);
   finish_input_track(app, now);
   if (app->leave_after_ms != 0 && !app->receive_unsubscribed) {
-    if (app->membership_joined_at == 0 &&
-        active_receive_memberships(app) != 0)
+    if (app->membership_joined_at == 0 && active_receive_memberships(app) != 0)
       app->membership_joined_at = now;
     if (app->membership_joined_at != 0 &&
         now - app->membership_joined_at >= app->leave_after_ms)
@@ -956,8 +870,8 @@ static void drive(app_ctx_t *app) {
 }
 
 int main(int argc, char **argv) {
-  const char *bind_host = "0.0.0.0", *cert_file = "t/assets/server.crt";
-  const char *key_file = "t/assets/server.key", *ca_file = NULL;
+  const char *bind_host = "0.0.0.0", *cert_file = NULL;
+  const char *key_file = NULL, *ca_file = NULL;
   const char *input_path = NULL, *output_path = NULL;
   const char *stats_path = NULL, *repair_shadow_path = NULL;
   const char *flexicast_group = NULL, *flexicast_interface = NULL;
@@ -997,7 +911,7 @@ int main(int argc, char **argv) {
       return 0;
     } else if (strcmp(argv[i], "--listen") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT16_MAX, &parsed) || parsed == 0)
+      if (!cli_parse_u64(argv[i], UINT16_MAX, &parsed) || parsed == 0)
         goto Invalid;
       listen_port = (uint16_t)parsed;
     } else if (strcmp(argv[i], "--peer") == 0) {
@@ -1010,17 +924,18 @@ int main(int argc, char **argv) {
       bind_host = argv[i];
     } else if (strcmp(argv[i], "--reconnect-ms") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT32_MAX, &parsed))
+      if (!cli_parse_u64(argv[i], UINT32_MAX, &parsed))
         goto Invalid;
       app.reconnect_ms = (uint32_t)parsed;
     } else if (strcmp(argv[i], "--start-delay-ms") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT32_MAX, &parsed))
+      if (!cli_parse_u64(argv[i], UINT32_MAX, &parsed))
         goto Invalid;
       app.start_delay_ms = (uint32_t)parsed;
     } else if (strcmp(argv[i], "--idle-timeout-ms") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT64_MAX, &idle_timeout) || idle_timeout == 0)
+      if (!cli_parse_u64(argv[i], UINT64_MAX, &idle_timeout) ||
+          idle_timeout == 0)
         goto Invalid;
     } else if (strcmp(argv[i], "--cert") == 0) {
       REQUIRE_VALUE();
@@ -1045,29 +960,29 @@ int main(int argc, char **argv) {
       max_connections = (size_t)parsed;
     } else if (strcmp(argv[i], "--max-repair-requests") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT16_MAX, &parsed) || parsed == 0)
+      if (!cli_parse_u64(argv[i], UINT16_MAX, &parsed) || parsed == 0)
         goto Invalid;
       max_repair_requests = (size_t)parsed;
     } else if (strcmp(argv[i], "--max-aggregate-repairs") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT16_MAX, &parsed) || parsed == 0)
+      if (!cli_parse_u64(argv[i], UINT16_MAX, &parsed) || parsed == 0)
         goto Invalid;
       max_aggregate_repairs = (size_t)parsed;
     } else if (strcmp(argv[i], "--repair-feedback-seed") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT64_MAX, &repair_feedback_seed))
+      if (!cli_parse_u64(argv[i], UINT64_MAX, &repair_feedback_seed))
         goto Invalid;
     } else if (strcmp(argv[i], "--repair-shadow-file") == 0) {
       REQUIRE_VALUE();
       repair_shadow_path = argv[i];
     } else if (strcmp(argv[i], "--repair-shadow-deadline") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT64_MAX, &repair_shadow_deadline) ||
+      if (!cli_parse_u64(argv[i], UINT64_MAX, &repair_shadow_deadline) ||
           repair_shadow_deadline == 0)
         goto Invalid;
     } else if (strcmp(argv[i], "--loss") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], 100, &parsed))
+      if (!cli_parse_u64(argv[i], 100, &parsed))
         goto Invalid;
       simulated_loss_rate = (uint8_t)parsed;
     } else if (strcmp(argv[i], "--track") == 0) {
@@ -1105,12 +1020,12 @@ int main(int argc, char **argv) {
       output_path = argv[i];
     } else if (strcmp(argv[i], "--message-size") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], APP_MAX_MESSAGE_SIZE, &parsed) || parsed == 0)
+      if (!cli_parse_u64(argv[i], APP_MAX_MESSAGE_SIZE, &parsed) || parsed == 0)
         goto Invalid;
       message_size = (size_t)parsed;
     } else if (strcmp(argv[i], "--count") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT64_MAX, &app.count_limit))
+      if (!cli_parse_u64(argv[i], UINT64_MAX, &app.count_limit))
         goto Invalid;
     } else if (strcmp(argv[i], "--receive-count") == 0) {
       REQUIRE_VALUE();
@@ -1119,37 +1034,37 @@ int main(int argc, char **argv) {
         goto Invalid;
     } else if (strcmp(argv[i], "--leave-after-ms") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT32_MAX, &parsed) || parsed == 0)
+      if (!cli_parse_u64(argv[i], UINT32_MAX, &parsed) || parsed == 0)
         goto Invalid;
       app.leave_after_ms = (uint32_t)parsed;
     } else if (strcmp(argv[i], "--late-join") == 0) {
       app.late_join = true;
     } else if (strcmp(argv[i], "--wait-subscribers") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], SIZE_MAX, &parsed) || parsed == 0)
+      if (!cli_parse_u64(argv[i], SIZE_MAX, &parsed) || parsed == 0)
         goto Invalid;
       app.required_subscriptions = (size_t)parsed;
     } else if (strcmp(argv[i], "--wait-members") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], SIZE_MAX, &parsed) || parsed == 0)
+      if (!cli_parse_u64(argv[i], SIZE_MAX, &parsed) || parsed == 0)
         goto Invalid;
       app.required_flexicast_members = (size_t)parsed;
       flexicast = true;
     } else if (strcmp(argv[i], "--interval-ms") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT32_MAX, &parsed))
+      if (!cli_parse_u64(argv[i], UINT32_MAX, &parsed))
         goto Invalid;
       app.interval_ms = (uint32_t)parsed;
     } else if (strcmp(argv[i], "--one-shot") == 0) {
       app.one_shot = true;
     } else if (strcmp(argv[i], "--drain-ms") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT32_MAX, &parsed))
+      if (!cli_parse_u64(argv[i], UINT32_MAX, &parsed))
         goto Invalid;
       app.drain_ms = (uint32_t)parsed;
     } else if (strcmp(argv[i], "--stats-ms") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT32_MAX, &parsed))
+      if (!cli_parse_u64(argv[i], UINT32_MAX, &parsed))
         goto Invalid;
       app.stats_ms = (uint32_t)parsed;
     } else if (strcmp(argv[i], "--stats-file") == 0) {
@@ -1172,7 +1087,7 @@ int main(int argc, char **argv) {
       flexicast = true;
     } else if (strcmp(argv[i], "--flexicast-port") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT16_MAX, &parsed) || parsed == 0)
+      if (!cli_parse_u64(argv[i], UINT16_MAX, &parsed) || parsed == 0)
         goto Invalid;
       flexicast_port = (uint16_t)parsed;
     } else if (strcmp(argv[i], "--flexicast-interface") == 0) {
@@ -1196,27 +1111,27 @@ int main(int argc, char **argv) {
       flexicast = true;
     } else if (strcmp(argv[i], "--flexicast-cc-startup-rate") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT64_MAX, &startup_rate))
+      if (!cli_parse_u64(argv[i], UINT64_MAX, &startup_rate))
         goto Invalid;
       flexicast = true;
     } else if (strcmp(argv[i], "--flexicast-cc-min-rate") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT64_MAX, &minimum_rate))
+      if (!cli_parse_u64(argv[i], UINT64_MAX, &minimum_rate))
         goto Invalid;
       flexicast = true;
     } else if (strcmp(argv[i], "--flexicast-cc-max-rate") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT64_MAX, &maximum_rate))
+      if (!cli_parse_u64(argv[i], UINT64_MAX, &maximum_rate))
         goto Invalid;
       flexicast = true;
     } else if (strcmp(argv[i], "--flexicast-cc-aggregate-rate") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT64_MAX, &aggregate_rate))
+      if (!cli_parse_u64(argv[i], UINT64_MAX, &aggregate_rate))
         goto Invalid;
       flexicast = true;
     } else if (strcmp(argv[i], "--flexicast-cc-feedback-timeout") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT32_MAX, &feedback_timeout))
+      if (!cli_parse_u64(argv[i], UINT32_MAX, &feedback_timeout))
         goto Invalid;
       flexicast = true;
     } else {
@@ -1228,9 +1143,10 @@ int main(int argc, char **argv) {
   if ((listen_port == 0 && num_peers == 0) ||
       (listen_port != 0 && num_peers == APP_MAX_TRANSPORTS) ||
       (!input_path && !output_path) || (app.one_shot && !input_path) ||
-      (app.leave_after_ms != 0 &&
-       (num_peers == 0 || app.receive_limit != 0)) ||
+      (app.leave_after_ms != 0 && (num_peers == 0 || app.receive_limit != 0)) ||
       !app.auth_token || app.auth_token[0] == '\0' ||
+      (cert_file == NULL) != (key_file == NULL) ||
+      ((listen_port != 0 || verify_peer) && cert_file == NULL) ||
       (flexicast_group && (!flexicast_port || !flexicast_interface)) ||
       (!flexicast_group && flexicast_port != 0))
     goto Invalid;
@@ -1328,38 +1244,38 @@ int main(int argc, char **argv) {
   }
   signal(SIGINT, handle_signal);
   signal(SIGTERM, handle_signal);
+#ifdef SIGHUP
+  signal(SIGHUP, handle_signal);
+#endif
 
-#define APPLY_COMMON_CONFIG(config_)                                           \
-  do {                                                                         \
-    (config_).cert_file = cert_file;                                           \
-    (config_).key_file = key_file;                                             \
-    (config_).ca_file = ca_file;                                               \
-    (config_).verify_peer = verify_peer;                                       \
-    (config_).allow_insecure_peer = allow_insecure;                            \
-    (config_).quic_idle_timeout_ms = idle_timeout;                            \
-    (config_).simulated_loss_rate = simulated_loss_rate;                       \
-    (config_).limits.max_connections = max_connections;                        \
-    (config_).limits.max_repair_requests_per_second = max_repair_requests;     \
-    (config_).limits.max_aggregate_repair_requests_per_second =                \
-        max_aggregate_repairs;                                                 \
-    (config_).repair_mode = repair_mode;                                       \
-    (config_).repair_feedback_seed = repair_feedback_seed;                     \
-    (config_).repair_shadow_deadline_ms = repair_shadow_deadline;              \
-    (config_).enable_flexicast = flexicast;                                    \
-    (config_).flexicast_interface = flexicast_interface;                       \
-    (config_).flexicast_cc_mode = cc_mode;                                     \
-    (config_).flexicast_repair_route = repair_route;                           \
-    (config_).flexicast_cc_startup_rate = startup_rate;                        \
-    (config_).flexicast_cc_minimum_rate = minimum_rate;                        \
-    (config_).flexicast_cc_maximum_rate = maximum_rate;                        \
-    (config_).flexicast_cc_aggregate_rate_limit = aggregate_rate;              \
-    (config_).flexicast_cc_feedback_timeout_ms = (uint32_t)feedback_timeout;   \
-  } while (0)
+  const transport_config_t common_config = {
+      .cert_file = cert_file,
+      .key_file = key_file,
+      .ca_file = ca_file,
+      .verify_peer = verify_peer,
+      .allow_insecure_peer = allow_insecure,
+      .quic_idle_timeout_ms = idle_timeout,
+      .simulated_loss_rate = simulated_loss_rate,
+      .limits = {.max_connections = max_connections,
+                 .max_repair_requests_per_second = max_repair_requests,
+                 .max_aggregate_repair_requests_per_second =
+                     max_aggregate_repairs},
+      .repair_mode = repair_mode,
+      .repair_feedback_seed = repair_feedback_seed,
+      .repair_shadow_deadline_ms = repair_shadow_deadline,
+      .enable_flexicast = flexicast,
+      .flexicast_interface = flexicast_interface,
+      .flexicast_cc_mode = cc_mode,
+      .flexicast_repair_route = repair_route,
+      .flexicast_cc_startup_rate = startup_rate,
+      .flexicast_cc_minimum_rate = minimum_rate,
+      .flexicast_cc_maximum_rate = maximum_rate,
+      .flexicast_cc_aggregate_rate_limit = aggregate_rate,
+      .flexicast_cc_feedback_timeout_ms = (uint32_t)feedback_timeout};
 
   if (listen_port != 0) {
     app_transport_t *entry = &app.transports[app.num_transports];
-    transport_config_t config = {0};
-    APPLY_COMMON_CONFIG(config);
+    transport_config_t config = common_config;
     config.bind_hosts[config.num_bind_hosts++] = bind_host;
     config.port = listen_port;
     config.flexicast_group = flexicast_group;
@@ -1378,18 +1294,23 @@ int main(int argc, char **argv) {
   }
   for (size_t i = 0; i < num_peers; i++) {
     app_transport_t *entry = &app.transports[app.num_transports];
-    transport_config_t config = {0};
+    transport_config_t config = common_config;
     uint16_t port = 8888;
-    if (!parse_peer(peer_args[i], entry->remote_host,
-                    sizeof(entry->remote_host), &port)) {
+    if (!cli_parse_endpoint(peer_args[i], entry->remote_host,
+                            sizeof(entry->remote_host), &port, NULL)) {
       fprintf(stderr, "qlinq-app: invalid peer '%s'\n", peer_args[i]);
       goto CleanupSockets;
     }
-    APPLY_COMMON_CONFIG(config);
     config.bind_hosts[config.num_bind_hosts++] =
         strchr(entry->remote_host, ':') ? "::" : "0.0.0.0";
     config.remote_hosts[config.num_remote_hosts++] = entry->remote_host;
     config.port = port;
+    config.reconnect_enabled = app.reconnect_ms != 0;
+    config.reconnect_initial_delay_ms = app.reconnect_ms;
+    config.reconnect_max_delay_ms =
+        app.reconnect_ms > TRANSPORT_DEFAULT_RECONNECT_MAX_DELAY_MS
+            ? app.reconnect_ms
+            : TRANSPORT_DEFAULT_RECONNECT_MAX_DELAY_MS;
     config.callback = on_transport_event;
     config.user_data = entry;
     entry->app = &app;
@@ -1400,13 +1321,26 @@ int main(int argc, char **argv) {
     }
     app.num_transports++;
   }
-#undef APPLY_COMMON_CONFIG
-
   app.started_at = transport_get_time_ms();
   app.next_stats_at = app.started_at + app.stats_ms;
   app.pv_last_at = app.started_at;
   app.next_pv_at = app.started_at + APP_PV_INTERVAL_MS;
   while (app_running && !app.failed) {
+#ifdef SIGHUP
+    if (reload_credentials_requested) {
+      reload_credentials_requested = 0;
+      bool ok = cert_file != NULL;
+      for (size_t i = 0; ok && i < app.num_transports; i++)
+        if (app.transports[i].transport &&
+            !transport_reload_credentials(app.transports[i].transport,
+                                          cert_file, key_file))
+          ok = false;
+      fprintf(stderr, "qlinq-app: TLS credential reload %s\n",
+              ok ? "complete" : "failed");
+      if (ok)
+        fprintf(stderr, "qlinq-app: TLS credentials reloaded\n");
+    }
+#endif
     drive(&app);
     int64_t now = transport_get_time_ms();
     bool send_done = !app.one_shot ||
@@ -1416,10 +1350,9 @@ int main(int argc, char **argv) {
         (app.track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0
             ? app.receive_unsubscribed_at
             : app.receive_done_at;
-    bool receive_done =
-        (app.receive_limit == 0 && app.leave_after_ms == 0) ||
-        (receive_drain_started_at != 0 &&
-         now - receive_drain_started_at >= app.drain_ms);
+    bool receive_done = (app.receive_limit == 0 && app.leave_after_ms == 0) ||
+                        (receive_drain_started_at != 0 &&
+                         now - receive_drain_started_at >= app.drain_ms);
     if ((app.one_shot || app.receive_limit != 0 || app.leave_after_ms != 0) &&
         send_done && receive_done)
       break;
@@ -1455,6 +1388,26 @@ int main(int argc, char **argv) {
     } else if (timeout != 0) {
       usleep((useconds_t)timeout * 1000);
     }
+  }
+  for (size_t i = 0; i < app.num_transports; i++)
+    if (app.transports[i].transport)
+      transport_shutdown(app.transports[i].transport,
+                         app_running ? "application complete"
+                                     : "signal shutdown");
+  int64_t shutdown_started = transport_get_time_ms();
+  bool drained = false;
+  while (!drained &&
+         transport_get_time_ms() - shutdown_started < app.drain_ms) {
+    drained = true;
+    for (size_t i = 0; i < app.num_transports; i++) {
+      if (!app.transports[i].transport)
+        continue;
+      transport_tick(app.transports[i].transport);
+      if (!transport_is_drained(app.transports[i].transport))
+        drained = false;
+    }
+    if (!drained)
+      usleep(1000);
   }
   int64_t stopped_at = transport_get_time_ms();
   print_stats(&app, stopped_at, true);

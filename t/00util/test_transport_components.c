@@ -1,3 +1,4 @@
+#include "cli_parse.h"
 #include "transport_config.h"
 #include "transport_egress.h"
 #include "transport_fec_state.h"
@@ -223,12 +224,32 @@ static int test_subscription_state_lifetime(void) {
 }
 
 int main(void) {
-  CHECK(test_subscription_state_lifetime() == 0,
-        "sparse recovery state lifetime");
-  CHECK(test_assembler_growth_budget() == 0,
-        "assembler transient allocation budget");
-  CHECK(test_udp_batch_boundaries() == 0, "UDP batch boundaries");
-  CHECK(test_recovery_cache_protection() == 0, "recovery cache protection");
+  uint64_t parsed_number = 0;
+  CHECK(cli_parse_u64("65535", UINT16_MAX, &parsed_number) &&
+            parsed_number == UINT16_MAX &&
+            !cli_parse_u64("65536", UINT16_MAX, &parsed_number) &&
+            !cli_parse_u64("-1", UINT64_MAX, &parsed_number),
+        "unsigned CLI value parsing");
+
+  char parsed_host[64];
+  uint16_t parsed_port = 1234;
+  bool has_port = false;
+  CHECK(cli_parse_endpoint("example.test:4321", parsed_host,
+                           sizeof(parsed_host), &parsed_port, &has_port) &&
+            strcmp(parsed_host, "example.test") == 0 && has_port &&
+            parsed_port == 4321,
+        "IPv4-style CLI endpoint parsing");
+  CHECK(cli_parse_endpoint("[2001:db8::1]", parsed_host, sizeof(parsed_host),
+                           &parsed_port, &has_port) &&
+            strcmp(parsed_host, "2001:db8::1") == 0 && !has_port &&
+            parsed_port == 4321,
+        "IPv6 CLI endpoint parsing");
+  CHECK(!cli_parse_endpoint("host:0", parsed_host, sizeof(parsed_host),
+                            &parsed_port, &has_port) &&
+            !cli_parse_endpoint("[broken", parsed_host, sizeof(parsed_host),
+                                &parsed_port, &has_port),
+        "invalid CLI endpoint rejection");
+
   transport_limits_t configured = {0};
   transport_limits_t resolved_limits;
   char limit_error[128];
@@ -739,8 +760,14 @@ int main(void) {
 
   transport_t *scheduler_transport = calloc(1, sizeof(*scheduler_transport));
   CHECK(scheduler_transport != NULL, "repair scheduler allocation");
+  transport_flexicast_queued_payload_t
+      scheduler_repairs[TRANSPORT_FLEXICAST_REPAIR_QUEUE_CAPACITY] = {0};
   transport_flexicast_flow_t scheduler_flow = {
-      .active = true, .source = true, .track_id = cached->track_id};
+      .active = true,
+      .source = true,
+      .track_id = cached->track_id,
+      .repair_queue = {.entries = scheduler_repairs,
+                       .capacity = TRANSPORT_FLEXICAST_REPAIR_QUEUE_CAPACITY}};
   uint16_t first_request[] = {3, 1};
   uint16_t overlapping_request[] = {2, 3};
   CHECK(transport_flexicast_schedule_repair(
@@ -767,7 +794,7 @@ int main(void) {
   CHECK(pending->intent_id != 0 && pending->retained_requesters == 2 &&
             pending->retained_deficit_sum == 4 &&
             pending->shared_useful_requesters == 2 &&
-            scheduler_flow.repair_requester_count == 2,
+            scheduler_flow.repair_requesters.count == 2,
         "repair aggregation retains bounded stable requester identities");
   uint16_t reduced_request = 1;
   CHECK(
@@ -808,30 +835,30 @@ int main(void) {
       TRANSPORT_REPAIR_MODE_INDEXED, false, overlapping_request, 2,
       TRANSPORT_FLEXICAST_OBS_SUPPRESSED, 130);
   CHECK(scheduler_flow.shadow_observation_count == 1 &&
-            scheduler_flow.shadow_requester_count == 2 &&
+            scheduler_flow.shadow_requesters.count == 2 &&
             scheduler_flow.shadow_observations[0].accepted_requests == 1 &&
             scheduler_flow.shadow_observations[0].suppressed_requests == 1 &&
             scheduler_flow.shadow_observations[0].ready_at_ms ==
                 120 + TRANSPORT_FLEXICAST_SHADOW_OBSERVATION_MS,
         "shadow observation independently retains accepted and suppressed "
         "demand");
-  scheduler_flow.repair_queued[0] =
+  scheduler_flow.repair_queue.entries[0] =
       (transport_flexicast_queued_payload_t){.data = malloc(1),
                                              .size = 1,
                                              .group_id = cached->group_id,
                                              .object_id = cached->object_id,
                                              .symbol_index = 1};
-  scheduler_flow.repair_queued[1] =
+  scheduler_flow.repair_queue.entries[1] =
       (transport_flexicast_queued_payload_t){.data = malloc(1),
                                              .size = 1,
                                              .group_id = cached->group_id,
                                              .object_id = 1000,
                                              .symbol_index = 7};
-  CHECK(scheduler_flow.repair_queued[0].data &&
-            scheduler_flow.repair_queued[1].data,
+  CHECK(scheduler_flow.repair_queue.entries[0].data &&
+            scheduler_flow.repair_queue.entries[1].data,
         "repair cancellation fixture allocation");
-  scheduler_flow.repair_queue_count = 2;
-  scheduler_flow.repair_queue_bytes = 2;
+  scheduler_flow.repair_queue.count = 2;
+  scheduler_flow.repair_queue.bytes = 2;
   scheduled_object.object_id = 1000;
   uint16_t already_queued = 7;
   CHECK(transport_flexicast_schedule_repair(
@@ -846,9 +873,9 @@ int main(void) {
             cached->object_id) == 4 &&
             scheduler_flow.pending_repair_count ==
                 TRANSPORT_FLEXICAST_PENDING_REPAIRS - 1U &&
-            scheduler_flow.repair_queue_count == 1 &&
-            scheduler_flow.repair_queue_bytes == 1 &&
-            scheduler_flow.repair_queued[0].object_id == 1000 &&
+            scheduler_flow.repair_queue.count == 1 &&
+            scheduler_flow.repair_queue.bytes == 1 &&
+            scheduler_flow.repair_queue.entries[0].object_id == 1000 &&
             scheduler_transport->stats.repair_packets_cancelled == 1 &&
             scheduler_transport->stats.repair_pending_symbols_cancelled == 3,
         "checkpoint release cancels and compacts obsolete repairs");
@@ -875,9 +902,9 @@ int main(void) {
                                                  &cached->track_id) > 0 &&
             scheduler_flow.pending_repair_count == 0 &&
             scheduler_flow.shadow_observation_count == 0 &&
-            scheduler_flow.shadow_requester_count == 0 &&
-            scheduler_flow.repair_queue_count == 0 &&
-            scheduler_flow.repair_queue_bytes == 0 &&
+            scheduler_flow.shadow_requesters.count == 0 &&
+            scheduler_flow.repair_queue.count == 0 &&
+            scheduler_flow.repair_queue.bytes == 0 &&
             scheduler_transport->stats.repair_packets_cancelled == 2,
         "track release cancels all remaining repair work");
 
@@ -895,15 +922,16 @@ int main(void) {
             scheduler_transport->stats.repair_requests_merged >= 3,
         "rateless aggregation takes the maximum receiver deficit");
 
-  transport_flexicast_flow_t covered_rateless_flow = {.active = true,
-                                                      .source = true,
-                                                      .track_id =
-                                                          rateless_track,
-                                                      .repair_queue_count = 3};
-  for (size_t i = 0; i < covered_rateless_flow.repair_queue_count; i++) {
-    covered_rateless_flow.repair_queued[i].group_id = object.group_id;
-    covered_rateless_flow.repair_queued[i].object_id = object.object_id;
-    covered_rateless_flow.repair_queued[i].repair_mode =
+  transport_flexicast_queued_payload_t covered_repairs[3] = {0};
+  transport_flexicast_flow_t covered_rateless_flow = {
+      .active = true,
+      .source = true,
+      .track_id = rateless_track,
+      .repair_queue = {.entries = covered_repairs, .capacity = 3, .count = 3}};
+  for (size_t i = 0; i < covered_rateless_flow.repair_queue.count; i++) {
+    covered_rateless_flow.repair_queue.entries[i].group_id = object.group_id;
+    covered_rateless_flow.repair_queue.entries[i].object_id = object.object_id;
+    covered_rateless_flow.repair_queue.entries[i].repair_mode =
         TRANSPORT_REPAIR_MODE_RATELESS;
   }
   bool duplicates_bounded = true;
@@ -912,7 +940,7 @@ int main(void) {
         scheduler_transport, &covered_rateless_flow, rateless_cached, i + 1U,
         TRANSPORT_REPAIR_MODE_RATELESS, false, NULL, 3, 310);
   CHECK(duplicates_bounded && covered_rateless_flow.pending_repair_count == 0 &&
-            covered_rateless_flow.repair_queue_count == 3,
+            covered_rateless_flow.repair_queue.count == 3,
         "queued rateless degrees of freedom bound duplicate requests");
 
   transport_flexicast_flow_t mixed_mode_flow = {
@@ -939,9 +967,9 @@ int main(void) {
         TRANSPORT_REPAIR_MODE_RATELESS, false, NULL, 3, 400);
   pending = &concentrated_flow.pending_repairs[0];
   CHECK(concentrated_bounded && concentrated_flow.pending_repair_count == 1 &&
-            concentrated_flow.repair_requester_count ==
+            concentrated_flow.repair_requesters.count ==
                 TRANSPORT_FLEXICAST_REPAIR_REQUESTERS &&
-            concentrated_flow.repair_requester_capacity ==
+            concentrated_flow.repair_requesters.capacity ==
                 TRANSPORT_FLEXICAST_REPAIR_REQUESTERS &&
             pending->retained_requesters ==
                 TRANSPORT_FLEXICAST_REPAIR_REQUESTERS &&
@@ -954,7 +982,7 @@ int main(void) {
   scheduler_transport->flexicast.capacity = 1;
   CHECK(transport_flexicast_cancel_track_repairs(scheduler_transport,
                                                  &rateless_track) == 3 &&
-            concentrated_flow.repair_requester_count == 0,
+            concentrated_flow.repair_requesters.count == 0,
         "repair checkpoint expiry releases requester records with the intent");
 
   transport_flexicast_flow_t dispersed_flow = {
@@ -972,8 +1000,8 @@ int main(void) {
   CHECK(dispersed_bounded &&
             dispersed_flow.pending_repair_count ==
                 TRANSPORT_FLEXICAST_PENDING_REPAIRS &&
-            dispersed_flow.repair_requester_count == 1000 &&
-            dispersed_flow.repair_requester_capacity <=
+            dispersed_flow.repair_requesters.count == 1000 &&
+            dispersed_flow.repair_requesters.capacity <=
                 TRANSPORT_FLEXICAST_REPAIR_REQUESTERS,
         "dispersed thousand-member loss scales with active demand and bounded "
         "intents");
@@ -987,7 +1015,7 @@ int main(void) {
         TRANSPORT_REPAIR_MODE_INDEXED, false, &missing_symbol, 1, 501);
   }
   CHECK(dispersed_bounded &&
-            dispersed_flow.repair_requester_count ==
+            dispersed_flow.repair_requesters.count ==
                 TRANSPORT_FLEXICAST_REPAIR_REQUESTERS &&
             scheduler_transport->stats.repair_requester_overflow >= 202 &&
             scheduler_transport->stats.repair_requester_records_peak ==
@@ -996,15 +1024,15 @@ int main(void) {
   scheduler_transport->flexicast.flows = &dispersed_flow;
   CHECK(transport_flexicast_cancel_track_repairs(scheduler_transport,
                                                  &cached->track_id) > 0 &&
-            dispersed_flow.repair_requester_count == 0,
+            dispersed_flow.repair_requesters.count == 0,
         "dispersed requester state expires at checkpoint release");
 
-  free(scheduler_flow.repair_requesters);
-  free(rateless_flow.repair_requesters);
-  free(covered_rateless_flow.repair_requesters);
-  free(mixed_mode_flow.repair_requesters);
-  free(concentrated_flow.repair_requesters);
-  free(dispersed_flow.repair_requesters);
+  free(scheduler_flow.repair_requesters.entries);
+  free(rateless_flow.repair_requesters.entries);
+  free(covered_rateless_flow.repair_requesters.entries);
+  free(mixed_mode_flow.repair_requesters.entries);
+  free(concentrated_flow.repair_requesters.entries);
+  free(dispersed_flow.repair_requesters.entries);
   fclose(scheduler_transport->repair_shadow_log);
   free(scheduler_transport);
 

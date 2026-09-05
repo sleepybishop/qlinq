@@ -5,10 +5,11 @@
 #define _DEFAULT_SOURCE
 #endif
 
+#include "cli_parse.h"
 #include "data_uds.h"
 #include "portable_sockets.h"
 #include "transport.h"
-#include <errno.h>
+#include <inttypes.h>
 #include <openssl/crypto.h>
 #include <poll.h>
 #include <signal.h>
@@ -19,46 +20,47 @@
 #include <unistd.h>
 
 static volatile sig_atomic_t g_running = 1;
+static volatile sig_atomic_t g_reload_credentials = 0;
 
 static void handle_signal(int sig) {
+#ifdef SIGHUP
+  if (sig == SIGHUP) {
+    g_reload_credentials = 1;
+    return;
+  }
+#endif
   (void)sig;
   g_running = 0;
 }
 
 #define MAX_TRANSPORTS 16
+#define MAX_DATA_POLL_FDS 17
+#define MAX_DAEMON_POLL_FDS                                                    \
+  (MAX_DATA_POLL_FDS + MAX_TRANSPORTS * (TRANSPORT_MAX_PATHS + 2))
 
-static bool parse_peer_endpoint(const char *endpoint, char *host,
-                                size_t host_capacity, int *port) {
-  if (!port || *port < 0 || *port > UINT16_MAX)
-    return false;
-  uint16_t parsed = (uint16_t)*port;
-  if (!cli_parse_endpoint(endpoint, host, host_capacity, &parsed, NULL))
-    return false;
-  memcpy(host, host_start, host_len);
-  host[host_len] = '\0';
-  if (port_start) {
-    char *end = NULL;
-    long parsed = strtol(port_start, &end, 10);
-    if (!port_start[0] || !end || *end != '\0' || parsed <= 0 ||
-        parsed > UINT16_MAX)
-      return false;
-    *port = (int)parsed;
-  }
-  return true;
-}
-
-static bool parse_u64_option(const char *value, uint64_t maximum,
-                             uint64_t *result) {
-  char *end = NULL;
-  unsigned long long parsed;
-  if (!value || !value[0] || value[0] == '-' || !result)
-    return false;
-  errno = 0;
-  parsed = strtoull(value, &end, 10);
-  if (errno != 0 || !end || *end != '\0' || parsed > maximum)
-    return false;
-  *result = (uint64_t)parsed;
-  return true;
+static void show_help(FILE *out, const char *program) {
+  fprintf(out,
+          "usage: %s (--listen PORT | --peer HOST[:PORT]) [options]\n\n"
+          "  --bind ADDRESS              numeric listener address\n"
+          "  --peer HOST[:PORT]          add an outbound peer (repeatable)\n"
+          "  --cert FILE --key FILE      TLS identity\n"
+          "  --ca FILE                   peer CA bundle\n"
+          "  --auth-token TOKEN          application authentication token\n"
+          "  --insecure-no-verify        test-only certificate bypass\n"
+          "  --socket NAME               Unix data socket name\n"
+          "  --track NAME                subscribe to a track (repeatable)\n"
+          "  --stats-ms MS               periodically print transport counters\n"
+          "  --reliable                  reliable track mode\n"
+          "  --rateless                  rateless FEC track mode\n"
+          "  --repair-mode MODE          auto, indexed, or rateless\n"
+          "  --flexicast                 enable Flexicast\n"
+          "  --flexicast-group ADDRESS   native multicast group\n"
+          "  --flexicast-port PORT       native multicast port\n"
+          "  --flexicast-interface IFACE native multicast interface\n"
+          "  --flexicast-cc MODE         multicast or adaptive\n"
+          "  --verbose\n\n"
+          "SIGHUP reloads --cert and --key atomically.\n",
+          program);
 }
 
 struct daemon_ctx_s;
@@ -81,6 +83,10 @@ typedef struct daemon_ctx_s {
   bool verbose;
   const char *auth_token;
   size_t auth_token_len;
+  const char *cert_file;
+  const char *key_file;
+  uint32_t stats_ms;
+  int64_t next_stats_at;
 } daemon_ctx_t;
 
 static void subscribe_to_tracks(transport_t *t, daemon_ctx_t *ctx) {
@@ -138,7 +144,16 @@ static void on_transport_event(void *user_data,
     }
     break;
   case TRANSPORT_EVENT_DISCONNECTED:
-    printf("peer disconnected\n");
+    printf("peer disconnected origin=%s class=%s code=%" PRIu64 " raw=%" PRId64
+           " reason=%s\n",
+           event->disconnect.remote ? "remote" : "local",
+           event->disconnect.application_error ? "application"
+           : event->disconnect.raw_error >= 0  ? "transport"
+                                               : "internal",
+           event->disconnect.error_code, event->disconnect.raw_error,
+           event->disconnect.reason && event->disconnect.reason[0]
+               ? event->disconnect.reason
+               : "none");
     break;
   case TRANSPORT_EVENT_SUBSCRIBE:
     printf("daemon: peer subscribed to track '%s' (type %d)\n",
@@ -261,13 +276,54 @@ static void daemon_tick(daemon_ctx_t *ctx) {
   }
 }
 
+static void daemon_print_stats(daemon_ctx_t *ctx, int64_t now_ms) {
+  if (!ctx || ctx->stats_ms == 0)
+    return;
+  if (ctx->next_stats_at == 0) {
+    ctx->next_stats_at = now_ms + ctx->stats_ms;
+    return;
+  }
+  if (now_ms < ctx->next_stats_at)
+    return;
+  for (size_t i = 0; i < ctx->num_transports; i++) {
+    transport_stats_t stats = {0};
+    if (!transport_get_stats(ctx->transports[i].transport, &stats))
+      continue;
+    fprintf(stderr,
+            "daemon: stats transport=%zu role=%s connections=%zu "
+            "reconnect_attempts=%" PRIu64 " repair_requests=%" PRIu64
+            " repair_queue=%zu recovery_pending=%zu flexicast_members=%zu "
+            "flexicast_queue=%zu cc_rate_Bps=%" PRIu64 "\n",
+            i, ctx->transports[i].is_server ? "server" : "client",
+            stats.active_connections, stats.reconnect_attempts,
+            stats.repair_requests_sent + stats.repair_requests_received,
+            stats.repair_queued_packets, stats.recovery_checkpoints_pending,
+            stats.flexicast_active_members, stats.flexicast_queued_packets,
+            stats.flexicast_cc_rate_bytes_per_second);
+  }
+  ctx->next_stats_at = now_ms + ctx->stats_ms;
+}
+
 /* run daemon loop driven by socket polling and quicly pacer timeouts */
 static void daemon_run(daemon_ctx_t *ctx) {
   printf("daemon is running. press ctrl+c to exit.\n");
   while (ctx->running && g_running) {
+#ifdef SIGHUP
+    if (g_reload_credentials) {
+      g_reload_credentials = 0;
+      bool ok = ctx->cert_file != NULL;
+      for (size_t i = 0; ok && i < ctx->num_transports; i++)
+        if (!transport_reload_credentials(ctx->transports[i].transport,
+                                          ctx->cert_file, ctx->key_file))
+          ok = false;
+      fprintf(stderr, "daemon: TLS credential reload %s\n",
+              ok ? "complete" : "failed");
+    }
+#endif
     daemon_tick(ctx);
 
     int64_t now_ms = transport_get_time_ms();
+    daemon_print_stats(ctx, now_ms);
     int64_t earliest_timeout_ms = INT64_MAX;
 
     for (size_t i = 0; i < ctx->num_transports; i++) {
@@ -289,17 +345,18 @@ static void daemon_run(daemon_ctx_t *ctx) {
       }
     }
 
-    struct pollfd fds[64];
+    struct pollfd fds[MAX_DAEMON_POLL_FDS];
     size_t num_fds = 0;
 
     if (ctx->data_pipe) {
-      num_fds +=
-          data_uds_get_poll_fds(ctx->data_pipe, fds + num_fds, 64 - num_fds);
+      num_fds += data_uds_get_poll_fds(ctx->data_pipe, fds + num_fds,
+                                       MAX_DAEMON_POLL_FDS - num_fds);
     }
     for (size_t i = 0; i < ctx->num_transports; i++) {
       if (ctx->transports[i].transport) {
-        num_fds += transport_get_poll_fds(ctx->transports[i].transport,
-                                          fds + num_fds, 64 - num_fds);
+        num_fds +=
+            transport_get_poll_fds(ctx->transports[i].transport, fds + num_fds,
+                                   MAX_DAEMON_POLL_FDS - num_fds);
       }
     }
 
@@ -319,6 +376,9 @@ int main(int argc, char **argv) {
 #ifndef _WIN32
   signal(SIGINT, handle_signal);
   signal(SIGTERM, handle_signal);
+#ifdef SIGHUP
+  signal(SIGHUP, handle_signal);
+#endif
 #endif
 
   printf("starting qlinqd peer mesh daemon...\n");
@@ -336,8 +396,8 @@ int main(int argc, char **argv) {
   const char *peers[MAX_TRANSPORTS];
   size_t num_peers = 0;
 
-  const char *cert_file = "t/assets/server.crt";
-  const char *key_file = "t/assets/server.key";
+  const char *cert_file = NULL;
+  const char *key_file = NULL;
   const char *ca_file = NULL;
   bool verify_peer = true;
   bool allow_insecure_peer = false;
@@ -356,11 +416,23 @@ int main(int argc, char **argv) {
   uint64_t max_connections = 0;
   uint64_t max_repair_requests = 0;
   uint64_t max_aggregate_repairs = 0;
+  uint64_t parsed_stats_ms = 0;
+  uint64_t parsed_port = 0;
   const char *socket_name = "qlinq-data";
+  bool invalid_args = false;
 
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
-      listen_port = atoi(argv[++i]);
+    if (strcmp(argv[i], "--help") == 0) {
+      show_help(stdout, argv[0]);
+      portable_socket_cleanup();
+      return 0;
+    } else if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
+      if (!cli_parse_u64(argv[++i], UINT16_MAX, &parsed_port) ||
+          parsed_port == 0) {
+        invalid_args = true;
+        break;
+      }
+      listen_port = (int)parsed_port;
     } else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
       listen_host = argv[++i];
     } else if (strcmp(argv[i], "--cert") == 0 && i + 1 < argc) {
@@ -379,16 +451,24 @@ int main(int argc, char **argv) {
       ctx.auth_token = argv[++i];
     } else if (strcmp(argv[i], "--verbose") == 0) {
       ctx.verbose = true;
+    } else if (strcmp(argv[i], "--stats-ms") == 0 && i + 1 < argc) {
+      if (!cli_parse_u64(argv[++i], UINT32_MAX, &parsed_stats_ms) ||
+          parsed_stats_ms == 0) {
+        fprintf(stderr, "invalid statistics interval\n");
+        portable_socket_cleanup();
+        return 1;
+      }
+      ctx.stats_ms = (uint32_t)parsed_stats_ms;
     } else if (strcmp(argv[i], "--max-connections") == 0 && i + 1 < argc) {
-      if (!parse_u64_option(argv[++i], TRANSPORT_HARD_MAX_CONNECTIONS,
-                            &max_connections) ||
+      if (!cli_parse_u64(argv[++i], TRANSPORT_HARD_MAX_CONNECTIONS,
+                         &max_connections) ||
           max_connections == 0) {
         fprintf(stderr, "invalid maximum connection count\n");
         portable_socket_cleanup();
         return 1;
       }
     } else if (strcmp(argv[i], "--max-repair-requests") == 0 && i + 1 < argc) {
-      if (!parse_u64_option(argv[++i], UINT16_MAX, &max_repair_requests) ||
+      if (!cli_parse_u64(argv[++i], UINT16_MAX, &max_repair_requests) ||
           max_repair_requests == 0) {
         fprintf(stderr, "invalid per-peer repair request limit\n");
         portable_socket_cleanup();
@@ -396,7 +476,7 @@ int main(int argc, char **argv) {
       }
     } else if (strcmp(argv[i], "--max-aggregate-repairs") == 0 &&
                i + 1 < argc) {
-      if (!parse_u64_option(argv[++i], UINT16_MAX, &max_aggregate_repairs) ||
+      if (!cli_parse_u64(argv[++i], UINT16_MAX, &max_aggregate_repairs) ||
           max_aggregate_repairs == 0) {
         fprintf(stderr, "invalid aggregate repair request limit\n");
         portable_socket_cleanup();
@@ -407,14 +487,17 @@ int main(int argc, char **argv) {
                i + 1 < argc) {
       socket_name = argv[++i];
     } else if (strcmp(argv[i], "--peer") == 0 && i + 1 < argc) {
-      if (num_peers < MAX_TRANSPORTS - 1) {
-        peers[num_peers++] = argv[++i];
+      if (num_peers >= MAX_TRANSPORTS - 1) {
+        invalid_args = true;
+        break;
       }
+      peers[num_peers++] = argv[++i];
     } else if (strcmp(argv[i], "--track") == 0 && i + 1 < argc) {
-      if (ctx.num_subscribe_tracks < 15) {
-        strncpy(ctx.subscribe_tracks[ctx.num_subscribe_tracks++], argv[++i],
-                63);
+      if (ctx.num_subscribe_tracks >= 15 || strlen(argv[i + 1]) >= 64) {
+        invalid_args = true;
+        break;
       }
+      strcpy(ctx.subscribe_tracks[ctx.num_subscribe_tracks++], argv[++i]);
     } else if (strcmp(argv[i], "--reliable") == 0) {
       ctx.use_reliable = true;
     } else if (strcmp(argv[i], "--rateless") == 0) {
@@ -439,7 +522,12 @@ int main(int argc, char **argv) {
       flexicast_group = argv[++i];
       enable_flexicast = true;
     } else if (strcmp(argv[i], "--flexicast-port") == 0 && i + 1 < argc) {
-      flexicast_port = atoi(argv[++i]);
+      if (!cli_parse_u64(argv[++i], UINT16_MAX, &parsed_port) ||
+          parsed_port == 0) {
+        invalid_args = true;
+        break;
+      }
+      flexicast_port = (int)parsed_port;
     } else if (strcmp(argv[i], "--flexicast-interface") == 0 && i + 1 < argc) {
       flexicast_interface = argv[++i];
     } else if (strcmp(argv[i], "--flexicast-cc") == 0 && i + 1 < argc) {
@@ -457,8 +545,7 @@ int main(int argc, char **argv) {
       enable_flexicast = true;
     } else if (strcmp(argv[i], "--flexicast-cc-startup-rate") == 0 &&
                i + 1 < argc) {
-      if (!parse_u64_option(argv[++i], UINT64_MAX,
-                            &flexicast_cc_startup_rate)) {
+      if (!cli_parse_u64(argv[++i], UINT64_MAX, &flexicast_cc_startup_rate)) {
         fprintf(stderr, "invalid Flexicast startup rate\n");
         portable_socket_cleanup();
         return 1;
@@ -466,8 +553,7 @@ int main(int argc, char **argv) {
       enable_flexicast = true;
     } else if (strcmp(argv[i], "--flexicast-cc-min-rate") == 0 &&
                i + 1 < argc) {
-      if (!parse_u64_option(argv[++i], UINT64_MAX,
-                            &flexicast_cc_minimum_rate)) {
+      if (!cli_parse_u64(argv[++i], UINT64_MAX, &flexicast_cc_minimum_rate)) {
         fprintf(stderr, "invalid Flexicast minimum rate\n");
         portable_socket_cleanup();
         return 1;
@@ -475,8 +561,7 @@ int main(int argc, char **argv) {
       enable_flexicast = true;
     } else if (strcmp(argv[i], "--flexicast-cc-max-rate") == 0 &&
                i + 1 < argc) {
-      if (!parse_u64_option(argv[++i], UINT64_MAX,
-                            &flexicast_cc_maximum_rate)) {
+      if (!cli_parse_u64(argv[++i], UINT64_MAX, &flexicast_cc_maximum_rate)) {
         fprintf(stderr, "invalid Flexicast maximum rate\n");
         portable_socket_cleanup();
         return 1;
@@ -484,8 +569,8 @@ int main(int argc, char **argv) {
       enable_flexicast = true;
     } else if (strcmp(argv[i], "--flexicast-cc-aggregate-rate") == 0 &&
                i + 1 < argc) {
-      if (!parse_u64_option(argv[++i], UINT64_MAX,
-                            &flexicast_cc_aggregate_rate_limit)) {
+      if (!cli_parse_u64(argv[++i], UINT64_MAX,
+                         &flexicast_cc_aggregate_rate_limit)) {
         fprintf(stderr, "invalid Flexicast aggregate rate\n");
         portable_socket_cleanup();
         return 1;
@@ -493,14 +578,24 @@ int main(int argc, char **argv) {
       enable_flexicast = true;
     } else if (strcmp(argv[i], "--flexicast-cc-feedback-timeout") == 0 &&
                i + 1 < argc) {
-      if (!parse_u64_option(argv[++i], UINT32_MAX,
-                            &flexicast_cc_feedback_timeout_ms)) {
+      if (!cli_parse_u64(argv[++i], UINT32_MAX,
+                         &flexicast_cc_feedback_timeout_ms)) {
         fprintf(stderr, "invalid Flexicast feedback timeout\n");
         portable_socket_cleanup();
         return 1;
       }
       enable_flexicast = true;
+    } else {
+      invalid_args = true;
+      break;
     }
+  }
+
+  if (invalid_args || (ctx.use_reliable && ctx.use_rateless)) {
+    fprintf(stderr, "invalid command line\n");
+    show_help(stderr, argv[0]);
+    portable_socket_cleanup();
+    return 1;
   }
 
   if ((flexicast_group && (flexicast_port <= 0 || flexicast_port > UINT16_MAX ||
@@ -521,7 +616,16 @@ int main(int argc, char **argv) {
     portable_socket_cleanup();
     return 1;
   }
+  if ((cert_file == NULL) != (key_file == NULL) ||
+      ((listen_port > 0 || verify_peer) && cert_file == NULL)) {
+    fprintf(stderr, "a TLS identity is required; use both --cert and --key "
+                    "(insecure clients may omit both)\n");
+    portable_socket_cleanup();
+    return 1;
+  }
   ctx.auth_token_len = strlen(ctx.auth_token);
+  ctx.cert_file = cert_file;
+  ctx.key_file = key_file;
   if (ctx.auth_token_len > UINT16_MAX) {
     fprintf(stderr, "authentication token is too long\n");
     portable_socket_cleanup();
@@ -534,34 +638,39 @@ int main(int argc, char **argv) {
     strcpy(ctx.subscribe_tracks[ctx.num_subscribe_tracks++], "");
   }
 
+  const transport_config_t common_config = {
+      .cert_file = cert_file,
+      .key_file = key_file,
+      .ca_file = ca_file,
+      .verify_peer = verify_peer,
+      .allow_insecure_peer = allow_insecure_peer,
+      .enable_flexicast = enable_flexicast,
+      .flexicast_interface = flexicast_interface,
+      .flexicast_cc_mode = flexicast_cc_mode,
+      .flexicast_cc_startup_rate = flexicast_cc_startup_rate,
+      .flexicast_cc_minimum_rate = flexicast_cc_minimum_rate,
+      .flexicast_cc_maximum_rate = flexicast_cc_maximum_rate,
+      .flexicast_cc_aggregate_rate_limit = flexicast_cc_aggregate_rate_limit,
+      .flexicast_cc_feedback_timeout_ms =
+          (uint32_t)flexicast_cc_feedback_timeout_ms,
+      .repair_mode = repair_mode,
+      .limits =
+          {
+              .max_connections = (size_t)max_connections,
+              .max_repair_requests_per_second = (size_t)max_repair_requests,
+              .max_aggregate_repair_requests_per_second =
+                  (size_t)max_aggregate_repairs,
+          },
+  };
+
   if (listen_port > 0) {
     /* Create server transport */
-    transport_config_t config = {0};
+    transport_config_t config = common_config;
     config.port = listen_port;
     config.bind_hosts[config.num_bind_hosts++] = listen_host;
-    config.cert_file = cert_file;
-    config.key_file = key_file;
-    config.ca_file = ca_file;
-    config.verify_peer = verify_peer;
-    config.allow_insecure_peer = allow_insecure_peer;
-    config.enable_flexicast = enable_flexicast;
     config.flexicast_group = flexicast_group;
     config.flexicast_group_port =
         flexicast_group ? (uint16_t)flexicast_port : 0;
-    config.flexicast_interface = flexicast_interface;
-    config.flexicast_cc_mode = flexicast_cc_mode;
-    config.flexicast_cc_startup_rate = flexicast_cc_startup_rate;
-    config.flexicast_cc_minimum_rate = flexicast_cc_minimum_rate;
-    config.flexicast_cc_maximum_rate = flexicast_cc_maximum_rate;
-    config.flexicast_cc_aggregate_rate_limit =
-        flexicast_cc_aggregate_rate_limit;
-    config.flexicast_cc_feedback_timeout_ms =
-        (uint32_t)flexicast_cc_feedback_timeout_ms;
-    config.repair_mode = repair_mode;
-    config.limits.max_connections = (size_t)max_connections;
-    config.limits.max_repair_requests_per_second = (size_t)max_repair_requests;
-    config.limits.max_aggregate_repair_requests_per_second =
-        (size_t)max_aggregate_repairs;
 
     daemon_transport_ctx_t *tctx = &ctx.transports[ctx.num_transports];
     tctx->daemon = &ctx;
@@ -580,11 +689,11 @@ int main(int argc, char **argv) {
 
   for (size_t i = 0; i < num_peers; i++) {
     /* Create client transport for each peer */
-    transport_config_t config = {0};
+    transport_config_t config = common_config;
     /* parse ip:port */
     char peer_ip[256];
-    int port = 8888;
-    if (!parse_peer_endpoint(peers[i], peer_ip, sizeof(peer_ip), &port)) {
+    uint16_t port = 8888;
+    if (!cli_parse_endpoint(peers[i], peer_ip, sizeof(peer_ip), &port, NULL)) {
       fprintf(stderr, "invalid peer endpoint: %s\n", peers[i]);
       continue;
     }
@@ -593,26 +702,7 @@ int main(int argc, char **argv) {
     config.remote_hosts[config.num_remote_hosts++] = peer_ip;
     config.bind_hosts[config.num_bind_hosts++] =
         strchr(peer_ip, ':') ? "::" : "0.0.0.0";
-    config.cert_file = cert_file;
-    config.key_file = key_file;
-    config.ca_file = ca_file;
-    config.verify_peer = verify_peer;
-    config.allow_insecure_peer = allow_insecure_peer;
-    config.enable_flexicast = enable_flexicast;
-    config.flexicast_interface = flexicast_interface;
-    config.flexicast_cc_mode = flexicast_cc_mode;
-    config.flexicast_cc_startup_rate = flexicast_cc_startup_rate;
-    config.flexicast_cc_minimum_rate = flexicast_cc_minimum_rate;
-    config.flexicast_cc_maximum_rate = flexicast_cc_maximum_rate;
-    config.flexicast_cc_aggregate_rate_limit =
-        flexicast_cc_aggregate_rate_limit;
-    config.flexicast_cc_feedback_timeout_ms =
-        (uint32_t)flexicast_cc_feedback_timeout_ms;
-    config.repair_mode = repair_mode;
-    config.limits.max_connections = (size_t)max_connections;
-    config.limits.max_repair_requests_per_second = (size_t)max_repair_requests;
-    config.limits.max_aggregate_repair_requests_per_second =
-        (size_t)max_aggregate_repairs;
+    config.reconnect_enabled = true;
 
     daemon_transport_ctx_t *tctx = &ctx.transports[ctx.num_transports];
     tctx->daemon = &ctx;
@@ -626,7 +716,7 @@ int main(int argc, char **argv) {
       continue;
     }
     ctx.num_transports++;
-    printf("connecting to peer %s:%d\n", peer_ip, port);
+    printf("connecting to peer %s:%u\n", peer_ip, port);
   }
 
   if (ctx.num_transports == 0) {
@@ -642,6 +732,21 @@ int main(int argc, char **argv) {
   }
 
   daemon_run(&ctx);
+
+  for (size_t i = 0; i < ctx.num_transports; i++)
+    transport_shutdown(ctx.transports[i].transport, "daemon shutdown");
+  int64_t shutdown_started = transport_get_time_ms();
+  bool drained = false;
+  while (!drained && transport_get_time_ms() - shutdown_started < 1000) {
+    drained = true;
+    for (size_t i = 0; i < ctx.num_transports; i++) {
+      transport_tick(ctx.transports[i].transport);
+      if (!transport_is_drained(ctx.transports[i].transport))
+        drained = false;
+    }
+    if (!drained)
+      usleep(1000);
+  }
 
   data_uds_destroy(ctx.data_pipe);
   for (size_t i = 0; i < ctx.num_transports; i++) {

@@ -64,6 +64,14 @@ typedef struct transport_flexicast_queued_payload_t {
   transport_repair_mode_t repair_mode;
 } transport_flexicast_queued_payload_t;
 
+typedef struct transport_flexicast_queue_t {
+  transport_flexicast_queued_payload_t *entries;
+  size_t capacity;
+  size_t head;
+  size_t count;
+  size_t bytes;
+} transport_flexicast_queue_t;
+
 typedef struct transport_flexicast_pending_repair_t {
   bool active;
   uint64_t intent_id;
@@ -87,7 +95,7 @@ typedef struct transport_flexicast_pending_repair_t {
 } transport_flexicast_pending_repair_t;
 
 typedef struct transport_flexicast_repair_requester_t {
-  uint64_t intent_id;
+  uint64_t request_id;
   uint64_t member_id;
   uint16_t deficit;
   uint64_t delivery_rate_bytes_per_second;
@@ -102,6 +110,12 @@ typedef struct transport_flexicast_repair_requester_t {
    * later requests can confirm progress by reporting a smaller deficit. */
   bool shared_repair_useful;
 } transport_flexicast_repair_requester_t;
+
+typedef struct transport_flexicast_requester_store_t {
+  transport_flexicast_repair_requester_t *entries;
+  size_t count;
+  size_t capacity;
+} transport_flexicast_requester_store_t;
 
 typedef enum {
   TRANSPORT_FLEXICAST_OBS_ACCEPTED = 0,
@@ -123,17 +137,6 @@ typedef struct transport_flexicast_shadow_observation_t {
   size_t throttled_requests;
   size_t overflow_requests;
 } transport_flexicast_shadow_observation_t;
-
-typedef struct transport_flexicast_shadow_requester_t {
-  uint64_t observation_id;
-  uint64_t member_id;
-  uint16_t deficit;
-  uint64_t delivery_rate_bytes_per_second;
-  int64_t first_request_ms;
-  int64_t last_request_ms;
-  int64_t last_feedback_ms;
-  uint64_t requested_symbols[QLINQ_WIRE_MAX_NACK_SYMBOLS / 64U];
-} transport_flexicast_shadow_requester_t;
 
 typedef struct transport_flexicast_recent_repair_t {
   bool active;
@@ -166,30 +169,18 @@ typedef struct transport_flexicast_flow_t {
   uint16_t udp_port;
   uint32_t ack_delay_msec;
   uint32_t interface_index;
-  transport_flexicast_queued_payload_t
-      queued[TRANSPORT_FLEXICAST_QUEUE_CAPACITY];
-  size_t queue_head;
-  size_t queue_count;
-  size_t queue_bytes;
-  transport_flexicast_queued_payload_t
-      repair_queued[TRANSPORT_FLEXICAST_REPAIR_QUEUE_CAPACITY];
-  size_t repair_queue_head;
-  size_t repair_queue_count;
-  size_t repair_queue_bytes;
+  transport_flexicast_queue_t data_queue;
+  transport_flexicast_queue_t repair_queue;
   transport_flexicast_pending_repair_t
       pending_repairs[TRANSPORT_FLEXICAST_PENDING_REPAIRS];
   size_t pending_repair_count;
-  transport_flexicast_repair_requester_t *repair_requesters;
-  size_t repair_requester_count;
-  size_t repair_requester_capacity;
+  transport_flexicast_requester_store_t repair_requesters;
   uint64_t next_repair_intent_id;
   transport_flexicast_shadow_observation_t
       shadow_observations[TRANSPORT_FLEXICAST_SHADOW_OBSERVATIONS];
   size_t shadow_observation_count;
   uint64_t next_shadow_observation_id;
-  transport_flexicast_shadow_requester_t *shadow_requesters;
-  size_t shadow_requester_count;
-  size_t shadow_requester_capacity;
+  transport_flexicast_requester_store_t shadow_requesters;
   transport_flexicast_recent_repair_t
       recent_repairs[TRANSPORT_FLEXICAST_RECENT_REPAIRS];
   size_t next_recent_repair;

@@ -19,6 +19,7 @@ typedef struct {
   bool data_a_received;
   bool data_b_received;
   bool checkpoint_subscribed;
+  bool checkpoint_unsubscribed;
   size_t checkpoint_objects_received;
   uint64_t catalog_group_id;
   uint64_t catalog_object_id;

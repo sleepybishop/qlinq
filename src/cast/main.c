@@ -4,6 +4,7 @@
 #define _DEFAULT_SOURCE
 #endif
 
+#include "cli_parse.h"
 #include "qlinq.h"
 
 #include <errno.h>
@@ -160,60 +161,6 @@ static void show_help(FILE *output, const char *program) {
       program, program);
 }
 
-static bool parse_u64(const char *text, uint64_t maximum, uint64_t *value) {
-  char *end = NULL;
-  unsigned long long parsed;
-  if (!text || !text[0] || text[0] == '-' || !value)
-    return false;
-  errno = 0;
-  parsed = strtoull(text, &end, 10);
-  if (errno != 0 || !end || *end != '\0' || parsed > maximum)
-    return false;
-  *value = (uint64_t)parsed;
-  return true;
-}
-
-static bool parse_peer_address(const char *argument, char *host,
-                               size_t host_capacity, bool *has_port,
-                               uint16_t *port) {
-  const char *start = argument;
-  const char *port_text = NULL;
-  size_t host_size;
-  uint64_t parsed_port;
-  if (!argument || !argument[0] || !host || host_capacity == 0 || !has_port ||
-      !port)
-    return false;
-  *has_port = false;
-  host_size = strlen(argument);
-  if (argument[0] == '[') {
-    const char *closing = strchr(argument + 1, ']');
-    if (!closing || (closing[1] != '\0' && closing[1] != ':'))
-      return false;
-    start = argument + 1;
-    host_size = (size_t)(closing - start);
-    if (closing[1] == ':')
-      port_text = closing + 2;
-  } else {
-    const char *first_colon = strchr(argument, ':');
-    const char *last_colon = strrchr(argument, ':');
-    if (first_colon && first_colon == last_colon) {
-      host_size = (size_t)(first_colon - argument);
-      port_text = first_colon + 1;
-    }
-  }
-  if (host_size == 0 || host_size >= host_capacity)
-    return false;
-  if (port_text) {
-    if (!parse_u64(port_text, UINT16_MAX, &parsed_port) || parsed_port == 0)
-      return false;
-    *has_port = true;
-    *port = (uint16_t)parsed_port;
-  }
-  memcpy(host, start, host_size);
-  host[host_size] = '\0';
-  return true;
-}
-
 static bool read_secret(cast_options_t *options) {
   if (options->secret_text) {
     options->secret_size = strlen(options->secret_text);
@@ -297,7 +244,7 @@ static bool parse_options(int argc, char **argv, cast_options_t *options) {
       options->peer_arguments[options->peer_count++] = value;
     } else if (strcmp(argv[i], "--port") == 0) {
       if (!require_value(argc, argv, &i, &value) ||
-          !parse_u64(value, UINT16_MAX, &parsed) || parsed == 0)
+          !cli_parse_u64(value, UINT16_MAX, &parsed) || parsed == 0)
         return false;
       options->port = (uint16_t)parsed;
       options->port_explicit = true;
@@ -341,36 +288,36 @@ static bool parse_options(int argc, char **argv, cast_options_t *options) {
         return false;
     } else if (strcmp(argv[i], "--idle-timeout-ms") == 0) {
       if (!require_value(argc, argv, &i, &value) ||
-          !parse_u64(value, UINT64_MAX, &options->idle_timeout_ms))
+          !cli_parse_u64(value, UINT64_MAX, &options->idle_timeout_ms))
         return false;
     } else if (strcmp(argv[i], "--block-size") == 0) {
       if (!require_value(argc, argv, &i, &value) ||
-          !parse_u64(value, CAST_MAX_BLOCK_SIZE, &parsed) || parsed == 0)
+          !cli_parse_u64(value, CAST_MAX_BLOCK_SIZE, &parsed) || parsed == 0)
         return false;
       options->block_size = (size_t)parsed;
     } else if (strcmp(argv[i], "--wait-receivers") == 0) {
       if (!require_value(argc, argv, &i, &value) ||
-          !parse_u64(value, 16384U, &parsed) || parsed == 0)
+          !cli_parse_u64(value, 16384U, &parsed) || parsed == 0)
         return false;
       options->wait_receivers = (size_t)parsed;
     } else if (strcmp(argv[i], "--max-connections") == 0) {
       if (!require_value(argc, argv, &i, &value) ||
-          !parse_u64(value, 16384U, &parsed) || parsed == 0)
+          !cli_parse_u64(value, 16384U, &parsed) || parsed == 0)
         return false;
       options->max_connections = (size_t)parsed;
     } else if (strcmp(argv[i], "--max-repair-requests") == 0) {
       if (!require_value(argc, argv, &i, &value) ||
-          !parse_u64(value, UINT16_MAX, &parsed) || parsed == 0)
+          !cli_parse_u64(value, UINT16_MAX, &parsed) || parsed == 0)
         return false;
       options->max_repair_requests = (size_t)parsed;
     } else if (strcmp(argv[i], "--max-aggregate-repairs") == 0) {
       if (!require_value(argc, argv, &i, &value) ||
-          !parse_u64(value, UINT16_MAX, &parsed) || parsed == 0)
+          !cli_parse_u64(value, UINT16_MAX, &parsed) || parsed == 0)
         return false;
       options->max_aggregate_repairs = (size_t)parsed;
     } else if (strcmp(argv[i], "--stats-ms") == 0) {
       if (!require_value(argc, argv, &i, &value) ||
-          !parse_u64(value, UINT32_MAX, &parsed))
+          !cli_parse_u64(value, UINT32_MAX, &parsed))
         return false;
       options->stats_ms = (uint32_t)parsed;
     } else if (strcmp(argv[i], "--verbose") == 0) {
@@ -385,7 +332,7 @@ static bool parse_options(int argc, char **argv, cast_options_t *options) {
       options->flexicast = true;
     } else if (strcmp(argv[i], "--flexicast-port") == 0) {
       if (!require_value(argc, argv, &i, &value) ||
-          !parse_u64(value, UINT16_MAX, &parsed) || parsed == 0)
+          !cli_parse_u64(value, UINT16_MAX, &parsed) || parsed == 0)
         return false;
       options->flexicast_port = (uint16_t)parsed;
       options->flexicast = true;
@@ -405,27 +352,27 @@ static bool parse_options(int argc, char **argv, cast_options_t *options) {
       options->flexicast = true;
     } else if (strcmp(argv[i], "--flexicast-startup-rate") == 0) {
       if (!require_value(argc, argv, &i, &value) ||
-          !parse_u64(value, UINT64_MAX, &options->flexicast_startup_rate))
+          !cli_parse_u64(value, UINT64_MAX, &options->flexicast_startup_rate))
         return false;
       options->flexicast = true;
     } else if (strcmp(argv[i], "--flexicast-min-rate") == 0) {
       if (!require_value(argc, argv, &i, &value) ||
-          !parse_u64(value, UINT64_MAX, &options->flexicast_minimum_rate))
+          !cli_parse_u64(value, UINT64_MAX, &options->flexicast_minimum_rate))
         return false;
       options->flexicast = true;
     } else if (strcmp(argv[i], "--flexicast-max-rate") == 0) {
       if (!require_value(argc, argv, &i, &value) ||
-          !parse_u64(value, UINT64_MAX, &options->flexicast_maximum_rate))
+          !cli_parse_u64(value, UINT64_MAX, &options->flexicast_maximum_rate))
         return false;
       options->flexicast = true;
     } else if (strcmp(argv[i], "--flexicast-aggregate-rate") == 0) {
       if (!require_value(argc, argv, &i, &value) ||
-          !parse_u64(value, UINT64_MAX, &options->flexicast_aggregate_rate))
+          !cli_parse_u64(value, UINT64_MAX, &options->flexicast_aggregate_rate))
         return false;
       options->flexicast = true;
     } else if (strcmp(argv[i], "--flexicast-feedback-timeout") == 0) {
       if (!require_value(argc, argv, &i, &value) ||
-          !parse_u64(value, UINT32_MAX, &parsed))
+          !cli_parse_u64(value, UINT32_MAX, &parsed))
         return false;
       options->flexicast_feedback_timeout_ms = (uint32_t)parsed;
       options->flexicast = true;
@@ -461,9 +408,9 @@ static bool parse_options(int argc, char **argv, cast_options_t *options) {
   for (size_t i = 0; i < options->peer_count; i++) {
     bool has_port = false;
     uint16_t parsed_port = 0;
-    if (!parse_peer_address(
+    if (!cli_parse_endpoint(
             options->peer_arguments[i], options->peer_addresses[i],
-            sizeof(options->peer_addresses[i]), &has_port, &parsed_port))
+            sizeof(options->peer_addresses[i]), &parsed_port, &has_port))
       return false;
     if (has_port) {
       if (options->port_explicit && parsed_port != options->port)
