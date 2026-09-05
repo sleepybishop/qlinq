@@ -1,13 +1,13 @@
 # Transport architecture
 
-The low-level public transport API remains in `transport.h`. The application
-wrapper in `qlinq.h` adds owned events and named streams; see
-[Native application API](application-api.md). The Quicly implementation is
-split into small internal modules with one-way dependencies toward shared data
-types and the wire codec.
+The native application API is in `qlinq.h`. It provides contexts, authenticated
+endpoints, named publishing and subscribed streams, and an owned event queue.
+It is implemented as a façade over the lower-level `transport.h` API. The
+Quicly implementation is split into small internal modules with one-way
+dependencies toward shared data types and the wire codec.
 
-Applications that link qlinq should use this API directly. `qlinq-app` is the
-reference direct consumer: it drives `transport_tick`, integrates
+Specialized integrations may use `transport.h` directly. `qlinq-app` is the
+reference low-level consumer: it drives `transport_tick`, integrates
 `transport_get_poll_fds` and `transport_get_first_timeout`, publishes with
 `transport_publish_ex`, and consumes callbacks without a Unix-socket hop. The
 `data_uds` interface remains a daemon adapter for out-of-process packet devices
@@ -15,7 +15,7 @@ such as `qlinq-tund`, not the primary application API.
 
 | Module | Responsibility |
 | --- | --- |
-| `qlinq.c` | Application contexts, endpoints, named streams and owned event queues |
+| `qlinq.c` | Native context, endpoint, named-stream, and owned-event facade |
 | `transport_quicly.c` | Connection lifecycle, socket event loop, and public control/query API |
 | `transport_internal.h` | Private shared transport and connection state |
 | `cli_parse.c` | Shared bounded numeric and endpoint parsing for app and daemon |
@@ -178,15 +178,18 @@ objects use smaller FEC symbols instead of padding every symbol to the maximum
 UDP payload. Received objects preserve the subscribed track flags; applications
 recognize grouped FEC data when either FEC flag is present.
 
-Finite rateless publishers call `transport_finish_track` after their final
-application record. Publication owns per-track internal FEC object numbering;
-the finish call flushes a partial group and queues a reliable completion
-watermark on every eligible control stream. A negotiated rolling checkpoint is
-also queued every 32 FEC objects. Receive-side protocol state retains up to
-eight missing-window bitmaps and retries one absent object at a time rather than
-injecting an entire repair window into a constrained radio queue. Reliable
-completion ACKs let an all-capable receiver cohort release cached source
-objects; eight unacknowledged windows instead produce publication backpressure.
+Finite fixed-FEC and rateless publishers call `transport_finish_track` after
+their final application record. Publication owns per-track internal FEC object
+numbering; the finish call freezes the current receiver cohort, flushes a
+partial group, and queues a reliable completion watermark on every eligible
+control stream. A negotiated rolling checkpoint is also queued every 32 FEC
+objects. Receive-side protocol state retains up to eight missing-window bitmaps
+and retries one absent object at a time rather than injecting an entire repair
+window into a constrained radio queue. Reliable completion ACKs let an
+all-capable receiver cohort release cached source objects and produce drained
+statistics; eight unacknowledged windows instead produce publication
+backpressure. `transport_abort_track` drops retained recovery state and sends a
+terminal abort to the current subscribers.
 This recovery lifecycle belongs in qlinq because it describes
 application-track/FEC object lifetime, while Quicly continues to own delivery
 and protection of the reliable control bytes.

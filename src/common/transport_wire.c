@@ -53,8 +53,7 @@ static qlinq_wire_result_t check_envelope(const uint8_t *src, size_t len,
 }
 
 bool qlinq_wire_frame_type_is_known(uint8_t type) {
-  return type >= QLINQ_WIRE_SUBSCRIBE &&
-         type <= QLINQ_WIRE_TRACK_CHECKPOINT_ACK;
+  return type >= QLINQ_WIRE_SUBSCRIBE && type <= QLINQ_WIRE_TRACK_ABORT;
 }
 
 qlinq_wire_result_t
@@ -525,5 +524,29 @@ qlinq_wire_decode_track_checkpoint_ack(const uint8_t *src, size_t len,
   ack->alias = src[0];
   ack->group_id = read_u64(src + 1);
   ack->final_object_id = read_u64(src + 9);
+  return QLINQ_WIRE_OK;
+}
+
+qlinq_wire_result_t
+qlinq_wire_encode_track_abort(uint8_t *dst, size_t capacity,
+                              const qlinq_wire_track_abort_t *abort_frame) {
+  if (!dst || !abort_frame)
+    return QLINQ_WIRE_INVALID;
+  if (capacity < QLINQ_WIRE_TRACK_ABORT_SIZE)
+    return QLINQ_WIRE_TOO_LARGE;
+  dst[0] = abort_frame->alias;
+  dst[1] = 0;
+  dst[2] = 0;
+  dst[3] = 0;
+  return QLINQ_WIRE_OK;
+}
+
+qlinq_wire_result_t
+qlinq_wire_decode_track_abort(const uint8_t *src, size_t len,
+                              qlinq_wire_track_abort_t *abort_frame) {
+  if (!src || !abort_frame || len != QLINQ_WIRE_TRACK_ABORT_SIZE ||
+      src[1] != 0 || src[2] != 0 || src[3] != 0)
+    return QLINQ_WIRE_INVALID;
+  abort_frame->alias = src[0];
   return QLINQ_WIRE_OK;
 }

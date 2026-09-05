@@ -403,6 +403,18 @@ static void on_transport_event(void *user_data,
     if (app->verbose)
       fprintf(stderr, "qlinq-app: object recovery failed\n");
     break;
+  case TRANSPORT_EVENT_TRACK_FINISHED:
+    if (app->verbose)
+      fprintf(stderr, "qlinq-app: track recovery finished\n");
+    break;
+  case TRANSPORT_EVENT_TRACK_DRAINED:
+    if (app->verbose)
+      fprintf(stderr, "qlinq-app: track delivery drained\n");
+    break;
+  case TRANSPORT_EVENT_TRACK_ABORTED:
+    if (app->verbose)
+      fprintf(stderr, "qlinq-app: track aborted by peer\n");
+    break;
   case TRANSPORT_EVENT_KEYFRAME_REQUEST:
     break;
   }

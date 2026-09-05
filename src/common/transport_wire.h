@@ -15,6 +15,7 @@
 #define QLINQ_WIRE_TRACK_END_SIZE 17U
 #define QLINQ_WIRE_TRACK_CHECKPOINT_SIZE 28U
 #define QLINQ_WIRE_TRACK_CHECKPOINT_ACK_SIZE 17U
+#define QLINQ_WIRE_TRACK_ABORT_SIZE 4U
 #define QLINQ_WIRE_MAX_TRACK_NAME 63U
 #define QLINQ_WIRE_MAX_NACK_SYMBOLS 1024U
 #define QLINQ_WIRE_NACK_WHOLE_OBJECT 0x01U
@@ -42,7 +43,8 @@ typedef enum {
   QLINQ_WIRE_FLEXICAST_BIND = 10,
   QLINQ_WIRE_TRACK_END = 11,
   QLINQ_WIRE_TRACK_CHECKPOINT = 12,
-  QLINQ_WIRE_TRACK_CHECKPOINT_ACK = 13
+  QLINQ_WIRE_TRACK_CHECKPOINT_ACK = 13,
+  QLINQ_WIRE_TRACK_ABORT = 14
 } qlinq_wire_frame_type_t;
 
 #define QLINQ_WIRE_ROLE_CLIENT 0U
@@ -159,6 +161,10 @@ typedef struct {
   uint64_t final_object_id;
 } qlinq_wire_track_checkpoint_ack_t;
 
+typedef struct {
+  uint8_t alias;
+} qlinq_wire_track_abort_t;
+
 bool qlinq_wire_frame_type_is_known(uint8_t type);
 
 qlinq_wire_result_t
@@ -242,4 +248,10 @@ qlinq_wire_result_t qlinq_wire_encode_track_checkpoint_ack(
 qlinq_wire_result_t
 qlinq_wire_decode_track_checkpoint_ack(const uint8_t *src, size_t len,
                                        qlinq_wire_track_checkpoint_ack_t *ack);
+qlinq_wire_result_t
+qlinq_wire_encode_track_abort(uint8_t *dst, size_t capacity,
+                              const qlinq_wire_track_abort_t *abort_frame);
+qlinq_wire_result_t
+qlinq_wire_decode_track_abort(const uint8_t *src, size_t len,
+                              qlinq_wire_track_abort_t *abort_frame);
 #endif

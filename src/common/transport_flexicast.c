@@ -171,8 +171,7 @@ static void retire_flow_id(transport_t *t, uint64_t flow_id, uint32_t epoch) {
   size_t slot = t->flexicast_retired_flow_next;
   t->flexicast_retired_flow_ids[slot] = flow_id;
   t->flexicast_retired_flow_epochs[slot] = epoch;
-  t->flexicast_retired_flow_next =
-      (slot + 1U) % TRANSPORT_FLEXICAST_MAX_FLOWS;
+  t->flexicast_retired_flow_next = (slot + 1U) % TRANSPORT_FLEXICAST_MAX_FLOWS;
   if (t->flexicast_retired_flow_count < TRANSPORT_FLEXICAST_MAX_FLOWS)
     t->flexicast_retired_flow_count++;
 }
@@ -920,8 +919,7 @@ feedback_demotion_timeout_ms(const transport_flexicast_flow_t *flow) {
                               : QUICLY_DEFAULT_MAX_ACK_DELAY;
   uint64_t interval =
       feedback_interval > ack_interval ? feedback_interval : ack_interval;
-  uint64_t timeout =
-      interval * TRANSPORT_FLEXICAST_MISSED_FEEDBACK_WINDOWS;
+  uint64_t timeout = interval * TRANSPORT_FLEXICAST_MISSED_FEEDBACK_WINDOWS;
 
   /* Delivery debt is counted in packets, while the controller paces bytes.
    * At a low rate, producing ACK_PACKET_THRESHOLD packets can itself take
@@ -941,8 +939,7 @@ feedback_demotion_timeout_ms(const transport_flexicast_flow_t *flow) {
     uint64_t threshold_bytes =
         (uint64_t)TRANSPORT_FLEXICAST_ACK_PACKET_THRESHOLD *
         flow->cc_config.maximum_datagram_size;
-    uint64_t serialization_ms =
-        (threshold_bytes * 1000U + rate - 1U) / rate;
+    uint64_t serialization_ms = (threshold_bytes * 1000U + rate - 1U) / rate;
     if (serialization_ms > UINT64_MAX - timeout)
       return UINT64_MAX;
     timeout += serialization_ms;
@@ -1039,9 +1036,8 @@ static bool send_pending_offer(transport_flexicast_flow_t *flow,
       return false;
     member->offer_bind_sent = true;
   }
-  if (quicly_flexicast_send_announce(member->conn->quic,
-                                     &member->offer_announce) !=
-      QUICLY_FLEXICAST_OK)
+  if (quicly_flexicast_send_announce(
+          member->conn->quic, &member->offer_announce) != QUICLY_FLEXICAST_OK)
     return false;
   member->offer_pending = false;
   return true;
@@ -2101,13 +2097,11 @@ static bool grow_repair_requesters(transport_flexicast_flow_t *flow) {
   return true;
 }
 
-static void
-observe_repair_requester(transport_t *t, transport_flexicast_flow_t *flow,
-                         transport_flexicast_pending_repair_t *pending,
-                         uint64_t member_id, size_t deficit,
-                         transport_repair_mode_t mode, bool whole_object,
-                         const uint16_t *missing, size_t missing_count,
-                         int64_t now_ms) {
+static void observe_repair_requester(
+    transport_t *t, transport_flexicast_flow_t *flow,
+    transport_flexicast_pending_repair_t *pending, uint64_t member_id,
+    size_t deficit, transport_repair_mode_t mode, bool whole_object,
+    const uint16_t *missing, size_t missing_count, int64_t now_ms) {
   if (deficit == 0)
     return;
   if (deficit > UINT16_MAX)
@@ -2218,9 +2212,9 @@ static void expire_repair_requesters(transport_t *t,
   }
 }
 
-static transport_flexicast_shadow_observation_t *find_shadow_observation(
-    transport_flexicast_flow_t *flow, uint64_t group_id, uint64_t object_id,
-    transport_repair_mode_t mode) {
+static transport_flexicast_shadow_observation_t *
+find_shadow_observation(transport_flexicast_flow_t *flow, uint64_t group_id,
+                        uint64_t object_id, transport_repair_mode_t mode) {
   for (size_t i = 0; i < TRANSPORT_FLEXICAST_SHADOW_OBSERVATIONS; i++) {
     transport_flexicast_shadow_observation_t *observation =
         &flow->shadow_observations[i];
@@ -2231,9 +2225,9 @@ static transport_flexicast_shadow_observation_t *find_shadow_observation(
   return NULL;
 }
 
-static transport_flexicast_shadow_requester_t *find_shadow_requester(
-    transport_flexicast_flow_t *flow, uint64_t observation_id,
-    uint64_t member_id) {
+static transport_flexicast_shadow_requester_t *
+find_shadow_requester(transport_flexicast_flow_t *flow, uint64_t observation_id,
+                      uint64_t member_id) {
   for (size_t i = 0; i < flow->shadow_requester_count; i++) {
     transport_flexicast_shadow_requester_t *requester =
         &flow->shadow_requesters[i];
@@ -2247,8 +2241,7 @@ static transport_flexicast_shadow_requester_t *find_shadow_requester(
 static bool grow_shadow_requesters(transport_flexicast_flow_t *flow) {
   if (flow->shadow_requester_count < flow->shadow_requester_capacity)
     return true;
-  if (flow->shadow_requester_capacity >=
-      TRANSPORT_FLEXICAST_REPAIR_REQUESTERS)
+  if (flow->shadow_requester_capacity >= TRANSPORT_FLEXICAST_REPAIR_REQUESTERS)
     return false;
   size_t capacity = flow->shadow_requester_capacity == 0
                         ? 16U
@@ -2294,8 +2287,7 @@ void transport_flexicast_observe_repair_request(
     const sent_object_cache_t *object, uint64_t requester_id,
     transport_repair_mode_t mode, bool whole_object, const uint16_t *missing,
     size_t missing_count,
-    transport_flexicast_observation_disposition_t disposition,
-    int64_t now_ms) {
+    transport_flexicast_observation_disposition_t disposition, int64_t now_ms) {
   if (!t || !t->repair_shadow_log || !flow || !object || requester_id == 0 ||
       (mode != TRANSPORT_REPAIR_MODE_INDEXED &&
        mode != TRANSPORT_REPAIR_MODE_RATELESS))
@@ -2328,8 +2320,7 @@ void transport_flexicast_observe_repair_request(
         .object_id = object->object_id,
         .mode = mode,
         .first_request_ms = now_ms,
-        .ready_at_ms =
-            now_ms + TRANSPORT_FLEXICAST_SHADOW_OBSERVATION_MS,
+        .ready_at_ms = now_ms + TRANSPORT_FLEXICAST_SHADOW_OBSERVATION_MS,
         .cohort_member_count = transport_flexicast_listening_members(flow)};
     flow->shadow_observation_count++;
   }
@@ -2348,11 +2339,10 @@ void transport_flexicast_observe_repair_request(
     break;
   }
 
-  transport_flexicast_shadow_requester_t *requester = find_shadow_requester(
-      flow, observation->observation_id, requester_id);
+  transport_flexicast_shadow_requester_t *requester =
+      find_shadow_requester(flow, observation->observation_id, requester_id);
   if (!requester) {
-    if (flow->shadow_requester_count >=
-            TRANSPORT_FLEXICAST_REPAIR_REQUESTERS ||
+    if (flow->shadow_requester_count >= TRANSPORT_FLEXICAST_REPAIR_REQUESTERS ||
         !grow_shadow_requesters(flow)) {
       observation->overflow_requests++;
       t->stats.repair_shadow_observation_overflow++;
@@ -2391,8 +2381,8 @@ void transport_flexicast_observe_repair_request(
   } else {
     for (size_t i = 0; missing && i < missing_count; i++)
       if (missing[i] < QLINQ_WIRE_MAX_NACK_SYMBOLS)
-        requester->requested_symbols[missing[i] / 64U] |=
-            UINT64_C(1) << (missing[i] % 64U);
+        requester->requested_symbols[missing[i] / 64U] |= UINT64_C(1)
+                                                          << (missing[i] % 64U);
   }
 }
 
@@ -2534,8 +2524,7 @@ static bool build_shadow_observation_snapshot(
       transport_repair_planner_path_t *entry = &requester->paths[path];
       entry->resource_id = t->local_ifindices[path];
       entry->measurement_known = state->initialized && state->b_ewma > 0;
-      entry->estimate.b =
-          state->b_ewma > 0 ? state->b_ewma : FP_FROM_INT(100);
+      entry->estimate.b = state->b_ewma > 0 ? state->b_ewma : FP_FROM_INT(100);
       entry->estimate.l = state->l_ewma;
       entry->estimate.p = state->p_ewma;
       entry->estimate.q = state->q_ewma;
@@ -2553,10 +2542,7 @@ static bool build_shadow_observation_snapshot(
       .deadline_ms = t->repair_shadow_deadline_ms,
       .shared_rate_bytes_per_second = flow->pacing_rate_bytes_per_second,
       .shared_resource_id = flow->interface_index,
-      .shared_physical_copies =
-          flow->native_multicast
-              ? 1U
-              : cohort_members,
+      .shared_physical_copies = flow->native_multicast ? 1U : cohort_members,
       .cohort_member_count = cohort_members,
       .observation_window_ms = TRANSPORT_FLEXICAST_SHADOW_OBSERVATION_MS,
       .observation_age_ms =
@@ -2592,45 +2578,45 @@ static void emit_ready_shadow_observations(transport_t *t,
       clear_shadow_observation(flow, observation);
       continue;
     }
-  transport_repair_planner_snapshot_t snapshot;
-  transport_repair_planner_requester_t *requesters = NULL;
-  transport_repair_planner_evaluation_t evaluation;
+    transport_repair_planner_snapshot_t snapshot;
+    transport_repair_planner_requester_t *requesters = NULL;
+    transport_repair_planner_evaluation_t evaluation;
     if (!build_shadow_observation_snapshot(t, flow, observation, object, now,
                                            &snapshot, &requesters) ||
-      !transport_repair_planner_evaluate(&snapshot, &evaluation)) {
-    t->stats.repair_shadow_log_errors++;
-    free(requesters);
+        !transport_repair_planner_evaluate(&snapshot, &evaluation)) {
+      t->stats.repair_shadow_log_errors++;
+      free(requesters);
       clear_shadow_observation(flow, observation);
       continue;
-  }
-  t->stats.repair_shadow_plans_evaluated++;
-  switch (evaluation.chosen.action) {
-  case TRANSPORT_REPAIR_PLAN_ALL_SHARED:
-    t->stats.repair_shadow_all_shared++;
-    break;
-  case TRANSPORT_REPAIR_PLAN_ALL_UNICAST:
-    t->stats.repair_shadow_all_unicast++;
-    break;
-  case TRANSPORT_REPAIR_PLAN_MIXED:
-    t->stats.repair_shadow_mixed++;
-    break;
-  }
-  if (evaluation.chosen.uncertain || evaluation.chosen.approximate)
-    t->stats.repair_shadow_uncertain++;
-  if (!evaluation.chosen.feasible)
-    t->stats.repair_shadow_infeasible++;
-  t->stats.repair_shadow_last_airtime_us =
-      evaluation.chosen.aggregate_airtime_us;
-  t->stats.repair_shadow_last_physical_bytes =
-      evaluation.chosen.physical_bytes;
-  t->stats.repair_shadow_last_savings_ppm =
-      evaluation.chosen_savings_vs_shared_ppm;
-  if (t->repair_shadow_log &&
-      (!transport_repair_planner_record_write(t->repair_shadow_log, &snapshot,
-                                              &evaluation) ||
-       fflush(t->repair_shadow_log) != 0))
-    t->stats.repair_shadow_log_errors++;
-  free(requesters);
+    }
+    t->stats.repair_shadow_plans_evaluated++;
+    switch (evaluation.chosen.action) {
+    case TRANSPORT_REPAIR_PLAN_ALL_SHARED:
+      t->stats.repair_shadow_all_shared++;
+      break;
+    case TRANSPORT_REPAIR_PLAN_ALL_UNICAST:
+      t->stats.repair_shadow_all_unicast++;
+      break;
+    case TRANSPORT_REPAIR_PLAN_MIXED:
+      t->stats.repair_shadow_mixed++;
+      break;
+    }
+    if (evaluation.chosen.uncertain || evaluation.chosen.approximate)
+      t->stats.repair_shadow_uncertain++;
+    if (!evaluation.chosen.feasible)
+      t->stats.repair_shadow_infeasible++;
+    t->stats.repair_shadow_last_airtime_us =
+        evaluation.chosen.aggregate_airtime_us;
+    t->stats.repair_shadow_last_physical_bytes =
+        evaluation.chosen.physical_bytes;
+    t->stats.repair_shadow_last_savings_ppm =
+        evaluation.chosen_savings_vs_shared_ppm;
+    if (t->repair_shadow_log &&
+        (!transport_repair_planner_record_write(t->repair_shadow_log, &snapshot,
+                                                &evaluation) ||
+         fflush(t->repair_shadow_log) != 0))
+      t->stats.repair_shadow_log_errors++;
+    free(requesters);
     clear_shadow_observation(flow, observation);
   }
 }
@@ -2671,8 +2657,8 @@ bool transport_flexicast_schedule_repair(
       requested = TRANSPORT_REPAIR_MAX_SYMBOLS;
     size_t covered =
         t->flexicast_repair_route == TRANSPORT_FLEXICAST_REPAIR_SHARED
-            ? rateless_repair_count_covered(
-                  flow, object->group_id, object->object_id, now_ms)
+            ? rateless_repair_count_covered(flow, object->group_id,
+                                            object->object_id, now_ms)
             : 0;
     if (requested <= covered) {
       t->stats.repair_requests_merged++;
@@ -2874,10 +2860,10 @@ static bool requester_needs_repair_symbol(
           (UINT64_C(1) << (symbol_index % 64U))) != 0;
 }
 
-static bool unicast_repair_can_accept(
-    transport_t *t, transport_flexicast_flow_t *flow,
-    const transport_flexicast_pending_repair_t *pending,
-    const uint16_t *indices, size_t count) {
+static bool
+unicast_repair_can_accept(transport_t *t, transport_flexicast_flow_t *flow,
+                          const transport_flexicast_pending_repair_t *pending,
+                          const uint16_t *indices, size_t count) {
   size_t matched = 0;
   for (size_t r = 0; r < flow->repair_requester_count; r++) {
     const transport_flexicast_repair_requester_t *requester =
@@ -2889,27 +2875,25 @@ static bool unicast_repair_can_accept(
       return false;
     size_t needed = 0;
     for (size_t i = 0; i < count; i++) {
-      uint16_t symbol_index = pending->mode == TRANSPORT_REPAIR_MODE_RATELESS
-                                  ? 0
-                                  : indices[i];
-      if (requester_needs_repair_symbol(requester, pending->mode,
-                                        symbol_index, i))
+      uint16_t symbol_index =
+          pending->mode == TRANSPORT_REPAIR_MODE_RATELESS ? 0 : indices[i];
+      if (requester_needs_repair_symbol(requester, pending->mode, symbol_index,
+                                        i))
         needed++;
     }
     if (needed > QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY ||
-        conn->queued_datagrams[0] >
-            QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - needed)
+        conn->queued_datagrams[0] > QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - needed)
       return false;
     matched++;
   }
   return matched != 0;
 }
 
-static bool queue_unicast_repair_symbol(
-    transport_t *t, transport_flexicast_flow_t *flow,
-    const transport_flexicast_pending_repair_t *pending,
-    ptls_iovec_t packet, uint16_t symbol_index, size_t rateless_ordinal,
-    size_t *transmissions) {
+static bool
+queue_unicast_repair_symbol(transport_t *t, transport_flexicast_flow_t *flow,
+                            const transport_flexicast_pending_repair_t *pending,
+                            ptls_iovec_t packet, uint16_t symbol_index,
+                            size_t rateless_ordinal, size_t *transmissions) {
   bool matched = false;
   for (size_t r = 0; r < flow->repair_requester_count; r++) {
     const transport_flexicast_repair_requester_t *requester =
@@ -2987,8 +2971,8 @@ static void materialize_pending_repairs(transport_t *t,
     if (!built && pending->mode == TRANSPORT_REPAIR_MODE_RATELESS &&
         object->next_repair_symbol >= QLINQ_FEC_MAX_TOTAL_SYMBOLS) {
       t->stats.repair_rateless_exhausted++;
-      built = transport_repair_build_systematic_fallback(
-          &t->fec_cache, object, count, &repair);
+      built = transport_repair_build_systematic_fallback(&t->fec_cache, object,
+                                                         count, &repair);
       systematic_fallback = built;
     }
     if (!built) {
@@ -3018,15 +3002,15 @@ static void materialize_pending_repairs(transport_t *t,
         break;
       memcpy(packet + QLINQ_WIRE_FEC_HEADER_SIZE,
              repair.symbols + i * repair.symbol_size, repair.symbol_size);
-      bool sent = forced_unicast
-                      ? queue_unicast_repair_symbol(
-                            t, flow, pending,
-                            ptls_iovec_init(packet, encoded_size),
-                            repair.indices[i], i, &unicast_transmissions)
-                      : queue_repair_payload(
-                            t, flow, ptls_iovec_init(packet, encoded_size),
-                            object->group_id, object->object_id,
-                            repair.indices[i], pending->mode, now);
+      bool sent =
+          forced_unicast
+              ? queue_unicast_repair_symbol(
+                    t, flow, pending, ptls_iovec_init(packet, encoded_size),
+                    repair.indices[i], i, &unicast_transmissions)
+              : queue_repair_payload(t, flow,
+                                     ptls_iovec_init(packet, encoded_size),
+                                     object->group_id, object->object_id,
+                                     repair.indices[i], pending->mode, now);
       if (!sent)
         break;
       if (pending->mode == TRANSPORT_REPAIR_MODE_RATELESS) {
@@ -3039,19 +3023,18 @@ static void materialize_pending_repairs(transport_t *t,
       queued++;
     }
     if (queued != 0 && pending->mode == TRANSPORT_REPAIR_MODE_RATELESS) {
-      bool committed = systematic_fallback
-                           ? transport_repair_commit_systematic_fallback(
-                                 object, &repair, queued)
-                           : transport_repair_commit_rateless(object, &repair,
-                                                              queued);
+      bool committed =
+          systematic_fallback
+              ? transport_repair_commit_systematic_fallback(object, &repair,
+                                                            queued)
+              : transport_repair_commit_rateless(object, &repair, queued);
       /* Repair allocation is transactional: only symbols admitted to an
        * egress queue consume an ESI (or advance the systematic fallback). */
       assert(committed);
     }
     transport_repair_batch_destroy(&repair);
     if (queued != 0) {
-      size_t physical_symbols =
-          forced_unicast ? unicast_transmissions : queued;
+      size_t physical_symbols = forced_unicast ? unicast_transmissions : queued;
       t->stats.repair_symbols_sent += physical_symbols;
       if (forced_unicast) {
         t->stats.repair_unicast_symbols_sent += unicast_transmissions;
@@ -3060,8 +3043,7 @@ static void materialize_pending_repairs(transport_t *t,
                 ? UINT64_MAX
                 : (uint64_t)unicast_transmissions * packet_size;
         t->stats.repair_unicast_payload_bytes_queued = saturating_add_u64(
-            t->stats.repair_unicast_payload_bytes_queued,
-            unicast_bytes);
+            t->stats.repair_unicast_payload_bytes_queued, unicast_bytes);
       } else {
         t->stats.repair_multicast_symbols_sent += queued;
       }

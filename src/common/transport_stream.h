@@ -69,5 +69,7 @@ bool transport_stream_write_track_checkpoint_frame(
 bool transport_stream_write_track_checkpoint_ack_frame(
     quicly_stream_t *stream, uint8_t alias, uint64_t group_id,
     uint64_t final_object_id);
+bool transport_stream_write_track_abort_frame(quicly_stream_t *stream,
+                                              uint8_t alias);
 
 #endif

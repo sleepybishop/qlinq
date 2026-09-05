@@ -2006,6 +2006,8 @@ recovery_sweep_done:
       }
     }
   }
+  transport_protocol_poll_lifecycle(t);
+  transport_publish_poll_lifecycle(t);
   t->tick_active = false;
 }
 
@@ -2021,7 +2023,7 @@ static bool subscribe_connection(transport_conn_t *conn,
     return false;
   uint8_t alias;
   bool newly_added = false;
-  if (transport_subscriptions_find_alias(&conn->receive_subscriptions, track_id,
+  if (transport_subscriptions_find_alias(&conn->subscriptions, track_id,
                                          &alias) != 0) {
     if (transport_subscriptions_count(&conn->receive_subscriptions) >=
         conn->negotiated_limits.max_subscriptions_per_connection)
@@ -2040,8 +2042,6 @@ static bool subscribe_connection(transport_conn_t *conn,
                                      track_id->name, alias))
       return false;
     newly_added = true;
-    memset(transport_object_gap(conn, alias), 0,
-           sizeof((*transport_object_gap(conn, alias))));
   }
 
   if (!transport_stream_write_track_frame(conn->stream, QLINQ_WIRE_SUBSCRIBE,
@@ -2050,8 +2050,10 @@ static bool subscribe_connection(transport_conn_t *conn,
       transport_subscriptions_remove(&conn->receive_subscriptions,
                                      track_id->type, track_id->name);
     return false;
-  }
-
+  if (newly_added)
+    memset(&conn->object_gaps[alias], 0, sizeof(conn->object_gaps[alias]));
+  transport_publish_checkpoint_member_added(conn->transport, conn, track_id,
+                                            alias);
   return true;
 }
 
@@ -2319,8 +2321,7 @@ bool transport_get_stats(transport_t *t, transport_stats_t *stats) {
   size_t active_count =
       t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
   for (size_t i = 0; i < active_count; i++) {
-    const transport_conn_t *conn =
-        t->is_server ? t->conns[i] : t->client_conn;
+    const transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
     if (!conn)
       continue;
     for (size_t slot = 0; slot < conn->send_subscriptions.capacity; slot++) {
@@ -2401,9 +2402,12 @@ bool transport_get_stats(transport_t *t, transport_stats_t *stats) {
       stats->flexicast_cc_loss_reduction_events += output.loss_reduction_events;
       stats->flexicast_cc_rtt_reduction_events += output.rtt_reduction_events;
       stats->flexicast_cc_ecn_reduction_events += output.ecn_reduction_events;
-      stats->flexicast_cc_timeout_reduction_events += output.timeout_reduction_events;
-      stats->flexicast_cc_rate_limit_reduction_events += output.rate_limit_reduction_events;
-      stats->flexicast_cc_other_reduction_events += output.other_reduction_events;
+      stats->flexicast_cc_timeout_reduction_events +=
+          output.timeout_reduction_events;
+      stats->flexicast_cc_rate_limit_reduction_events +=
+          output.rate_limit_reduction_events;
+      stats->flexicast_cc_other_reduction_events +=
+          output.other_reduction_events;
       stats->flexicast_cc_external_load_growth_freeze_events +=
           output.external_load_growth_freeze_events;
     }

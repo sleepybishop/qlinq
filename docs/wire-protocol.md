@@ -41,7 +41,8 @@ a 20-byte metadata header followed by application data.
 | 11 | Track completion | Alias, group ID, and final FEC object ID |
 | 12 | Recovery checkpoint | Alias, group ID, first and final FEC object IDs |
 | 13 | Recovery checkpoint ACK | Alias, group ID, and final FEC object ID |
-| 14–255 | Reserved | Rejected by this version |
+| 14 | Track abort | Alias and three reserved zero bytes |
+| 15–255 | Reserved | Rejected by this version |
 
 `HELLO` is the first frame on the bidirectional control stream in each
 direction. Application control frames and the public connected event are gated
@@ -110,13 +111,13 @@ retired source flow is ignored. Re-subscribing starts the bind/announce/join/key
 exchange again, so it is also the explicit retry after a route or interface
 outage has been repaired.
 
-Rateless data receivers retain a bounded 256-object completed-delivery window.
+FEC-backed data receivers retain a bounded 256-object completed-delivery window.
 Repair or redundant symbols for an object in that window are discarded before
 assembler allocation, so a completed object produces exactly one application
 event. Objects older than the window are treated as expired rather than being
 resurrected by very late repair traffic.
 
-Checkpoint-capable rateless publishers send a reliable 28-byte
+Checkpoint-capable fixed-FEC and rateless publishers send a reliable 28-byte
 `TRACK_CHECKPOINT` after every 32 internal FEC objects. Its payload is the
 one-byte track alias, one-byte flags, two reserved zero bytes, and the 64-bit
 group, first-object, and final-object IDs. The `BASELINE` flag (`0x01`) tells a
@@ -127,16 +128,23 @@ partially assembled objects continue using symbol-level NACKs. Once every
 object in a window has been delivered, it returns a reliable 17-byte
 `TRACK_CHECKPOINT_ACK`.
 
-When a finite publisher finishes, it flushes grouped data and sends the existing
-17-byte `TRACK_END`. For checkpoint-capable peers this is the final checkpoint
+When a finite publisher finishes, it freezes the current receiver cohort,
+flushes grouped data, and sends the 17-byte `TRACK_END`. For
+checkpoint-capable peers this is the final checkpoint
 and is acknowledged through the same ACK frame; older peers retain the final
 32-object recovery behavior without sending an ACK. The source protects cached
 objects from ring eviction while an all-capable subscribed cohort has
 unacknowledged windows. It releases a window only after every member has
-acknowledged it. A late subscriber starts after the latest emitted checkpoint,
-and unsubscribe or connection teardown removes the member from the cohort.
+acknowledged it. A subscriber arriving after final completion receives the
+four-byte `TRACK_ABORT` instead of joining the finished transfer. Unsubscribe
+or connection teardown settles that member as failed for completion reporting.
 Eight unacknowledged windows exhaust the 256-object repair cache and apply
 publication backpressure rather than silently overwriting recoverable data.
+
+`TRACK_ABORT` is also sent when the source application cancels a stream. On
+receipt, the receiver discards incomplete assemblers and recovery windows for
+the alias and reports a terminal abort. The frame is idempotent; its three
+reserved bytes must be zero.
 
 The source holds Flexicast payloads in bounded plaintext queues until a
 per-flow token bucket permits transmission. Ordinary data is limited to 256

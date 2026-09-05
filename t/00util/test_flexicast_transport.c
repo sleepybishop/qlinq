@@ -987,20 +987,18 @@ int main(int argc, char **argv) {
   bool indexed_repair = argc == 2 && strcmp(argv[1], "--repair-indexed") == 0;
   bool exhausted_repair =
       argc == 2 && strcmp(argv[1], "--repair-exhaustion") == 0;
-  bool repair =
-      argc == 2 && (strcmp(argv[1], "--repair") == 0 || indexed_repair ||
-                    exhausted_repair);
+  bool repair = argc == 2 && (strcmp(argv[1], "--repair") == 0 ||
+                              indexed_repair || exhausted_repair);
   bool ipv6 = argc == 2 && strcmp(argv[1], "--native6") == 0;
   if (argc > 2 || (argc == 2 && !native_multicast && !adaptive && !repair)) {
-    fprintf(
-        stderr,
-        "usage: %s "
-        "[--native|--native6|--join-fallback|--ack-fallback|--pacing|"
-        "--adaptive|--repair|--repair-indexed|--repair-exhaustion|--mesh|"
-        "--mesh-split|--membership|"
-        "--membership6|--unsubscribe|"
-        "--unsubscribe6]\n",
-        argv[0]);
+    fprintf(stderr,
+            "usage: %s "
+            "[--native|--native6|--join-fallback|--ack-fallback|--pacing|"
+            "--adaptive|--repair|--repair-indexed|--repair-exhaustion|--mesh|"
+            "--mesh-split|--membership|"
+            "--membership6|--unsubscribe|"
+            "--unsubscribe6]\n",
+            argv[0]);
     return 1;
   }
   flexicast_test_state_t server_state = {0};
@@ -1232,11 +1230,10 @@ int main(int argc, char **argv) {
               source_stats.repair_rateless_symbols_sent);
       goto Fail;
     }
-    printf(indexed_repair
-               ? "===FLEXICAST INDEXED REPAIR OK===\n"
-               : exhausted_repair
-                     ? "===FLEXICAST RATELESS EXHAUSTION RECOVERY OK===\n"
-                     : "===FLEXICAST RATELESS REPAIR OK===\n");
+    printf(indexed_repair ? "===FLEXICAST INDEXED REPAIR OK===\n"
+           : exhausted_repair
+               ? "===FLEXICAST RATELESS EXHAUSTION RECOVERY OK===\n"
+               : "===FLEXICAST RATELESS REPAIR OK===\n");
     transport_destroy(client_b);
     transport_destroy(client_a);
     transport_destroy(server);
@@ -1324,7 +1321,8 @@ int main(int argc, char **argv) {
               source_stats.flexicast_cc_timeout_reduction_events +
               source_stats.flexicast_cc_rate_limit_reduction_events +
               source_stats.flexicast_cc_other_reduction_events) {
-    fprintf(stderr, "Flexicast controller transition telemetry is incomplete\n");
+    fprintf(stderr,
+            "Flexicast controller transition telemetry is incomplete\n");
     goto Fail;
   }
 
@@ -1395,25 +1393,22 @@ int main(int argc, char **argv) {
       transport_stats_t a_diagnostic = {0}, b_diagnostic = {0};
       (void)transport_get_stats(client_a, &a_diagnostic);
       (void)transport_get_stats(client_b, &b_diagnostic);
-      fprintf(stderr,
-              "post-timeout unicast fallback delivery failed "
-              "(a=%d/%zu rx=%" PRIu64 " errors=%" PRIu64
-              ", b=%d/%zu rx=%" PRIu64 " errors=%" PRIu64
-              " conns=%zu closed=%" PRIu64
-              ", source_packets=%" PRIu64 " udp=%" PRIu64
-              " egress=%zu conns=%zu queued=%zu drops=%" PRIu64
-              ")\n",
-              client_a_state.received, client_a_state.payload_size,
-              a_diagnostic.datagrams_received, a_diagnostic.protocol_errors,
-              client_b_state.received, client_b_state.payload_size,
-              b_diagnostic.datagrams_received, b_diagnostic.protocol_errors,
-              b_diagnostic.active_connections, b_diagnostic.connections_closed,
-              source_stats.flexicast_packets_sent,
-              source_stats.udp_packets_sent,
-              source_stats.egress_current_packets,
-              source_stats.active_connections,
-              source_stats.flexicast_queued_packets,
-              source_stats.flexicast_pacing_dropped);
+      fprintf(
+          stderr,
+          "post-timeout unicast fallback delivery failed "
+          "(a=%d/%zu rx=%" PRIu64 " errors=%" PRIu64 ", b=%d/%zu rx=%" PRIu64
+          " errors=%" PRIu64 " conns=%zu closed=%" PRIu64
+          ", source_packets=%" PRIu64 " udp=%" PRIu64
+          " egress=%zu conns=%zu queued=%zu drops=%" PRIu64 ")\n",
+          client_a_state.received, client_a_state.payload_size,
+          a_diagnostic.datagrams_received, a_diagnostic.protocol_errors,
+          client_b_state.received, client_b_state.payload_size,
+          b_diagnostic.datagrams_received, b_diagnostic.protocol_errors,
+          b_diagnostic.active_connections, b_diagnostic.connections_closed,
+          source_stats.flexicast_packets_sent, source_stats.udp_packets_sent,
+          source_stats.egress_current_packets, source_stats.active_connections,
+          source_stats.flexicast_queued_packets,
+          source_stats.flexicast_pacing_dropped);
       goto Fail;
     }
   }

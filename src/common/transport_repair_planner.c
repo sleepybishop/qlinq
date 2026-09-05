@@ -51,10 +51,10 @@ static bool snapshot_has_unknown_resource(
   return false;
 }
 
-static bool add_resource_cost(
-    transport_repair_planner_resource_cost_t *resources,
-    size_t *resource_count, uint64_t resource_id, uint64_t bytes,
-    uint64_t airtime_us) {
+static bool
+add_resource_cost(transport_repair_planner_resource_cost_t *resources,
+                  size_t *resource_count, uint64_t resource_id, uint64_t bytes,
+                  uint64_t airtime_us) {
   for (size_t i = 0; i < *resource_count; i++) {
     if (resources[i].resource_id != resource_id)
       continue;
@@ -66,10 +66,10 @@ static bool add_resource_cost(
   }
   if (*resource_count >= TRANSPORT_REPAIR_PLANNER_MAX_RESOURCES)
     return false;
-  resources[*resource_count] = (transport_repair_planner_resource_cost_t){
-      .resource_id = resource_id,
-      .physical_bytes = bytes,
-      .airtime_us = airtime_us};
+  resources[*resource_count] =
+      (transport_repair_planner_resource_cost_t){.resource_id = resource_id,
+                                                 .physical_bytes = bytes,
+                                                 .airtime_us = airtime_us};
   (*resource_count)++;
   return true;
 }
@@ -86,15 +86,14 @@ static uint64_t packets_at_rate_to_us(size_t packets, fp_t packets_per_second) {
   if (packets_per_second <= 0)
     return UINT64_MAX;
   fp_wide_t numerator = (fp_wide_t)packets * 1000000 * FP_ONE;
-  fp_wide_t result =
-      (numerator + packets_per_second - 1) / packets_per_second;
+  fp_wide_t result = (numerator + packets_per_second - 1) / packets_per_second;
   return result > UINT64_MAX ? UINT64_MAX : (uint64_t)result;
 }
 
-static bool build_requester_cost(
-    const transport_repair_planner_snapshot_t *snapshot,
-    const transport_repair_planner_requester_t *requester,
-    bool collapse_resources, requester_cost_t *cost) {
+static bool
+build_requester_cost(const transport_repair_planner_snapshot_t *snapshot,
+                     const transport_repair_planner_requester_t *requester,
+                     bool collapse_resources, requester_cost_t *cost) {
   memset(cost, 0, sizeof(*cost));
   if (requester->deficit == 0 || requester->path_count == 0 ||
       requester->path_count > TRANSPORT_MAX_PATHS)
@@ -114,8 +113,8 @@ static bool build_requester_cost(
   if (completion == PATHFLOW_ERROR)
     return false;
 
-  uint64_t packet_bytes = saturating_add_u64(snapshot->symbol_size,
-                                             snapshot->packet_overhead);
+  uint64_t packet_bytes =
+      saturating_add_u64(snapshot->symbol_size, snapshot->packet_overhead);
   for (size_t i = 0; i < requester->path_count; i++) {
     if (paths[i].x == 0)
       continue;
@@ -145,13 +144,13 @@ static uint64_t member_hash_add(uint64_t hash, uint64_t member_id) {
   return hash;
 }
 
-static bool candidate_add_requester_cost(
-    transport_repair_planner_candidate_t *candidate,
-    const requester_cost_t *requester) {
+static bool
+candidate_add_requester_cost(transport_repair_planner_candidate_t *candidate,
+                             const requester_cost_t *requester) {
   if (!requester->valid)
     return false;
-  candidate->physical_bytes = saturating_add_u64(
-      candidate->physical_bytes, requester->physical_bytes);
+  candidate->physical_bytes =
+      saturating_add_u64(candidate->physical_bytes, requester->physical_bytes);
   candidate->aggregate_airtime_us = saturating_add_u64(
       candidate->aggregate_airtime_us, requester->aggregate_airtime_us);
   if (requester->completion_us > candidate->predicted_completion_us)
@@ -160,33 +159,31 @@ static bool candidate_add_requester_cost(
   candidate->unicast_requesters++;
   candidate->uncertain |= requester->uncertain;
   for (size_t i = 0; i < requester->resource_count; i++)
-    if (!add_resource_cost(
-            candidate->resources, &candidate->resource_count,
-            requester->resources[i].resource_id,
-            requester->resources[i].physical_bytes,
-            requester->resources[i].airtime_us))
+    if (!add_resource_cost(candidate->resources, &candidate->resource_count,
+                           requester->resources[i].resource_id,
+                           requester->resources[i].physical_bytes,
+                           requester->resources[i].airtime_us))
       return false;
   return true;
 }
 
-static void finalize_candidate(
-    const transport_repair_planner_snapshot_t *snapshot,
-    transport_repair_planner_candidate_t *candidate) {
+static void
+finalize_candidate(const transport_repair_planner_snapshot_t *snapshot,
+                   transport_repair_planner_candidate_t *candidate) {
   uint64_t deadline_us = saturating_mul_u64(snapshot->deadline_ms, 1000U);
   for (size_t i = 0; i < candidate->resource_count; i++) {
-    if (candidate->resources[i].airtime_us >
-        candidate->predicted_completion_us)
+    if (candidate->resources[i].airtime_us > candidate->predicted_completion_us)
       candidate->predicted_completion_us = candidate->resources[i].airtime_us;
     if (deadline_us != 0 && candidate->resources[i].airtime_us > deadline_us)
       candidate->feasible = false;
   }
 }
 
-static bool build_candidate(
-    const transport_repair_planner_snapshot_t *snapshot,
-    const requester_cost_t *unicast_costs, uint64_t shared_mask,
-    bool exact_mask, bool collapse_resources,
-    transport_repair_planner_candidate_t *candidate) {
+static bool build_candidate(const transport_repair_planner_snapshot_t *snapshot,
+                            const requester_cost_t *unicast_costs,
+                            uint64_t shared_mask, bool exact_mask,
+                            bool collapse_resources,
+                            transport_repair_planner_candidate_t *candidate) {
   transport_repair_plan_action_t action = TRANSPORT_REPAIR_PLAN_MIXED;
   if (shared_mask == 0)
     action = TRANSPORT_REPAIR_PLAN_ALL_UNICAST;
@@ -208,8 +205,8 @@ static bool build_candidate(
   size_t maximum_deficit = 0;
   uint32_t minimum_delivery_ppm = 1000000U;
   for (size_t i = 0; i < snapshot->requester_count; i++) {
-    bool shared = exact_mask ? (shared_mask & (UINT64_C(1) << i)) != 0
-                             : shared_mask != 0;
+    bool shared =
+        exact_mask ? (shared_mask & (UINT64_C(1) << i)) != 0 : shared_mask != 0;
     const transport_repair_planner_requester_t *requester =
         &snapshot->requesters[i];
     candidate->innovative_deliveries = saturating_add_u64(
@@ -234,16 +231,14 @@ static bool build_candidate(
       minimum_delivery_ppm = requester->shared_delivery_probability_ppm;
     }
     if (snapshot->mode == TRANSPORT_REPAIR_MODE_INDEXED)
-      for (size_t word = 0;
-           word < QLINQ_WIRE_MAX_NACK_SYMBOLS / 64U; word++)
+      for (size_t word = 0; word < QLINQ_WIRE_MAX_NACK_SYMBOLS / 64U; word++)
         requested_union[word] |= requester->requested_symbols[word];
   }
 
   if (candidate->shared_requesters != 0) {
-    size_t logical_symbols =
-        snapshot->mode == TRANSPORT_REPAIR_MODE_INDEXED
-            ? bit_count_words(requested_union)
-            : maximum_deficit;
+    size_t logical_symbols = snapshot->mode == TRANSPORT_REPAIR_MODE_INDEXED
+                                 ? bit_count_words(requested_union)
+                                 : maximum_deficit;
     if (logical_symbols == 0 || snapshot->shared_rate_bytes_per_second == 0) {
       candidate->valid = false;
       candidate->feasible = false;
@@ -253,16 +248,16 @@ static bool build_candidate(
       minimum_delivery_ppm = 1000000U;
     uint64_t physical_symbols = divide_ceil_u64(
         saturating_mul_u64(logical_symbols, 1000000U), minimum_delivery_ppm);
-    uint64_t packet_bytes = saturating_add_u64(snapshot->symbol_size,
-                                               snapshot->packet_overhead);
+    uint64_t packet_bytes =
+        saturating_add_u64(snapshot->symbol_size, snapshot->packet_overhead);
     uint64_t copies = snapshot->shared_physical_copies == 0
                           ? 1
                           : snapshot->shared_physical_copies;
     uint64_t bytes = saturating_mul_u64(
         saturating_mul_u64(physical_symbols, packet_bytes), copies);
-    uint64_t airtime_us = divide_ceil_u64(
-        saturating_mul_u64(bytes, 1000000U),
-        snapshot->shared_rate_bytes_per_second);
+    uint64_t airtime_us =
+        divide_ceil_u64(saturating_mul_u64(bytes, 1000000U),
+                        snapshot->shared_rate_bytes_per_second);
     uint64_t resource_id =
         collapse_resources ? 0 : snapshot->shared_resource_id;
     if (airtime_us == UINT64_MAX ||
@@ -290,9 +285,9 @@ static bool candidates_share_single_resource(
          left->resources[0].resource_id == right->resources[0].resource_id;
 }
 
-static bool candidate_better(
-    const transport_repair_planner_candidate_t *candidate,
-    const transport_repair_planner_candidate_t *best) {
+static bool
+candidate_better(const transport_repair_planner_candidate_t *candidate,
+                 const transport_repair_planner_candidate_t *best) {
   if (!candidate->valid)
     return false;
   if (!best->valid)
@@ -317,10 +312,11 @@ static bool candidate_better(
   return candidate->action < best->action;
 }
 
-static void evaluate_large_prefixes(
-    const transport_repair_planner_snapshot_t *snapshot,
-    const requester_cost_t *unicast_costs, bool collapse_resources,
-    transport_repair_planner_candidate_t *mixed) {
+static void
+evaluate_large_prefixes(const transport_repair_planner_snapshot_t *snapshot,
+                        const requester_cost_t *unicast_costs,
+                        bool collapse_resources,
+                        transport_repair_planner_candidate_t *mixed) {
   size_t *order = calloc(snapshot->requester_count, sizeof(*order));
   transport_repair_planner_requester_t *copy =
       calloc(snapshot->requester_count, sizeof(*copy));
@@ -338,7 +334,8 @@ static void evaluate_large_prefixes(
     while (position > 0) {
       size_t left = order[position - 1U];
       uint64_t left_score = unicast_costs[left].aggregate_airtime_us;
-      uint64_t right_score = unicast_costs[order[position]].aggregate_airtime_us;
+      uint64_t right_score =
+          unicast_costs[order[position]].aggregate_airtime_us;
       if (left_score > right_score ||
           (left_score == right_score &&
            snapshot->requesters[left].member_id <
@@ -408,15 +405,15 @@ bool transport_repair_planner_evaluate(
   if (!unicast_costs)
     return false;
   for (size_t i = 0; i < snapshot->requester_count; i++)
-    build_requester_cost(snapshot, &snapshot->requesters[i],
-                         collapse_resources, &unicast_costs[i]);
+    build_requester_cost(snapshot, &snapshot->requesters[i], collapse_resources,
+                         &unicast_costs[i]);
 
-  uint64_t all_mask = snapshot->requester_count <= 64
-                          ? (snapshot->requester_count == 64
-                                 ? UINT64_MAX
-                                 : (UINT64_C(1) << snapshot->requester_count) -
-                                       1U)
-                          : 1;
+  uint64_t all_mask =
+      snapshot->requester_count <= 64
+          ? (snapshot->requester_count == 64
+                 ? UINT64_MAX
+                 : (UINT64_C(1) << snapshot->requester_count) - 1U)
+          : 1;
   build_candidate(snapshot, unicast_costs, all_mask,
                   snapshot->requester_count <= 64, collapse_resources,
                   &evaluation->all_shared);
@@ -451,25 +448,25 @@ bool transport_repair_planner_evaluate(
   if (evaluation->all_shared.valid) {
     bool same_resource = candidates_share_single_resource(
         &evaluation->chosen, &evaluation->all_shared);
-    uint64_t chosen_cost =
-        same_resource ? evaluation->chosen.physical_bytes
-                      : evaluation->chosen.aggregate_airtime_us;
-    uint64_t shared_cost =
-        same_resource ? evaluation->all_shared.physical_bytes
-                      : evaluation->all_shared.aggregate_airtime_us;
+    uint64_t chosen_cost = same_resource
+                               ? evaluation->chosen.physical_bytes
+                               : evaluation->chosen.aggregate_airtime_us;
+    uint64_t shared_cost = same_resource
+                               ? evaluation->all_shared.physical_bytes
+                               : evaluation->all_shared.aggregate_airtime_us;
     if (chosen_cost < shared_cost && shared_cost != 0) {
       uint64_t saved = shared_cost - chosen_cost;
       fp_wide_t ppm = (fp_wide_t)saved * 1000000 / shared_cost;
-    evaluation->chosen_savings_vs_shared_ppm =
-        ppm > UINT32_MAX ? UINT32_MAX : (uint32_t)ppm;
+      evaluation->chosen_savings_vs_shared_ppm =
+          ppm > UINT32_MAX ? UINT32_MAX : (uint32_t)ppm;
     }
   }
   free(unicast_costs);
   return true;
 }
 
-const char *transport_repair_plan_action_name(
-    transport_repair_plan_action_t action) {
+const char *
+transport_repair_plan_action_name(transport_repair_plan_action_t action) {
   switch (action) {
   case TRANSPORT_REPAIR_PLAN_ALL_SHARED:
     return "all-shared";
@@ -570,8 +567,7 @@ bool transport_repair_planner_record_write(
         !write_u64(output, requester->feedback_age_ms) ||
         !write_u32(output, requester->shared_delivery_probability_ppm))
       return false;
-    for (size_t word = 0;
-         word < QLINQ_WIRE_MAX_NACK_SYMBOLS / 64U; word++)
+    for (size_t word = 0; word < QLINQ_WIRE_MAX_NACK_SYMBOLS / 64U; word++)
       if (!write_u64(output, requester->requested_symbols[word]))
         return false;
     if (!write_u64(output, requester->path_count))
@@ -659,14 +655,12 @@ bool transport_repair_planner_record_read(
   for (size_t i = 0; i < snapshot->requester_count; i++) {
     transport_repair_planner_requester_t *requester = &requesters[i];
     uint32_t deficit = 0;
-    if (!read_u64(input, &requester->member_id) ||
-        !read_u32(input, &deficit) ||
+    if (!read_u64(input, &requester->member_id) || !read_u32(input, &deficit) ||
         !read_u64(input, &requester->feedback_age_ms) ||
         !read_u32(input, &requester->shared_delivery_probability_ppm))
       goto Error;
     requester->deficit = (uint16_t)deficit;
-    for (size_t word = 0;
-         word < QLINQ_WIRE_MAX_NACK_SYMBOLS / 64U; word++)
+    for (size_t word = 0; word < QLINQ_WIRE_MAX_NACK_SYMBOLS / 64U; word++)
       if (!read_u64(input, &requester->requested_symbols[word]))
         goto Error;
     if (!read_u64(input, &value) || value > TRANSPORT_MAX_PATHS)

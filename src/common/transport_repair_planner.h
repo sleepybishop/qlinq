@@ -7,8 +7,8 @@
 
 #include <stdbool.h>
 #include <stddef.h>
-#include <stdio.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #define TRANSPORT_REPAIR_PLANNER_VERSION 3U
 #define TRANSPORT_REPAIR_PLANNER_MAX_REQUESTERS 1024U
@@ -118,8 +118,8 @@ bool transport_repair_planner_evaluate(
     const transport_repair_planner_snapshot_t *snapshot,
     transport_repair_planner_evaluation_t *evaluation);
 
-const char *transport_repair_plan_action_name(
-    transport_repair_plan_action_t action);
+const char *
+transport_repair_plan_action_name(transport_repair_plan_action_t action);
 
 /* Versioned local experiment record, not a network wire format. The reader
  * allocates snapshot->requesters; release it with the matching destroy call. */

@@ -364,11 +364,10 @@ int main(void) {
     planner_requesters[i].deficit = 4;
     planner_requesters[i].shared_delivery_probability_ppm = 1000000U;
     planner_requesters[i].path_count = 1;
-    planner_requesters[i].paths[0] =
-        (transport_repair_planner_path_t){
-            .resource_id = 1,
-            .estimate = {.b = FP_FROM_INT(100), .p = 0, .l = 0, .q = 0},
-            .measurement_known = true};
+    planner_requesters[i].paths[0] = (transport_repair_planner_path_t){
+        .resource_id = 1,
+        .estimate = {.b = FP_FROM_INT(100), .p = 0, .l = 0, .q = 0},
+        .measurement_known = true};
   }
   transport_repair_planner_snapshot_t planner_snapshot = {
       .version = TRANSPORT_REPAIR_PLANNER_VERSION,
@@ -442,25 +441,27 @@ int main(void) {
 
   planner_snapshot.shared_resource_id = 0;
   transport_repair_planner_evaluation_t planner_replay;
-  CHECK(transport_repair_planner_evaluate(&planner_snapshot,
-                                          &planner_evaluation) &&
-            transport_repair_planner_evaluate(&planner_snapshot,
-                                              &planner_replay) &&
-            planner_evaluation.chosen.uncertain &&
-            planner_evaluation.chosen.resource_count == 1 &&
-            planner_evaluation.chosen.action == planner_replay.chosen.action &&
-            planner_evaluation.chosen.aggregate_airtime_us ==
-                planner_replay.chosen.aggregate_airtime_us &&
-            planner_evaluation.chosen.physical_bytes ==
-                planner_replay.chosen.physical_bytes,
-        "unknown resources collapse conservatively and replay deterministically");
+  CHECK(
+      transport_repair_planner_evaluate(&planner_snapshot,
+                                        &planner_evaluation) &&
+          transport_repair_planner_evaluate(&planner_snapshot,
+                                            &planner_replay) &&
+          planner_evaluation.chosen.uncertain &&
+          planner_evaluation.chosen.resource_count == 1 &&
+          planner_evaluation.chosen.action == planner_replay.chosen.action &&
+          planner_evaluation.chosen.aggregate_airtime_us ==
+              planner_replay.chosen.aggregate_airtime_us &&
+          planner_evaluation.chosen.physical_bytes ==
+              planner_replay.chosen.physical_bytes,
+      "unknown resources collapse conservatively and replay deterministically");
   FILE *planner_record = tmpfile();
   transport_repair_planner_snapshot_t recorded_snapshot;
   transport_repair_planner_recorded_result_t recorded_result;
   CHECK(planner_record &&
             transport_repair_planner_record_write(
                 planner_record, &planner_snapshot, &planner_evaluation) &&
-            fflush(planner_record) == 0 && fseek(planner_record, 0, SEEK_SET) == 0 &&
+            fflush(planner_record) == 0 &&
+            fseek(planner_record, 0, SEEK_SET) == 0 &&
             transport_repair_planner_record_read(
                 planner_record, &recorded_snapshot, &recorded_result) &&
             transport_repair_planner_evaluate(&recorded_snapshot,
@@ -492,11 +493,10 @@ int main(void) {
     large_requesters[i].deficit = 1;
     large_requesters[i].shared_delivery_probability_ppm = 1000000U;
     large_requesters[i].path_count = 1;
-    large_requesters[i].paths[0] =
-        (transport_repair_planner_path_t){
-            .resource_id = 1,
-            .estimate = {.b = FP_FROM_INT(1), .p = 0, .l = 0, .q = 0},
-            .measurement_known = true};
+    large_requesters[i].paths[0] = (transport_repair_planner_path_t){
+        .resource_id = 1,
+        .estimate = {.b = FP_FROM_INT(1), .p = 0, .l = 0, .q = 0},
+        .measurement_known = true};
   }
   transport_repair_planner_snapshot_t large_snapshot = {
       .version = TRANSPORT_REPAIR_PLANNER_VERSION,
@@ -509,31 +509,31 @@ int main(void) {
       .cohort_member_count = 1000,
       .requesters = large_requesters,
       .requester_count = 1000};
-  CHECK(transport_repair_planner_evaluate(&large_snapshot,
-                                          &planner_evaluation) &&
-            planner_evaluation.chosen.action ==
-                TRANSPORT_REPAIR_PLAN_ALL_SHARED &&
-            !planner_evaluation.chosen.uncertain &&
-            planner_evaluation.chosen.shared_requesters == 1000 &&
-            planner_evaluation.all_shared.resource_count == 1 &&
-            planner_evaluation.all_shared.resources[0].resource_id == 1 &&
-            planner_evaluation.all_shared.physical_bytes == 1000 &&
-            planner_evaluation.all_unicast.resource_count == 1 &&
-            planner_evaluation.all_unicast.resources[0].resource_id == 1 &&
-            planner_evaluation.all_unicast.physical_bytes == 1000000,
-        "thousand-requester planner counts a shared radio once and each "
-        "unicast transmission once");
+  CHECK(
+      transport_repair_planner_evaluate(&large_snapshot, &planner_evaluation) &&
+          planner_evaluation.chosen.action ==
+              TRANSPORT_REPAIR_PLAN_ALL_SHARED &&
+          !planner_evaluation.chosen.uncertain &&
+          planner_evaluation.chosen.shared_requesters == 1000 &&
+          planner_evaluation.all_shared.resource_count == 1 &&
+          planner_evaluation.all_shared.resources[0].resource_id == 1 &&
+          planner_evaluation.all_shared.physical_bytes == 1000 &&
+          planner_evaluation.all_unicast.resource_count == 1 &&
+          planner_evaluation.all_unicast.resources[0].resource_id == 1 &&
+          planner_evaluation.all_unicast.physical_bytes == 1000000,
+      "thousand-requester planner counts a shared radio once and each "
+      "unicast transmission once");
   for (size_t i = 0; i < 1000; i++)
     large_requesters[i].paths[0].resource_id = 2;
-  CHECK(transport_repair_planner_evaluate(&large_snapshot,
-                                          &planner_evaluation) &&
-            planner_evaluation.all_shared.resource_count == 1 &&
-            planner_evaluation.all_shared.resources[0].resource_id == 1 &&
-            planner_evaluation.all_unicast.resource_count == 1 &&
-            planner_evaluation.all_unicast.resources[0].resource_id == 2 &&
-            planner_evaluation.all_unicast.physical_bytes == 1000000,
-        "thousand-requester planner keeps demonstrably independent multicast "
-        "and unicast resources separate");
+  CHECK(
+      transport_repair_planner_evaluate(&large_snapshot, &planner_evaluation) &&
+          planner_evaluation.all_shared.resource_count == 1 &&
+          planner_evaluation.all_shared.resources[0].resource_id == 1 &&
+          planner_evaluation.all_unicast.resource_count == 1 &&
+          planner_evaluation.all_unicast.resources[0].resource_id == 2 &&
+          planner_evaluation.all_unicast.physical_bytes == 1000000,
+      "thousand-requester planner keeps demonstrably independent multicast "
+      "and unicast resources separate");
   free(large_requesters);
 
   const uint8_t object_data[] = {1, 2, 3, 4};
@@ -762,7 +762,8 @@ int main(void) {
               ((UINT64_C(1) << 1U) | (UINT64_C(1) << 2U) |
                (UINT64_C(1) << 3U)) &&
           scheduler_transport->stats.repair_requests_merged == 1,
-      "repair aggregation spans minimum NACK backoff without extending holdoff");
+      "repair aggregation spans minimum NACK backoff without extending "
+      "holdoff");
   CHECK(pending->intent_id != 0 && pending->retained_requesters == 2 &&
             pending->retained_deficit_sum == 4 &&
             pending->shared_useful_requesters == 2 &&
@@ -812,7 +813,8 @@ int main(void) {
             scheduler_flow.shadow_observations[0].suppressed_requests == 1 &&
             scheduler_flow.shadow_observations[0].ready_at_ms ==
                 120 + TRANSPORT_FLEXICAST_SHADOW_OBSERVATION_MS,
-        "shadow observation independently retains accepted and suppressed demand");
+        "shadow observation independently retains accepted and suppressed "
+        "demand");
   scheduler_flow.repair_queued[0] =
       (transport_flexicast_queued_payload_t){.data = malloc(1),
                                              .size = 1,
@@ -1016,15 +1018,15 @@ int main(void) {
         "bounded sent-object cache initial insert");
   sent_object_cache_t *retry_entry = transport_sent_cache_find(
       &bounded_cache, &object.track_id, object.group_id, object.object_id);
-  CHECK(retry_entry &&
-            transport_sent_cache_store(&bounded_cache, &object, 4, 2, 2,
-                                       false) &&
-            transport_sent_cache_find(&bounded_cache, &object.track_id,
-                                      object.group_id, object.object_id) ==
-                retry_entry &&
-            retry_entry->total_symbols == 4 &&
-            retry_entry->next_repair_symbol == 4,
-        "partial publication retry updates one recovery-cache entry");
+  CHECK(
+      retry_entry &&
+          transport_sent_cache_store(&bounded_cache, &object, 4, 2, 2, false) &&
+          transport_sent_cache_find(&bounded_cache, &object.track_id,
+                                    object.group_id,
+                                    object.object_id) == retry_entry &&
+          retry_entry->total_symbols == 4 &&
+          retry_entry->next_repair_symbol == 4,
+      "partial publication retry updates one recovery-cache entry");
   for (uint64_t object_id = 1; object_id < TRANSPORT_SENT_CACHE_SIZE;
        object_id++) {
     object.object_id = object_id;

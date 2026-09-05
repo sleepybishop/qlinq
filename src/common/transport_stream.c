@@ -358,3 +358,14 @@ bool transport_stream_write_track_checkpoint_ack_frame(
   return transport_stream_write_frame(stream, QLINQ_WIRE_TRACK_CHECKPOINT_ACK,
                                       payload, sizeof(payload));
 }
+
+bool transport_stream_write_track_abort_frame(quicly_stream_t *stream,
+                                              uint8_t alias) {
+  uint8_t payload[QLINQ_WIRE_TRACK_ABORT_SIZE];
+  qlinq_wire_track_abort_t abort_frame = {.alias = alias};
+  if (qlinq_wire_encode_track_abort(payload, sizeof(payload), &abort_frame) !=
+      QLINQ_WIRE_OK)
+    return false;
+  return transport_stream_write_frame(stream, QLINQ_WIRE_TRACK_ABORT, payload,
+                                      sizeof(payload));
+}

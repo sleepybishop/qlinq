@@ -203,6 +203,47 @@ static bool send_checkpoint_ack(transport_conn_t *conn, uint8_t alias,
   return true;
 }
 
+static bool track_uses_recovery(const moq_track_id_t *track) {
+  return track && track->type == MOQ_TRACK_DATA &&
+         (track->flags &
+          (MOQ_TRACK_FLAG_FEC_ENABLED | MOQ_TRACK_FLAG_FEC_RATELESS)) != 0;
+}
+
+static bool recovery_windows_empty(const transport_object_gap_state_t *state) {
+  if (!state || state->pending_mask != 0)
+    return false;
+  for (size_t i = 0; i < QLINQ_RECOVERY_MAX_WINDOWS; i++)
+    if (state->recovery_windows[i].active)
+      return false;
+  return true;
+}
+
+void transport_protocol_poll_lifecycle(transport_t *t) {
+  if (!t)
+    return;
+  size_t active_count = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
+  for (size_t c = 0; c < active_count; c++) {
+    transport_conn_t *conn = t->is_server ? t->conns[c] : t->client_conn;
+    if (!conn)
+      continue;
+    for (size_t alias = 0; alias <= UINT8_MAX; alias++) {
+      transport_object_gap_state_t *gap = &conn->object_gaps[alias];
+      if (!gap->finish_pending || gap->finish_emitted || gap->aborted ||
+          !recovery_windows_empty(gap))
+        continue;
+      moq_track_id_t track;
+      if (transport_subscriptions_find_by_alias(&conn->subscriptions,
+                                                (uint8_t)alias, &track) != 0)
+        continue;
+      gap->finish_emitted = true;
+      transport_event_t event = {.type = TRANSPORT_EVENT_TRACK_FINISHED,
+                                 .conn = conn,
+                                 .track_id = track};
+      transport_emit_event(t, &event);
+    }
+  }
+}
+
 static transport_recovery_window_t *
 find_recovery_window(transport_object_gap_state_t *state, uint64_t group_id,
                      uint64_t first_object_id, uint64_t final_object_id) {
@@ -438,14 +479,25 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
                        "protocol error: too many tracks");
           break;
         }
-        /* A Flexicast subscriber becomes responsible for retained recovery
-         * state only after it has installed the current group key and replied
-         * READY. Enrolling it before the reliable announcement can create a
-         * NACK storm that starves its own admission. Ordinary/unavailable
-         * Flexicast paths keep the immediate unicast recovery baseline. */
-        if (!transport_flexicast_offer(t, conn, &parsed_track, alias))
+        /* Completion applies to the cohort present when finish starts. A
+         * subscriber arriving afterward has no recovery baseline for that
+         * finite transfer, so terminate it explicitly instead of leaving it
+         * waiting for data and TRACK_END that have already passed. */
+        if (transport_publish_track_terminal(t, &parsed_track)) {
+          if (!transport_stream_write_track_abort_frame(conn->stream, alias)) {
+            quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
+                         "protocol error: terminal track rejection failed");
+            break;
+          }
+          /* A Flexicast subscriber becomes responsible for retained recovery
+           * state only after it has installed the current group key and replied
+           * READY. Enrolling it before the reliable announcement can create a
+           * NACK storm that starves its own admission. Ordinary/unavailable
+           * Flexicast paths keep the immediate unicast recovery baseline. */
+        } else if (!transport_flexicast_offer(t, conn, &parsed_track, alias)) {
           transport_publish_checkpoint_member_added(t, conn, &parsed_track,
                                                     alias);
+        }
       } else if (type == QLINQ_WIRE_UNSUBSCRIBE) {
         transport_publish_checkpoint_member_removed(t, conn, &parsed_track,
                                                     alias);
@@ -613,8 +665,7 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
                 missing_count);
             int64_t now = transport_get_time_ms();
             bool shared_repair =
-                t->flexicast_repair_route ==
-                TRANSPORT_FLEXICAST_REPAIR_SHARED;
+                t->flexicast_repair_route == TRANSPORT_FLEXICAST_REPAIR_SHARED;
             bool source_suppressed =
                 repair_flow && shared_repair &&
                 transport_repair_suppression_contains(
@@ -624,9 +675,9 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
               t->stats.repair_requests_suppressed++;
               if (indices_valid)
                 transport_flexicast_observe_repair_request(
-                    t, repair_flow, cached, conn->id, repair_mode,
-                    whole_object, missing, missing_count,
-                    TRANSPORT_FLEXICAST_OBS_SUPPRESSED, now);
+                    t, repair_flow, cached, conn->id, repair_mode, whole_object,
+                    missing, missing_count, TRANSPORT_FLEXICAST_OBS_SUPPRESSED,
+                    now);
               quicly_streambuf_ingress_shift(stream, frame.consumed);
               continue;
             }
@@ -636,9 +687,9 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
               t->stats.repair_requests_aggregate_throttled++;
               if (repair_flow && indices_valid)
                 transport_flexicast_observe_repair_request(
-                    t, repair_flow, cached, conn->id, repair_mode,
-                    whole_object, missing, missing_count,
-                    TRANSPORT_FLEXICAST_OBS_THROTTLED, now);
+                    t, repair_flow, cached, conn->id, repair_mode, whole_object,
+                    missing, missing_count, TRANSPORT_FLEXICAST_OBS_THROTTLED,
+                    now);
               quicly_streambuf_ingress_shift(stream, frame.consumed);
               continue;
             }
@@ -650,8 +701,8 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
                       whole_object, missing, missing_count, now);
               if (indices_valid)
                 transport_flexicast_observe_repair_request(
-                    t, repair_flow, cached, conn->id, repair_mode,
-                    whole_object, missing, missing_count,
+                    t, repair_flow, cached, conn->id, repair_mode, whole_object,
+                    missing, missing_count,
                     scheduled ? TRANSPORT_FLEXICAST_OBS_ACCEPTED
                               : TRANSPORT_FLEXICAST_OBS_THROTTLED,
                     now);
@@ -673,8 +724,7 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
                                                 missing_count, &repair));
               if (!built && indices_valid &&
                   repair_mode == TRANSPORT_REPAIR_MODE_RATELESS &&
-                  cached->next_repair_symbol >=
-                      QLINQ_FEC_MAX_TOTAL_SYMBOLS) {
+                  cached->next_repair_symbol >= QLINQ_FEC_MAX_TOTAL_SYMBOLS) {
                 t->stats.repair_rateless_exhausted++;
                 built = transport_repair_build_systematic_fallback(
                     &t->fec_cache, cached, missing_count, &repair);
@@ -717,8 +767,8 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
                       systematic_fallback
                           ? transport_repair_commit_systematic_fallback(
                                 cached, &repair, repairs_queued)
-                          : transport_repair_commit_rateless(
-                                cached, &repair, repairs_queued);
+                          : transport_repair_commit_rateless(cached, &repair,
+                                                             repairs_queued);
                   /* A failed queue admission must not burn a repair ESI. */
                   assert(committed);
                 }
@@ -740,11 +790,9 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
               0 ||
           qlinq_wire_decode_track_checkpoint(input.base, input.len,
                                              &checkpoint) != QLINQ_WIRE_OK ||
-          transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
-                                                checkpoint.alias,
-                                                &resolved_track) != 0 ||
-          resolved_track.type != MOQ_TRACK_DATA ||
-          (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0) {
+          transport_subscriptions_find_by_alias(
+              &conn->subscriptions, checkpoint.alias, &resolved_track) != 0 ||
+          !track_uses_recovery(&resolved_track)) {
         quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
                      "protocol error: invalid recovery checkpoint");
         break;
@@ -779,10 +827,9 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       if (!conn->authenticated ||
           qlinq_wire_decode_track_checkpoint_ack(input.base, input.len, &ack) !=
               QLINQ_WIRE_OK ||
-          transport_subscriptions_find_by_alias(
-              &conn->send_subscriptions, ack.alias, &resolved_track) != 0 ||
-          resolved_track.type != MOQ_TRACK_DATA ||
-          (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0 ||
+          transport_subscriptions_find_by_alias(&conn->subscriptions, ack.alias,
+                                                &resolved_track) != 0 ||
+          !track_uses_recovery(&resolved_track) ||
           !transport_publish_checkpoint_acked(t, conn, &ack, &resolved_track)) {
         quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
                      "protocol error: invalid recovery checkpoint ACK");
@@ -796,21 +843,42 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       if (!conn->authenticated ||
           qlinq_wire_decode_track_end(input.base, input.len, &end) !=
               QLINQ_WIRE_OK ||
-          transport_subscriptions_find_by_alias(
-              &conn->receive_subscriptions, end.alias, &resolved_track) != 0 ||
-          resolved_track.type != MOQ_TRACK_DATA ||
-          (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0) {
+          transport_subscriptions_find_by_alias(&conn->subscriptions, end.alias,
+                                                &resolved_track) != 0 ||
+          !track_uses_recovery(&resolved_track)) {
         quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
                      "protocol error: invalid track completion");
         break;
       }
 
       transport_object_gap_state_t *gap = &conn->object_gaps[end.alias];
+      if ((gap->finish_pending &&
+           (gap->finish_group_id != end.group_id ||
+            gap->finish_object_id != end.final_object_id)) ||
+          gap->aborted) {
+        quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
+                     "protocol error: conflicting track completion");
+        break;
+      }
+      gap->finish_pending = true;
+      gap->finish_group_id = end.group_id;
+      gap->finish_object_id = end.final_object_id;
       /* TRACK_END can overtake multicast data. Keep earlier gaps pending so
        * their ordinary randomized repair timers can observe shared repairs;
        * the final recovery window has independent bounded state. */
       bool acknowledge =
           (conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) != 0;
+      if (end.final_object_id == UINT64_MAX) {
+        if (acknowledge && !send_checkpoint_ack(conn, end.alias, end.group_id,
+                                                end.final_object_id)) {
+          quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
+                       "protocol error: empty completion ACK failed");
+          break;
+        }
+        t->stats.track_ends_received++;
+        quicly_streambuf_ingress_shift(stream, frame.consumed);
+        continue;
+      }
       uint64_t first_object_id = 0;
       if (acknowledge && gap->checkpoint_initialized) {
         if (end.final_object_id <= gap->last_checkpoint_object_id) {
@@ -844,6 +912,36 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
         break;
       }
       t->stats.track_ends_received++;
+      quicly_streambuf_ingress_shift(stream, frame.consumed);
+    } else if (type == QLINQ_WIRE_TRACK_ABORT) {
+      qlinq_wire_track_abort_t abort_frame;
+      moq_track_id_t resolved_track;
+      if (!conn->authenticated ||
+          qlinq_wire_decode_track_abort(input.base, input.len, &abort_frame) !=
+              QLINQ_WIRE_OK ||
+          transport_subscriptions_find_by_alias(
+              &conn->subscriptions, abort_frame.alias, &resolved_track) != 0) {
+        quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
+                     "protocol error: invalid track abort");
+        break;
+      }
+      transport_object_gap_state_t *gap = &conn->object_gaps[abort_frame.alias];
+      if (!gap->aborted) {
+        gap->aborted = true;
+        gap->finish_pending = false;
+        gap->pending_mask = 0;
+        memset(gap->recovery_windows, 0, sizeof(gap->recovery_windows));
+        for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++) {
+          frame_assembler_t *assembler = &conn->assemblers[i];
+          if (assembler->total_symbols > 0 &&
+              assembler->track_id == abort_frame.alias)
+            transport_release_assembler(t, assembler);
+        }
+        transport_event_t event = {.type = TRANSPORT_EVENT_TRACK_ABORTED,
+                                   .conn = conn,
+                                   .track_id = resolved_track};
+        transport_emit_event(t, &event);
+      }
       quicly_streambuf_ingress_shift(stream, frame.consumed);
     } else if (type == QLINQ_WIRE_FLEXICAST_BIND) {
       qlinq_wire_flexicast_bind_t bind;
@@ -1229,18 +1327,18 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
   if (payload.len != QLINQ_WIRE_FEC_HEADER_SIZE + symbol_size)
     goto malformed_datagram;
 
-  bool rateless_data =
-      resolved_track.type == MOQ_TRACK_DATA &&
-      (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0;
+  bool recoverable_data = track_uses_recovery(&resolved_track);
+  bool rateless_data = recoverable_data && (resolved_track.flags &
+                                            MOQ_TRACK_FLAG_FEC_RATELESS) != 0;
   transport_object_gap_state_t *object_state = &tconn->object_gaps[track_id];
   if (!allow_telemetry)
     object_state->shared_delivery = true;
-  if (rateless_data && object_was_delivered(object_state, object_id)) {
+  if (recoverable_data && object_was_delivered(object_state, object_id)) {
     t->stats.fec_duplicate_objects_suppressed++;
     return;
   }
 
-  if (rateless_data) {
+  if (recoverable_data) {
     transport_object_gap_state_t *gap = object_state;
     if (!gap->seen_initialized) {
       gap->seen_initialized = true;
@@ -1428,9 +1526,9 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
                                          .size = original_size,
                                          .is_keyframe = (is_keyframe != 0),
                                          .priority = asm_slot->priority}};
-      if (rateless_data)
+      if (recoverable_data)
         mark_object_delivered(object_state, object_id);
-      if (rateless_data)
+      if (recoverable_data)
         recovery_mark_delivered(tconn, track_id, group_id, object_id);
       t->stats.fec_objects_recovered++;
       transport_emit_event(t, &ev);

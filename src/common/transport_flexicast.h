@@ -307,8 +307,7 @@ void transport_flexicast_observe_repair_request(
     const sent_object_cache_t *object, uint64_t requester_id,
     transport_repair_mode_t mode, bool whole_object, const uint16_t *missing,
     size_t missing_count,
-    transport_flexicast_observation_disposition_t disposition,
-    int64_t now_ms);
+    transport_flexicast_observation_disposition_t disposition, int64_t now_ms);
 size_t transport_flexicast_cancel_repairs_through(transport_t *t,
                                                   const moq_track_id_t *track,
                                                   uint64_t group_id,

@@ -185,6 +185,18 @@ static void on_transport_event(void *user_data,
   case TRANSPORT_EVENT_OBJECT_LOST:
     printf("daemon: object lost event\n");
     break;
+  case TRANSPORT_EVENT_TRACK_FINISHED:
+    if (ctx->verbose)
+      printf("daemon: track '%s' finished\n", event->track_id.name);
+    break;
+  case TRANSPORT_EVENT_TRACK_DRAINED:
+    if (ctx->verbose)
+      printf("daemon: track '%s' drained\n", event->track_id.name);
+    break;
+  case TRANSPORT_EVENT_TRACK_ABORTED:
+    if (ctx->verbose)
+      printf("daemon: track '%s' aborted\n", event->track_id.name);
+    break;
   case TRANSPORT_EVENT_KEYFRAME_REQUEST:
     break;
   }

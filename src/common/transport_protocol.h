@@ -10,6 +10,7 @@ void transport_protocol_receive_datagram(transport_conn_t *conn,
                                          bool allow_telemetry);
 bool transport_protocol_send_hello(transport_conn_t *conn);
 void transport_protocol_maybe_emit_connected(transport_conn_t *conn);
+void transport_protocol_poll_lifecycle(transport_t *t);
 bool transport_protocol_send_nack(transport_conn_t *conn, uint8_t alias,
                                   uint64_t group_id, uint64_t object_id,
                                   const uint16_t *missing, uint16_t count,

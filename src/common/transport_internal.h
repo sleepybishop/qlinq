@@ -18,8 +18,8 @@
 #include "quicly.h"
 
 #include <pthread.h>
-#include <stdio.h>
 #include <stdatomic.h>
+#include <stdio.h>
 
 #define QLINQ_FEC_ASSEMBLER_TIMEOUT_MS 2000
 #define QLINQ_FEC_NACK_DELAY_MS 25
@@ -55,6 +55,11 @@ typedef struct {
   bool checkpoint_initialized;
   bool shared_delivery;
   uint64_t last_checkpoint_object_id;
+  bool finish_pending;
+  bool finish_emitted;
+  bool aborted;
+  uint64_t finish_group_id;
+  uint64_t finish_object_id;
   transport_recovery_window_t recovery_windows[QLINQ_RECOVERY_MAX_WINDOWS];
 } transport_object_gap_state_t;
 
@@ -66,6 +71,12 @@ typedef struct {
   bool checkpoint_initialized;
   uint64_t checkpoint_group_id;
   uint64_t last_checkpoint_object_id;
+  bool finish_started;
+  bool drain_emitted;
+  bool aborted;
+  size_t finish_targets;
+  size_t finish_completed;
+  size_t finish_failed;
 } transport_fec_track_state_t;
 
 typedef struct {
@@ -78,6 +89,8 @@ typedef struct {
   bool acked_initialized;
   uint64_t acked_group_id;
   uint64_t acked_object_id;
+  bool finish_target;
+  bool finish_accounted;
 } transport_checkpoint_ack_state_t;
 
 struct transport_t {

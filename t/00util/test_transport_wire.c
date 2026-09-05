@@ -67,7 +67,7 @@ int main(void) {
   CHECK(qlinq_wire_decode_frame(corrupted, frame_len, sizeof(payload),
                                 &frame) == QLINQ_WIRE_INVALID,
         "unknown type rejection");
-  corrupted[3] = 14;
+  corrupted[3] = 15;
   CHECK(qlinq_wire_decode_frame(corrupted, frame_len, sizeof(payload),
                                 &frame) == QLINQ_WIRE_INVALID,
         "removed private Flexicast controls rejected");
@@ -354,6 +354,26 @@ int main(void) {
                                 QLINQ_WIRE_TRACK_END_SIZE, sizeof(payload),
                                 &frame_len) == QLINQ_WIRE_OK,
         "track completion control frame recognized");
+
+  qlinq_wire_track_abort_t track_abort = {.alias = 23};
+  CHECK(qlinq_wire_encode_track_abort(payload, sizeof(payload), &track_abort) ==
+            QLINQ_WIRE_OK,
+        "track abort encode");
+  qlinq_wire_track_abort_t decoded_abort;
+  CHECK(qlinq_wire_decode_track_abort(payload, QLINQ_WIRE_TRACK_ABORT_SIZE,
+                                      &decoded_abort) == QLINQ_WIRE_OK &&
+            decoded_abort.alias == track_abort.alias,
+        "track abort roundtrip");
+  payload[1] = 1;
+  CHECK(qlinq_wire_decode_track_abort(payload, QLINQ_WIRE_TRACK_ABORT_SIZE,
+                                      &decoded_abort) == QLINQ_WIRE_INVALID,
+        "track abort reserved bytes");
+  payload[1] = 0;
+  CHECK(qlinq_wire_encode_frame(frame_buf, sizeof(frame_buf),
+                                QLINQ_WIRE_TRACK_ABORT, payload,
+                                QLINQ_WIRE_TRACK_ABORT_SIZE, sizeof(payload),
+                                &frame_len) == QLINQ_WIRE_OK,
+        "track abort control frame recognized");
 
   qlinq_wire_track_checkpoint_t checkpoint = {
       .alias = 22,

@@ -80,8 +80,11 @@ typedef enum {
   TRANSPORT_EVENT_AUTH,          /* server received authentication token */
   TRANSPORT_EVENT_AUTH_COMPLETE, /* client received authentication response */
   TRANSPORT_EVENT_KEYFRAME_REQUEST, /* client requested a video keyframe */
-  TRANSPORT_EVENT_OBJECT_LOST       /* packet group failed FEC recovery and was
+  TRANSPORT_EVENT_OBJECT_LOST,      /* packet group failed FEC recovery and was
                                        evicted */
+  TRANSPORT_EVENT_TRACK_FINISHED,   /* receiver completed finite recovery */
+  TRANSPORT_EVENT_TRACK_DRAINED,    /* publisher's finish cohort settled */
+  TRANSPORT_EVENT_TRACK_ABORTED     /* finite stream was canceled */
 } transport_event_type_t;
 
 typedef enum {
@@ -123,7 +126,12 @@ typedef struct {
     const uint8_t *token;
     size_t token_len;
     bool success;
-  } auth;                            /* valid for auth events */
+  } auth; /* valid for auth events */
+  struct {
+    size_t peers_total;
+    size_t peers_completed;
+    size_t peers_failed;
+  } completion; /* valid for TRACK_DRAINED */
   transport_disconnect_t disconnect; /* valid for disconnected events */
 } transport_event_t;
 
@@ -320,6 +328,9 @@ bool transport_publish(transport_t *t, const moq_object_t *obj);
  * object. Receivers use the watermark to request any wholly unseen tail
  * objects. Calling this function more than once is safe. */
 bool transport_finish_track(transport_t *t, moq_track_id_t track_id);
+
+/* Cancel a publishing track and notify its current subscribers. */
+bool transport_abort_track(transport_t *t, moq_track_id_t track_id);
 
 /* subscribe to a media track (client-side) */
 bool transport_subscribe(transport_t *t, moq_track_id_t track_id);
@@ -553,11 +564,23 @@ typedef struct {
   uint64_t quic_paths_validation_failed;
 } transport_conn_stats_t;
 
+typedef struct {
+  size_t subscribers;
+  size_t group_members;
+  size_t confirmations_pending;
+  size_t confirmations_completed;
+  size_t confirmations_failed;
+  bool finishing;
+  bool drained;
+} transport_track_stats_t;
+
 /* Snapshot aggregate or per-connection observability. These functions follow
  * the same owner-thread rule as the rest of the API. */
 bool transport_get_stats(transport_t *t, transport_stats_t *stats);
 bool transport_get_conn_stats(transport_t *t, transport_conn_t *conn,
                               transport_conn_stats_t *stats);
+bool transport_get_track_stats(transport_t *t, const moq_track_id_t *track_id,
+                               transport_track_stats_t *stats);
 uint32_t transport_get_conn_id(transport_t *t, transport_conn_t *conn);
 
 /* Returns the negotiated repair semantics for this connection and track.

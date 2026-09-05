@@ -349,6 +349,12 @@ find_fec_track_state(transport_t *t, const moq_track_id_t *track_id,
   return available;
 }
 
+static bool track_uses_recovery(const moq_track_id_t *track_id) {
+  return track_id && track_id->type == MOQ_TRACK_DATA &&
+         (track_id->flags &
+          (MOQ_TRACK_FLAG_FEC_ENABLED | MOQ_TRACK_FLAG_FEC_RATELESS)) != 0;
+}
+
 static bool
 checkpoint_ack_pending(const transport_checkpoint_ack_state_t *state) {
   return state && state->sent_initialized &&
@@ -425,8 +431,7 @@ void transport_publish_checkpoint_member_added(transport_t *t,
                                                uint8_t alias) {
   if (!t || !conn || !track_id ||
       (conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) == 0 ||
-      track_id->type != MOQ_TRACK_DATA ||
-      (track_id->flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0)
+      !track_uses_recovery(track_id))
     return;
   transport_checkpoint_ack_state_t *ack = transport_checkpoint_ack(conn, alias);
   if (!ack)
@@ -461,6 +466,13 @@ void transport_publish_checkpoint_member_removed(transport_t *t,
                                                  uint8_t alias) {
   if (!t || !conn || !track_id)
     return;
+  transport_checkpoint_ack_state_t *ack = &conn->checkpoint_acks[alias];
+  transport_fec_track_state_t *track = find_fec_track_state(t, track_id, false);
+  if (track && track->finish_started && ack->finish_target &&
+      !ack->finish_accounted) {
+    ack->finish_accounted = true;
+    track->finish_failed++;
+  }
   memset(&conn->checkpoint_acks[alias], 0,
          sizeof(conn->checkpoint_acks[alias]));
   conn->checkpoint_acks[alias].retired = true;
@@ -479,8 +491,16 @@ void transport_publish_checkpoint_connection_removed(transport_t *t,
     if (!(*transport_checkpoint_ack(conn, alias)).participating)
       continue;
     moq_track_id_t track_id = subscription->track_id;
-    memset(transport_checkpoint_ack(conn, alias), 0,
-           sizeof((*transport_checkpoint_ack(conn, alias))));
+    transport_checkpoint_ack_state_t *ack = &conn->checkpoint_acks[alias];
+    transport_fec_track_state_t *track =
+        find_fec_track_state(t, &track_id, false);
+    if (track && track->finish_started && ack->finish_target &&
+        !ack->finish_accounted) {
+      ack->finish_accounted = true;
+      track->finish_failed++;
+    }
+    memset(&conn->checkpoint_acks[alias], 0,
+           sizeof(conn->checkpoint_acks[alias]));
     release_acked_checkpoints(t, &track_id);
   }
 }
@@ -516,8 +536,24 @@ bool transport_publish_checkpoint_acked(
      * window, and would make the bounded-state alarm meaningless. */
     state->oldest_unacked_sent_at_ms = transport_get_time_ms();
   }
+  transport_fec_track_state_t *track = find_fec_track_state(t, track_id, false);
+  if (track && track->finish_started && state->finish_target &&
+      !state->finish_accounted && state->acked_initialized &&
+      state->acked_group_id == track->checkpoint_group_id &&
+      state->acked_object_id >= track->last_checkpoint_object_id) {
+    state->finish_accounted = true;
+    track->finish_completed++;
+  }
   release_acked_checkpoints(t, track_id);
   return true;
+}
+
+bool transport_publish_track_terminal(transport_t *t,
+                                      const moq_track_id_t *track_id) {
+  if (!t || !track_id)
+    return false;
+  transport_fec_track_state_t *state = find_fec_track_state(t, track_id, false);
+  return state && (state->finish_started || state->aborted);
 }
 
 static bool checkpoint_cache_is_protected(transport_t *t,
@@ -683,17 +719,11 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
       (obj->size > 0 && !obj->data))
     return TRANSPORT_PUBLISH_INVALID;
 
-  size_t recipients = t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
-  for (size_t i = 0; i < recipients; i++) {
-    transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
-    if (!transport_publish_recipient_eligible(t, conn, &obj->track_id))
-      continue;
-    const track_subscription_t *sub = transport_subscriptions_find_const(
-        &conn->send_subscriptions, &obj->track_id);
-    if (sub && sub->track_id.flags != obj->track_id.flags)
-      return TRANSPORT_PUBLISH_INVALID;
-  }
-  size_t fec_limit = publication_fec_limit(t, &obj->track_id);
+  transport_fec_track_state_t *existing_state =
+      find_fec_track_state(t, &obj->track_id, false);
+  if (existing_state &&
+      (existing_state->finish_started || existing_state->aborted))
+    return TRANSPORT_PUBLISH_INVALID;
 
   /* route to grouping buffer if it's data and we're not flushing */
   if (obj->track_id.type == MOQ_TRACK_DATA && !t->fec_in_flush) {
@@ -1013,8 +1043,7 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
 
 bool transport_finish_track(transport_t *t, moq_track_id_t track_id) {
   if (!transport_owner_ok(t) || !transport_track_id_valid(&track_id) ||
-      track_id.type != MOQ_TRACK_DATA ||
-      (track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0)
+      !track_uses_recovery(&track_id))
     return false;
 
   uint64_t final_object_id = 0;
@@ -1022,12 +1051,20 @@ bool transport_finish_track(transport_t *t, moq_track_id_t track_id) {
   if (!transport_publish_finish_grouped(t, &track_id, &final_object_id,
                                         &has_objects))
     return false;
-  if (!has_objects)
+  transport_fec_track_state_t *state = find_fec_track_state(t, &track_id, true);
+  if (!state || state->aborted)
+    return false;
+  if (state->finish_started)
     return true;
+  state->finish_started = true;
+  state->drain_emitted = false;
+  state->finish_targets = 0;
+  state->finish_completed = 0;
+  state->finish_failed = 0;
+  if (!has_objects)
+    final_object_id = UINT64_MAX;
 
   size_t active_count = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
-  bool found = false;
-  bool succeeded = true;
   for (size_t i = 0; i < active_count; i++) {
     transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
     if (!conn || !conn->quic || !conn->protocol_ready || !conn->authenticated ||
@@ -1041,7 +1078,7 @@ bool transport_finish_track(transport_t *t, moq_track_id_t track_id) {
     if ((conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) != 0 &&
         conn->checkpoint_acks[alias].retired)
       continue;
-    found = true;
+    state->finish_targets++;
     if (transport_stream_write_track_end_frame(conn->stream, alias, 0,
                                                final_object_id)) {
       t->stats.track_ends_sent++;
@@ -1051,17 +1088,103 @@ bool transport_finish_track(transport_t *t, moq_track_id_t track_id) {
           transport_publish_checkpoint_member_added(t, conn, &track_id, alias);
         transport_checkpoint_ack_state_t *ack = &conn->checkpoint_acks[alias];
         checkpoint_mark_sent(ack, 0, final_object_id);
+        ack->finish_target = true;
+        ack->finish_accounted = false;
+      } else {
+        state->finish_failed++;
       }
     } else {
-      succeeded = false;
+      state->finish_failed++;
     }
   }
-  transport_fec_track_state_t *state =
-      find_fec_track_state(t, &track_id, false);
-  if (state) {
-    state->checkpoint_initialized = true;
-    state->checkpoint_group_id = 0;
-    state->last_checkpoint_object_id = final_object_id;
+  state->checkpoint_initialized = true;
+  state->checkpoint_group_id = 0;
+  state->last_checkpoint_object_id = final_object_id;
+  return true;
+}
+
+bool transport_abort_track(transport_t *t, moq_track_id_t track_id) {
+  if (!transport_owner_ok(t) || !transport_track_id_valid(&track_id))
+    return false;
+  transport_fec_track_state_t *state = find_fec_track_state(t, &track_id, true);
+  if (!state)
+    return false;
+  if (state->aborted)
+    return true;
+  state->aborted = true;
+  state->finish_started = false;
+  state->drain_emitted = true;
+
+  size_t active_count = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
+  for (size_t i = 0; i < active_count; i++) {
+    transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
+    uint8_t alias = 0;
+    if (!conn || !conn->quic || !conn->protocol_ready || !conn->authenticated ||
+        !conn->stream || !quicly_sendstate_is_open(&conn->stream->sendstate) ||
+        transport_subscriptions_find_alias(&conn->subscriptions, &track_id,
+                                           &alias) != 0)
+      continue;
+    (void)transport_stream_write_track_abort_frame(conn->stream, alias);
   }
-  return !found || succeeded;
+
+  if (t->fec_buf_len != 0 &&
+      transport_track_id_equal(&t->fec_track_id, &track_id)) {
+    t->fec_buf_len = 0;
+    t->fec_pkt_count = 0;
+    t->fec_first_pkt_time = 0;
+  }
+  (void)transport_sent_cache_release_track(&t->sent_cache, &track_id);
+  (void)transport_flexicast_cancel_track_repairs(t, &track_id);
+  return true;
+}
+
+void transport_publish_poll_lifecycle(transport_t *t) {
+  if (!t)
+    return;
+  for (size_t i = 0; i < TRANSPORT_HARD_MAX_SUBSCRIPTIONS; i++) {
+    transport_fec_track_state_t *state = &t->fec_tracks[i];
+    if (!state->active || state->aborted || !state->finish_started ||
+        state->drain_emitted ||
+        state->finish_completed + state->finish_failed < state->finish_targets)
+      continue;
+    state->drain_emitted = true;
+    transport_event_t event = {
+        .type = TRANSPORT_EVENT_TRACK_DRAINED,
+        .track_id = state->track_id,
+        .completion = {.peers_total = state->finish_targets,
+                       .peers_completed = state->finish_completed,
+                       .peers_failed = state->finish_failed}};
+    transport_emit_event(t, &event);
+  }
+}
+
+bool transport_get_track_stats(transport_t *t, const moq_track_id_t *track_id,
+                               transport_track_stats_t *stats) {
+  if (!transport_owner_ok(t) || !transport_track_id_valid(track_id) || !stats)
+    return false;
+  memset(stats, 0, sizeof(*stats));
+  size_t active_count = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
+  for (size_t i = 0; i < active_count; i++) {
+    transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
+    if (conn &&
+        transport_subscriptions_contains(&conn->subscriptions, track_id))
+      stats->subscribers++;
+  }
+  for (size_t i = 0; i < t->flexicast.capacity; i++) {
+    transport_flexicast_flow_t *flow = &t->flexicast.flows[i];
+    if (flow->active && flow->source &&
+        transport_track_id_equal(&flow->track_id, track_id))
+      stats->group_members += transport_flexicast_listening_members(flow);
+  }
+  transport_fec_track_state_t *state = find_fec_track_state(t, track_id, false);
+  if (state) {
+    stats->finishing = state->finish_started && !state->drain_emitted;
+    stats->drained = state->drain_emitted;
+    stats->confirmations_completed = state->finish_completed;
+    stats->confirmations_failed = state->finish_failed;
+    size_t settled = state->finish_completed + state->finish_failed;
+    stats->confirmations_pending =
+        state->finish_targets > settled ? state->finish_targets - settled : 0;
+  }
+  return true;
 }

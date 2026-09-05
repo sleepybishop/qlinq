@@ -47,8 +47,7 @@ This produces three main binaries and an embeddable transport library:
 - `qlinq-app`: A direct `transport.h` send/receive and mesh test tool; it does
   not use the daemon's Unix data socket.
 - `qlinq-tund`: The lightweight virtual TUN/TAP interface controller.
-- `libqlinq.a`: The in-process transport API used by `qlinq-app`; applications
-  link this instead of traversing the daemon data socket.
+- `libqlinq.a`: The in-process library.
 
 For example, start a rateless Flexicast sender using the adaptive controller:
 

@@ -74,9 +74,8 @@ NANORQ_OBJS = $(NANORQ_SRCS:.c=.o)
 PATHFLOW_OBJS = $(PATHFLOW_SRCS:.c=.o)
 IFMON_OBJS = $(IFMON_SRCS:.c=.o)
 
-TRANSPORT_OBJS = src/common/qlinq.o \
-              src/common/cli_parse.o \
-              src/common/transport_config.o \
+TRANSPORT_OBJS = src/common/transport_config.o \
+              src/common/qlinq.o \
               src/common/transport_egress.o \
               src/common/transport_fec_state.o \
               src/common/transport_flexicast.o \
@@ -209,6 +208,9 @@ t/00util/test_transport_wire: t/00util/test_transport_wire.o src/common/transpor
 t/00util/test_transport_components: t/00util/test_transport_components.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_transport_components.o $(COMMON_OBJS) $(LDFLAGS)
 
+t/00util/test_qlinq_api: t/00util/test_qlinq_api.o $(COMMON_OBJS)
+	$(CC) -o $@ t/00util/test_qlinq_api.o $(COMMON_OBJS) $(LDFLAGS)
+
 t/00util/fuzz_transport_wire: t/00util/fuzz_transport_wire.c src/common/transport_wire.c
 	clang $(CFLAGS_COMMON) $(INCLUDES) -fsanitize=fuzzer,address,undefined \
 		-o $@ t/00util/fuzz_transport_wire.c src/common/transport_wire.c
@@ -292,7 +294,7 @@ check: all $(CHECK_BINARIES) gencerts
 	prove -I. -v t/*.t
 
 clean: 
-	rm -f qlinqd qlinq-app qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_flexicast_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/fuzz_transport_wire t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
+	rm -f qlinqd qlinq-app qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_flexicast_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_qlinq_api t/00util/fuzz_transport_wire t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete
 	rm -f $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \
@@ -300,7 +302,7 @@ clean:
 		deps/nanors/deps/obl/oblas_common.d \
 		deps/nanors/deps/obl/oblas_lite.d
 
-check: qlinqd qlinq-app qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_flexicast_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls gencerts
+check: qlinqd qlinq-app qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_flexicast_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_qlinq_api t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls gencerts
 	prove -I. -v t/*.t
 
 # Optional Linux integration suite. It uses root/CAP_NET_ADMIN or an
