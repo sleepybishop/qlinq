@@ -1202,6 +1202,18 @@ static uint64_t mix_repair_feedback(uint64_t value) {
   return value ^ (value >> 31);
 }
 
+uint64_t transport_multicast_nack_retry_backoff_ms(uint16_t attempt) {
+  if (attempt == 0)
+    return 0;
+  unsigned shift = attempt - 1U;
+  if (shift > 3U)
+    shift = 3U;
+  uint64_t delay = QLINQ_FEC_MULTICAST_NACK_RETRY_BASE_MS << shift;
+  return delay < QLINQ_FEC_MULTICAST_NACK_RETRY_MAX_MS
+             ? delay
+             : QLINQ_FEC_MULTICAST_NACK_RETRY_MAX_MS;
+}
+
 /* Flexicast receivers cannot overhear one another's encrypted control streams.
  * Spread their requests long enough for the first shared repair datagram to
  * suppress most of the cohort, while keeping ordinary unicast recovery at the
@@ -1209,17 +1221,28 @@ static uint64_t mix_repair_feedback(uint64_t value) {
 static int64_t repair_feedback_delay_ms(const transport_conn_t *conn,
                                         bool shared_delivery, uint8_t alias,
                                         uint64_t group_id, uint64_t object_id,
-                                        uint16_t attempt) {
+                                        uint16_t salt,
+                                        uint16_t retry_attempt) {
   if (!shared_delivery)
     return QLINQ_FEC_NACK_DELAY_MS;
   uint64_t value = conn->transport->repair_feedback_nonce;
   value ^= group_id + UINT64_C(0x9e3779b97f4a7c15);
   value ^= object_id * UINT64_C(0xd6e8feb86659fd93);
   value ^= (uint64_t)alias << 48;
-  value ^= (uint64_t)attempt * UINT64_C(0xa0761d6478bd642f);
+  value ^= (uint64_t)salt * UINT64_C(0xa0761d6478bd642f);
   uint64_t span =
       QLINQ_FEC_MULTICAST_NACK_BACKOFF_MAX_MS - QLINQ_FEC_NACK_DELAY_MS + 1U;
-  return QLINQ_FEC_NACK_DELAY_MS + (int64_t)(mix_repair_feedback(value) % span);
+  uint64_t delay =
+      QLINQ_FEC_NACK_DELAY_MS + (mix_repair_feedback(value) % span);
+  if (retry_attempt != 0) {
+    /* The first request remains prompt and independently randomized. Once a
+     * receiver has asked for shared repair, give multicast repair time to
+     * arrive before sending another encrypted unicast request. Without this
+     * retry backoff, every incomplete assembler can consume its full NACK
+     * allowance even though the source is already serving the cohort. */
+    delay += transport_multicast_nack_retry_backoff_ms(retry_attempt);
+  }
+  return delay > INT64_MAX ? INT64_MAX : (int64_t)delay;
 }
 
 void transport_tick(transport_t *t) {
@@ -1284,27 +1307,54 @@ void transport_tick(transport_t *t) {
     for (size_t alias = 0; alias <= UINT8_MAX && object_nack_budget > 0;
          alias++) {
       transport_object_gap_state_t *gap = &conn->object_gaps[alias];
+      moq_track_id_t feedback_track;
+      bool shared_rateless_feedback =
+          gap->shared_delivery &&
+          transport_subscriptions_find_by_alias(
+              &conn->subscriptions, (uint8_t)alias, &feedback_track) == 0 &&
+          transport_get_effective_repair_mode(t, conn, &feedback_track) ==
+              TRANSPORT_REPAIR_MODE_RATELESS;
       if (gap->pending_mask != 0) {
         for (uint32_t bit = 0; bit < 32 && object_nack_budget > 0; bit++) {
-          if ((gap->pending_mask & (1U << bit)) == 0)
+          uint32_t bit_mask = 1U << bit;
+          if ((gap->pending_mask & bit_mask) == 0 ||
+              (shared_rateless_feedback &&
+               (gap->requested_mask & bit_mask) != 0))
             continue;
           uint64_t object_id = gap->pending_base + bit;
+          uint16_t feedback_salt =
+              shared_rateless_feedback ? (uint16_t)bit : 0;
+          uint16_t retry_attempt =
+              shared_rateless_feedback ? gap->nack_attempt : 0;
           if (now_nack_ms - gap->detected_at_ms <
               repair_feedback_delay_ms(conn, gap->shared_delivery,
                                        (uint8_t)alias, gap->group_id, object_id,
-                                       0))
+                                       feedback_salt, retry_attempt))
             continue;
           if (transport_protocol_send_nack(conn, (uint8_t)alias, gap->group_id,
                                            object_id, NULL, 0, true)) {
             /* Keep the object pending until a shared repair symbol arrives.
              * The source-wide failsafe may defer an otherwise valid request,
              * and NACK control streams do not acknowledge repair admission. */
-            gap->detected_at_ms = now_nack_ms;
+            if (shared_rateless_feedback)
+              gap->requested_mask |= bit_mask;
+            else
+              gap->detected_at_ms = now_nack_ms;
             object_nack_budget--;
             t->recovery_conn_cursor = (c + 1U) % active_conns;
           } else {
             break;
           }
+        }
+        if (shared_rateless_feedback && gap->pending_mask != 0 &&
+            (gap->requested_mask & gap->pending_mask) == gap->pending_mask) {
+          /* Back off only after every object still missing has received one
+           * request in this round. A single counter must not make first-time
+           * requests for later objects look like retries of the first one. */
+          gap->requested_mask = 0;
+          gap->detected_at_ms = now_nack_ms;
+          if (gap->nack_attempt != UINT16_MAX)
+            gap->nack_attempt++;
         }
       }
 
@@ -1319,7 +1369,10 @@ void transport_tick(transport_t *t) {
              attempt++) {
           uint32_t bit =
               (window->cursor + attempt) % QLINQ_RECOVERY_WINDOW_OBJECTS;
-          if ((window->missing_mask & (1U << bit)) == 0)
+          uint32_t bit_mask = 1U << bit;
+          if ((window->missing_mask & bit_mask) == 0 ||
+              (shared_rateless_feedback &&
+               (window->requested_mask & bit_mask) != 0))
             continue;
           uint64_t object_id = window->first_object_id + bit;
           if (object_id > window->final_object_id)
@@ -1328,7 +1381,8 @@ void transport_tick(transport_t *t) {
           if (gap->shared_delivery)
             recovery_delay += repair_feedback_delay_ms(
                 conn, true, (uint8_t)alias, window->group_id, object_id,
-                window->cursor);
+                shared_rateless_feedback ? (uint16_t)bit : window->cursor,
+                shared_rateless_feedback ? window->nack_attempt : 0);
           if (now_nack_ms - window->last_request_ms < recovery_delay)
             continue;
           bool assembling = false;
@@ -1353,11 +1407,23 @@ void transport_tick(transport_t *t) {
                                            true)) {
             window->cursor =
                 (uint8_t)((bit + 1U) % QLINQ_RECOVERY_WINDOW_OBJECTS);
-            window->last_request_ms = now_nack_ms;
+            if (shared_rateless_feedback)
+              window->requested_mask |= bit_mask;
+            else
+              window->last_request_ms = now_nack_ms;
             object_nack_budget--;
             t->recovery_conn_cursor = (c + 1U) % active_conns;
           }
-          break;
+          if (!shared_rateless_feedback)
+            break;
+        }
+        if (shared_rateless_feedback && window->missing_mask != 0 &&
+            (window->requested_mask & window->missing_mask) ==
+                window->missing_mask) {
+          window->requested_mask = 0;
+          window->last_request_ms = now_nack_ms;
+          if (window->nack_attempt != UINT16_MAX)
+            window->nack_attempt++;
         }
       }
     }
@@ -1367,26 +1433,50 @@ void transport_tick(transport_t *t) {
       if (asm_slot->total_symbols == 0)
         continue;
 
-      if (!asm_slot->decoded &&
-          now_nack_ms - asm_slot->first_symbol_time_ms >=
+      if (now_nack_ms - asm_slot->last_activity_time_ms >=
+          QLINQ_FEC_ASSEMBLER_TIMEOUT_MS) {
+        moq_track_id_t resolved_track;
+        if (transport_subscriptions_find_by_alias(&conn->subscriptions,
+                                                  asm_slot->track_id,
+                                                  &resolved_track) == 0) {
+          transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT_LOST,
+                                  .conn = conn,
+                                  .track_id = resolved_track,
+                                  .object = {.track_id = resolved_track,
+                                             .group_id = asm_slot->group_id,
+                                             .object_id = asm_slot->object_id}};
+          t->stats.fec_objects_lost++;
+          transport_emit_event(t, &ev);
+        }
+        transport_release_assembler(t, asm_slot);
+        continue;
+      }
+
+      if (asm_slot->decoded)
+        continue;
+      moq_track_id_t resolved_track;
+      if (transport_subscriptions_find_by_alias(&conn->subscriptions,
+                                                asm_slot->track_id,
+                                                &resolved_track) != 0 ||
+          !(resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS))
+        continue; /* Fixed RS-FEC does not send NACKs */
+      transport_repair_mode_t repair_mode =
+          transport_get_effective_repair_mode(t, conn, &resolved_track);
+      uint16_t retry_attempt =
+          repair_mode == TRANSPORT_REPAIR_MODE_RATELESS ? asm_slot->nack_attempt
+                                                        : 0;
+      if (now_nack_ms - asm_slot->first_symbol_time_ms >=
               repair_feedback_delay_ms(conn, asm_slot->shared_delivery,
                                        asm_slot->track_id, asm_slot->group_id,
                                        asm_slot->object_id,
-                                       asm_slot->nack_attempt) &&
+                                       asm_slot->nack_attempt, retry_attempt) &&
           (!asm_slot->nack_sent ||
            now_nack_ms - asm_slot->last_nack_time_ms >=
                repair_feedback_delay_ms(conn, asm_slot->shared_delivery,
                                         asm_slot->track_id, asm_slot->group_id,
                                         asm_slot->object_id,
-                                        asm_slot->nack_attempt))) {
-        moq_track_id_t resolved_track;
-        if (transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
-                                                  asm_slot->track_id,
-                                                  &resolved_track) != 0 ||
-            !(resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS))
-          continue; /* Fixed RS-FEC does not send NACKs */
-        transport_repair_mode_t repair_mode =
-            transport_get_effective_repair_mode(t, conn, &resolved_track);
+                                        asm_slot->nack_attempt,
+                                        retry_attempt))) {
         uint16_t missing_count = 0;
         const uint16_t *missing = NULL;
         if (repair_mode == TRANSPORT_REPAIR_MODE_RATELESS) {

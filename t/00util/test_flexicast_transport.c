@@ -81,6 +81,63 @@ static void configure_adaptive_controller(transport_config_t *config,
   config->flexicast_cc_feedback_timeout_ms = 100;
 }
 
+static void dump_recovery_state(const char *label, transport_t *transport,
+                                const moq_track_id_t *track) {
+  transport_conn_t *conn = transport ? transport->client_conn : NULL;
+  uint8_t alias = 0;
+  if (!conn ||
+      transport_subscriptions_find_alias(&conn->subscriptions, track, &alias) !=
+          0) {
+    fprintf(stderr, "%s recovery state unavailable\n", label);
+    return;
+  }
+  transport_object_gap_state_t *gap = &conn->object_gaps[alias];
+  fprintf(stderr,
+          "%s recovery alias=%u pending=%08" PRIx32
+          " requested=%08" PRIx32 " attempt=%u checkpoint=%d last=%" PRIu64
+          " finish=%d emitted=%d\n",
+          label, alias, gap->pending_mask, gap->requested_mask,
+          gap->nack_attempt, gap->checkpoint_initialized,
+          gap->last_checkpoint_object_id, gap->finish_pending,
+          gap->finish_emitted);
+  for (size_t i = 0; i < QLINQ_RECOVERY_MAX_WINDOWS; i++) {
+    transport_recovery_window_t *window = &gap->recovery_windows[i];
+    if (!window->active)
+      continue;
+    fprintf(stderr,
+            "%s window=%zu objects=%" PRIu64 "-%" PRIu64
+            " missing=%08" PRIx32 " requested=%08" PRIx32
+            " attempt=%u age=%" PRId64 "\n",
+            label, i, window->first_object_id, window->final_object_id,
+            window->missing_mask, window->requested_mask,
+            window->nack_attempt,
+            transport_get_time_ms() - window->last_request_ms);
+  }
+}
+
+static void dump_source_recovery_state(transport_t *transport,
+                                       const moq_track_id_t *track) {
+  size_t cached = 0;
+  for (size_t i = 0; i < TRANSPORT_SENT_CACHE_SIZE; i++)
+    cached += transport->sent_cache.entries[i].data != NULL;
+  fprintf(stderr, "source recovery cached=%zu connections=%zu\n", cached,
+          transport->conn_count);
+  for (size_t i = 0; i < transport->conn_count; i++) {
+    transport_conn_t *conn = transport->conns[i];
+    uint8_t alias = 0;
+    if (!conn || transport_subscriptions_find_alias(&conn->subscriptions,
+                                                    track, &alias) != 0)
+      continue;
+    transport_checkpoint_ack_state_t *ack = &conn->checkpoint_acks[alias];
+    fprintf(stderr,
+            "source member=%u alias=%u participating=%d sent=%d:%" PRIu64
+            " acked=%d:%" PRIu64 " finish=%d/%d\n",
+            conn->id, alias, ack->participating, ack->sent_initialized,
+            ack->sent_object_id, ack->acked_initialized, ack->acked_object_id,
+            ack->finish_target, ack->finish_accounted);
+  }
+}
+
 static bool parse_u16(const char *value, uint16_t *parsed) {
   char *end = NULL;
   unsigned long number = strtoul(value, &end, 10);
@@ -1255,7 +1312,11 @@ int main(int argc, char **argv) {
       fprintf(stderr, "shared repair completion failed\n");
       goto Fail;
     }
-    retries = 2000;
+    /* Recovery remains live after the usual few seconds, but an unlucky
+     * sequence of lost shared repairs can exceed the old 10-second fixture
+     * deadline. Keep the assertion bounded without turning that tail into a
+     * false state-machine failure. */
+    retries = 4000;
     while (retries-- > 0 && (client_a_state.objects_received < 10 ||
                              client_b_state.objects_received < 10)) {
       drive(server, client_a, client_b);
@@ -1306,6 +1367,9 @@ int main(int argc, char **argv) {
               source_stats.repair_indexed_requests_received,
               source_stats.repair_rateless_requests_received,
               source_stats.repair_rateless_symbols_sent);
+      dump_recovery_state("client-a", client_a, &track);
+      dump_recovery_state("client-b", client_b, &track);
+      dump_source_recovery_state(server, &track);
       goto Fail;
     }
     printf(indexed_repair ? "===FLEXICAST INDEXED REPAIR OK===\n"

@@ -24,6 +24,8 @@
 #define QLINQ_FEC_ASSEMBLER_TIMEOUT_MS 2000
 #define QLINQ_FEC_NACK_DELAY_MS 25
 #define QLINQ_FEC_MULTICAST_NACK_BACKOFF_MAX_MS 250
+#define QLINQ_FEC_MULTICAST_NACK_RETRY_BASE_MS 500
+#define QLINQ_FEC_MULTICAST_NACK_RETRY_MAX_MS 1000
 #define QLINQ_FEC_REPAIR_SUPPRESSION_MS 250
 #define QLINQ_FEC_COMPLETION_RETRY_MS 500
 #define QLINQ_RECOVERY_WINDOW_OBJECTS 32U
@@ -38,17 +40,23 @@ typedef struct {
   uint64_t first_object_id;
   uint64_t final_object_id;
   uint32_t missing_mask;
+  uint32_t requested_mask;
   uint8_t cursor;
+  uint16_t nack_attempt;
   int64_t last_request_ms;
 } transport_recovery_window_t;
+
+uint64_t transport_multicast_nack_retry_backoff_ms(uint16_t attempt);
 
 typedef struct {
   uint64_t last_seen;
   bool seen_initialized;
   uint64_t pending_base;
   uint32_t pending_mask;
+  uint32_t requested_mask;
   uint64_t group_id;
   int64_t detected_at_ms;
+  uint16_t nack_attempt;
   uint64_t largest_delivered;
   uint64_t delivered_mask[QLINQ_RECOVERY_HISTORY_OBJECTS / 64U];
   bool delivered_initialized;

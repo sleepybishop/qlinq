@@ -351,6 +351,8 @@ static void recovery_mark_delivered(transport_conn_t *conn, uint8_t alias,
       continue;
     window->missing_mask &=
         ~(1U << (uint32_t)(object_id - window->first_object_id));
+    window->requested_mask &=
+        ~(1U << (uint32_t)(object_id - window->first_object_id));
   }
   if ((conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) != 0) {
     (void)acknowledge_completed_recovery_windows(conn, alias);
@@ -373,6 +375,8 @@ static bool queue_missing_objects(transport_object_gap_state_t *state,
   if (state->pending_mask == 0) {
     state->pending_base = first_missing;
     state->detected_at_ms = transport_get_time_ms();
+    state->requested_mask = 0;
+    state->nack_attempt = 0;
     state->group_id = group_id;
   }
   if (first_missing < state->pending_base ||
@@ -1354,6 +1358,11 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
     } else if (gap->pending_mask != 0 && object_id >= gap->pending_base &&
                object_id - gap->pending_base < 32) {
       gap->pending_mask &= ~(1U << (object_id - gap->pending_base));
+      gap->requested_mask &= ~(1U << (object_id - gap->pending_base));
+      if (gap->pending_mask == 0) {
+        gap->requested_mask = 0;
+        gap->nack_attempt = 0;
+      }
     }
   }
 
