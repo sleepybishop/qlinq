@@ -1446,7 +1446,19 @@ recovery_sweep_done:
   if (t->ifmon_pipe[0] >= 0) {
     ifmon_pipe_msg_t msg;
     while (read(t->ifmon_pipe[0], &msg, sizeof(msg)) == sizeof(msg)) {
+      uint8_t flexicast_ip_version = msg.addr.ss_family == AF_INET    ? 4U
+                                     : msg.addr.ss_family == AF_INET6 ? 6U
+                                                                      : 0U;
+      const uint8_t *flexicast_address =
+          msg.addr.ss_family == AF_INET
+              ? (const uint8_t *)&((struct sockaddr_in *)&msg.addr)->sin_addr
+          : msg.addr.ss_family == AF_INET6
+              ? (const uint8_t *)&((struct sockaddr_in6 *)&msg.addr)->sin6_addr
+              : NULL;
       if (msg.is_added) {
+        if (flexicast_address)
+          transport_flexicast_interface_added(t, flexicast_ip_version,
+                                              flexicast_address, msg.index);
         if (!path_interface_allowed(t, msg.name))
           continue;
         if (t->num_fds < TRANSPORT_MAX_PATHS) {
@@ -1560,6 +1572,12 @@ recovery_sweep_done:
         }
       } else {
         /* ip removed */
+        if (flexicast_address) {
+          transport_flexicast_interface_removed(t, flexicast_ip_version,
+                                                flexicast_address, msg.index);
+        } else if (msg.addr.ss_family == AF_UNSPEC) {
+          transport_flexicast_interface_removed(t, 0, NULL, msg.index);
+        }
         for (size_t i = 0; i < t->num_fds; i++) {
           int match = msg.addr.ss_family == AF_UNSPEC
                           ? t->local_ifindices[i] == msg.index

@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <openssl/crypto.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -71,6 +72,8 @@ struct qlinq_context {
   size_t queued_event_bytes;
   size_t max_queued_events;
   size_t max_queued_event_bytes;
+  qlinq_log_callback_t log_callback;
+  void *log_user_data;
   qlinq_status_t last_status;
 };
 
@@ -134,18 +137,42 @@ static void set_status(qlinq_context_t *context, qlinq_status_t status) {
     context->last_status = status;
 }
 
+static void on_transport_log(void *user_data,
+                             const transport_log_event_t *source) {
+  qlinq_endpoint_t *endpoint = user_data;
+  if (!endpoint || !source || !endpoint->context ||
+      !endpoint->context->log_callback)
+    return;
+  qlinq_log_event_t event = {.level = (qlinq_log_level_t)source->level,
+                             .component = source->component,
+                             .peer_id = source->connection_id,
+                             .path_index = source->path_index,
+                             .message = source->message};
+  endpoint->context->log_callback(endpoint->context->log_user_data, &event);
+}
+
 static bool queue_event(qlinq_context_t *context, const qlinq_event_t *source,
                         const void *payload, size_t payload_size,
                         const char *message) {
-  size_t message_size = message ? strlen(message) + 1U : 0U;
+  size_t message_size = 0;
+  if (message) {
+    size_t message_length = strlen(message);
+    if (message_length == SIZE_MAX) {
+      set_status(context, QLINQ_STATUS_INVALID);
+      return false;
+    }
+    message_size = message_length + 1U;
+  }
   if (!context || !source ||
-      payload_size > SIZE_MAX - message_size - sizeof(qlinq_event_node_t)) {
+      payload_size > SIZE_MAX - sizeof(qlinq_event_node_t) ||
+      message_size > SIZE_MAX - sizeof(qlinq_event_node_t) - payload_size) {
     set_status(context, QLINQ_STATUS_INVALID);
     return false;
   }
   size_t allocation_size =
       sizeof(qlinq_event_node_t) + payload_size + message_size;
   if (context->queued_events >= context->max_queued_events ||
+      context->queued_event_bytes > context->max_queued_event_bytes ||
       allocation_size >
           context->max_queued_event_bytes - context->queued_event_bytes) {
     set_status(context, QLINQ_STATUS_RESOURCE_LIMIT);
@@ -161,6 +188,8 @@ static bool queue_event(qlinq_context_t *context, const qlinq_event_t *source,
   node->event = *source;
   node->event._private = node;
   node->event.record.data = NULL;
+  node->event.message = NULL;
+  node->event.disconnect.reason = NULL;
   uint8_t *cursor = node->storage;
   if (payload_size != 0) {
     memcpy(cursor, payload, payload_size);
@@ -170,6 +199,8 @@ static bool queue_event(qlinq_context_t *context, const qlinq_event_t *source,
   if (message_size != 0) {
     memcpy(cursor, message, message_size);
     node->event.message = (const char *)cursor;
+    if (node->event.type == QLINQ_EVENT_PEER_DISCONNECTED)
+      node->event.disconnect.reason = (const char *)cursor;
   }
 
   if (context->event_tail)
@@ -450,11 +481,23 @@ static void on_transport_event(void *user_data,
     }
     break;
   case TRANSPORT_EVENT_DISCONNECTED: {
-    qlinq_event_t event = {.type = QLINQ_EVENT_PEER_DISCONNECTED,
-                           .endpoint = endpoint,
-                           .peer_id = peer_id(endpoint, source->conn),
-                           .status = QLINQ_STATUS_OK};
-    (void)queue_event(endpoint->context, &event, NULL, 0, NULL);
+    qlinq_event_t event = {
+        .type = QLINQ_EVENT_PEER_DISCONNECTED,
+        .endpoint = endpoint,
+        .peer_id = peer_id(endpoint, source->conn),
+        .disconnect = {.error_code = source->disconnect.error_code,
+                       .raw_error = source->disconnect.raw_error,
+                       .application_error =
+                           source->disconnect.application_error,
+                       .offending_frame_type =
+                           source->disconnect.offending_frame_type,
+                       .remote = source->disconnect.remote},
+        .status = QLINQ_STATUS_OK};
+    const char *reason =
+        source->disconnect.reason && source->disconnect.reason[0] != '\0'
+            ? source->disconnect.reason
+            : "unspecified";
+    (void)queue_event(endpoint->context, &event, NULL, 0, reason);
     remove_peer(endpoint, source->conn);
     break;
   }
@@ -624,6 +667,10 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
         config->remote_addresses[i];
   transport_config.port = config->port;
   transport_config.quic_idle_timeout_ms = config->idle_timeout_ms;
+  transport_config.reconnect_enabled = config->reconnect_enabled;
+  transport_config.reconnect_initial_delay_ms =
+      config->reconnect_initial_delay_ms;
+  transport_config.reconnect_max_delay_ms = config->reconnect_max_delay_ms;
   transport_config.cert_file = config->security.certificate_file;
   transport_config.key_file = config->security.private_key_file;
   transport_config.ca_file = config->security.trust_store_file;
@@ -654,9 +701,13 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
   map_limits(&config->limits, &transport_config.limits);
   transport_config.callback = on_transport_event;
   transport_config.user_data = endpoint;
+  transport_config.log_callback = on_transport_log;
+  transport_config.log_user_data = endpoint;
 
   endpoint->transport = transport_create(&transport_config);
   if (!endpoint->transport) {
+    if (endpoint->shared_secret)
+      OPENSSL_cleanse(endpoint->shared_secret, endpoint->shared_secret_size);
     free(endpoint->shared_secret);
     free(endpoint);
     set_status(context, QLINQ_STATUS_IO);
@@ -679,6 +730,8 @@ qlinq_context_t *qlinq_context_create(const qlinq_context_config_t *config) {
       config && config->max_queued_event_bytes != 0
           ? config->max_queued_event_bytes
           : QLINQ_DEFAULT_EVENT_BYTES;
+  context->log_callback = config ? config->log_callback : NULL;
+  context->log_user_data = config ? config->log_user_data : NULL;
   if (context->max_queued_events == 0 ||
       context->max_queued_event_bytes < sizeof(qlinq_event_node_t) ||
       portable_socket_init() != 0) {
@@ -702,7 +755,10 @@ static void free_endpoint(qlinq_endpoint_t *endpoint) {
     endpoint->peers = peer->next;
     free(peer);
   }
-  free(endpoint->shared_secret);
+  if (endpoint->shared_secret) {
+    OPENSSL_cleanse(endpoint->shared_secret, endpoint->shared_secret_size);
+    free(endpoint->shared_secret);
+  }
   free(endpoint);
 }
 
@@ -731,6 +787,38 @@ qlinq_endpoint_t *qlinq_listen(qlinq_context_t *context,
 qlinq_endpoint_t *qlinq_connect(qlinq_context_t *context,
                                 const qlinq_endpoint_config_t *config) {
   return open_endpoint(context, config, false);
+}
+
+qlinq_status_t qlinq_endpoint_shutdown(qlinq_endpoint_t *endpoint,
+                                       const char *reason) {
+  if (!endpoint || !endpoint->active || !endpoint->transport)
+    return QLINQ_STATUS_STATE;
+  transport_shutdown(endpoint->transport, reason);
+  set_status(endpoint->context, QLINQ_STATUS_OK);
+  return QLINQ_STATUS_OK;
+}
+
+bool qlinq_endpoint_is_drained(qlinq_endpoint_t *endpoint) {
+  return endpoint && endpoint->active && endpoint->transport &&
+         transport_is_drained(endpoint->transport);
+}
+
+qlinq_status_t qlinq_endpoint_reload_credentials(qlinq_endpoint_t *endpoint,
+                                                 const char *certificate_file,
+                                                 const char *private_key_file) {
+  if (!endpoint || !endpoint->active || !endpoint->transport ||
+      !certificate_file || !private_key_file) {
+    if (endpoint)
+      set_status(endpoint->context, QLINQ_STATUS_INVALID);
+    return QLINQ_STATUS_INVALID;
+  }
+  if (!transport_reload_credentials(endpoint->transport, certificate_file,
+                                    private_key_file)) {
+    set_status(endpoint->context, QLINQ_STATUS_IO);
+    return QLINQ_STATUS_IO;
+  }
+  set_status(endpoint->context, QLINQ_STATUS_OK);
+  return QLINQ_STATUS_OK;
 }
 
 void qlinq_endpoint_close(qlinq_endpoint_t *endpoint) {
@@ -1013,6 +1101,12 @@ qlinq_status_t qlinq_service(qlinq_context_t *context, int timeout_ms) {
     return QLINQ_STATUS_STATE;
   }
 
+  if (endpoint_count > SIZE_MAX / (TRANSPORT_MAX_PATHS + 2U) ||
+      endpoint_count * (TRANSPORT_MAX_PATHS + 2U) >
+          SIZE_MAX / sizeof(struct pollfd)) {
+    set_status(context, QLINQ_STATUS_RESOURCE_LIMIT);
+    return QLINQ_STATUS_RESOURCE_LIMIT;
+  }
   size_t capacity = endpoint_count * (TRANSPORT_MAX_PATHS + 2U);
   struct pollfd *fds = calloc(capacity, sizeof(*fds));
   if (!fds) {
@@ -1094,17 +1188,42 @@ bool qlinq_endpoint_get_stats(qlinq_endpoint_t *endpoint,
       .connections_accepted = transport_stats.connections_accepted,
       .connections_rejected = transport_stats.connections_rejected,
       .connections_closed = transport_stats.connections_closed,
+      .reconnect_attempts = transport_stats.reconnect_attempts,
+      .reconnect_succeeded = transport_stats.reconnect_succeeded,
+      .reconnect_failed = transport_stats.reconnect_failed,
       .protocol_errors = transport_stats.protocol_errors,
+      .internal_state_recoveries = transport_stats.internal_state_recoveries,
       .records_received = endpoint->records_received,
       .fec_objects_recovered = transport_stats.fec_objects_recovered,
       .fec_objects_lost = transport_stats.fec_objects_lost,
       .repair_requests_sent = transport_stats.repair_requests_sent,
       .repair_requests_received = transport_stats.repair_requests_received,
       .repair_symbols_sent = transport_stats.repair_symbols_sent,
+      .repair_commit_failures = transport_stats.repair_commit_failures,
       .group_packets_sent = transport_stats.flexicast_packets_sent,
       .group_packets_received = transport_stats.flexicast_packets_received,
+      .group_native_packets_sent =
+          transport_stats.flexicast_native_packets_sent,
+      .group_fallbacks = transport_stats.flexicast_fallbacks,
+      .group_feedback_fallbacks = transport_stats.flexicast_feedback_fallbacks,
+      .group_control_frames_throttled =
+          transport_stats.flexicast_control_frames_throttled,
+      .group_rekeys = transport_stats.flexicast_rekeys,
+      .group_interface_fallbacks =
+          transport_stats.flexicast_interface_fallbacks,
+      .group_interface_rejoins = transport_stats.flexicast_interface_rejoins,
+      .group_rate_bytes_per_second =
+          transport_stats.flexicast_cc_rate_bytes_per_second,
+      .group_physical_bytes_sent =
+          transport_stats.flexicast_physical_bytes_sent,
+      .repair_physical_bytes_sent = transport_stats.repair_physical_bytes_sent,
+      .repair_oldest_age_ms = transport_stats.repair_oldest_age_ms,
       .active_connections = transport_stats.active_connections,
+      .active_group_flows = transport_stats.flexicast_active_flows,
+      .active_group_memberships = transport_stats.flexicast_active_memberships,
       .active_group_members = transport_stats.flexicast_active_members,
+      .repair_queued_packets = transport_stats.repair_queued_packets,
+      .repair_queued_bytes = transport_stats.repair_queued_bytes,
       .queued_packets = transport_stats.flexicast_queued_packets +
                         transport_stats.repair_queued_packets +
                         transport_stats.egress_current_packets,

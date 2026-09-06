@@ -414,6 +414,7 @@ typedef struct {
   uint64_t reconnect_failed;
   uint64_t protocol_handshakes_completed;
   uint64_t protocol_errors;
+  uint64_t internal_state_recoveries;
   uint64_t resource_limit_errors;
   uint64_t stream_egress_blocked, stream_control_failures;
   size_t stream_egress_bytes, stream_egress_frames,
@@ -461,6 +462,7 @@ typedef struct {
   uint64_t repair_unicast_symbols_sent;
   uint64_t repair_unicast_payload_bytes_queued;
   uint64_t repair_batches_emitted;
+  uint64_t repair_commit_failures;
   uint64_t repair_queue_backpressure;
   uint64_t repair_packets_cancelled;
   uint64_t repair_pending_symbols_cancelled;
@@ -489,6 +491,7 @@ typedef struct {
   uint64_t flexicast_rekey_members;
   uint64_t flexicast_rekey_batched_changes;
   uint64_t flexicast_feedback_fallbacks;
+  uint64_t flexicast_control_frames_throttled;
   uint64_t flexicast_paced_packets;
   uint64_t flexicast_pacing_delays;
   uint64_t flexicast_pacing_backpressure;
@@ -519,6 +522,8 @@ typedef struct {
   uint64_t repair_oldest_age_ms;
   uint64_t flexicast_membership_joins;
   uint64_t flexicast_membership_leaves;
+  uint64_t flexicast_interface_fallbacks;
+  uint64_t flexicast_interface_rejoins;
   size_t flexicast_active_memberships;
   size_t flexicast_active_flows;
   size_t flexicast_active_members;

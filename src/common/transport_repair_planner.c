@@ -206,7 +206,9 @@ static bool build_candidate(const transport_repair_planner_snapshot_t *snapshot,
   uint32_t minimum_delivery_ppm = 1000000U;
   for (size_t i = 0; i < snapshot->requester_count; i++) {
     bool shared =
-        exact_mask ? (shared_mask & (UINT64_C(1) << i)) != 0 : shared_mask != 0;
+        shared_mask != 0 &&
+        (!exact_mask ||
+         (i < 64 && (shared_mask & (UINT64_C(1) << i)) != 0));
     const transport_repair_planner_requester_t *requester =
         &snapshot->requesters[i];
     candidate->innovative_deliveries = saturating_add_u64(

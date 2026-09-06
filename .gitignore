@@ -6,6 +6,7 @@ qlinq-tund
 t/00util/test_fec
 t/00util/test_transport
 t/00util/test_flexicast_transport
+t/00util/test_flexicast_scale
 t/00util/test_uds
 t/00util/test_audio
 t/00util/test_inputd
@@ -16,7 +17,9 @@ t/00util/test_data_uds
 t/00util/test_transport_wire
 t/00util/test_transport_components
 t/00util/test_qlinq_api
+t/00util/test_qlinq_reconnect
 t/00util/fuzz_transport_wire
+t/00util/fuzz_flexicast_frames
 t/00util/test_benchmark
 t/00util/test_rateless_benchmark
 t/00util/test_tc_benchmark

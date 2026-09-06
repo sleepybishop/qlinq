@@ -67,6 +67,20 @@ static void drive_mesh(transport_t **transports, size_t count) {
       transport_tick(transports[i]);
 }
 
+static void configure_adaptive_controller(transport_config_t *config,
+                                          bool adaptive) {
+  if (!adaptive)
+    return;
+  config->flexicast_cc_mode = TRANSPORT_FLEXICAST_CC_ADAPTIVE;
+  /* Correctness-matrix profile: keep deadlines short enough that lifecycle
+   * tests measure state transitions rather than a deliberately slow floor. */
+  config->flexicast_cc_startup_rate = 128U * 1024U;
+  config->flexicast_cc_minimum_rate = 64U * 1024U;
+  config->flexicast_cc_maximum_rate = 256U * 1024U;
+  config->flexicast_cc_aggregate_rate_limit = 256U * 1024U;
+  config->flexicast_cc_feedback_timeout_ms = 100;
+}
+
 static bool parse_u16(const char *value, uint16_t *parsed) {
   char *end = NULL;
   unsigned long number = strtoul(value, &end, 10);
@@ -296,7 +310,7 @@ static int run_netns_noise(int family, const char *bind_host, const char *group,
   return 0;
 }
 
-static int run_mesh(bool shared_group) {
+static int run_mesh(bool shared_group, bool adaptive) {
   flexicast_test_state_t states[6] = {{0}};
   transport_config_t configs[6] = {
       {.bind_hosts = {"127.0.0.1"},
@@ -328,6 +342,8 @@ static int run_mesh(bool shared_group) {
     configs[1].flexicast_group = "232.42.42.12";
     configs[1].flexicast_group_port = 10022;
   }
+  configure_adaptive_controller(&configs[0], adaptive);
+  configure_adaptive_controller(&configs[1], adaptive);
   for (size_t i = 2; i < 6; i++) {
     size_t source = i < 4 ? 0 : 1;
     configs[i] = (transport_config_t){.bind_hosts = {"127.0.0.1"},
@@ -545,7 +561,7 @@ Fail:
   return 1;
 }
 
-static int run_unsubscribe_lifecycle(bool ipv6) {
+static int run_unsubscribe_lifecycle(bool ipv6, bool adaptive) {
   flexicast_test_state_t server_state = {0}, client_a_state = {0},
                          client_b_state = {0};
   transport_config_t server_config = {.bind_hosts = {"127.0.0.1"},
@@ -578,6 +594,7 @@ static int run_unsubscribe_lifecycle(bool ipv6) {
     client_config.remote_hosts[0] = "::1";
     client_config.flexicast_interface = "::1";
   }
+  configure_adaptive_controller(&server_config, adaptive);
   transport_config_t client_b_config = client_config;
   client_b_config.user_data = &client_b_state;
 
@@ -771,7 +788,7 @@ Fail:
   return 1;
 }
 
-static int run_membership_lifecycle(bool ipv6) {
+static int run_membership_lifecycle(bool ipv6, bool adaptive) {
   flexicast_test_state_t server_state = {0}, client_state = {0};
   transport_config_t server_config = {.bind_hosts = {"127.0.0.1"},
                                       .num_bind_hosts = 1,
@@ -809,6 +826,7 @@ static int run_membership_lifecycle(bool ipv6) {
     client_config.remote_hosts[0] = "::1";
     client_config.flexicast_interface = "::1";
   }
+  configure_adaptive_controller(&server_config, adaptive);
   transport_t *server = transport_create(&server_config);
   transport_t *client = transport_create(&client_config);
   if (!server || !client) {
@@ -863,6 +881,58 @@ static int run_membership_lifecycle(bool ipv6) {
     goto Fail;
   }
 
+  uint8_t interface_address[16] = {0};
+  uint32_t interface_index = if_nametoindex("lo");
+  int family = ipv6 ? AF_INET6 : AF_INET;
+  if (interface_index == 0 ||
+      inet_pton(family, ipv6 ? "::1" : "127.0.0.1", interface_address) != 1) {
+    fprintf(stderr, "unable to identify loopback multicast interface\n");
+    goto Fail;
+  }
+  /* Link deletion can arrive without an address, so exercise the interface
+   * index-only teardown path used by AF_UNSPEC ifmon notifications. */
+  transport_flexicast_interface_removed(client, 0, NULL, interface_index);
+  (void)transport_get_stats(client, &receiver_stats);
+  if (receiver_stats.flexicast_active_memberships != 0 ||
+      receiver_stats.flexicast_membership_leaves != 1 ||
+      receiver_stats.flexicast_interface_fallbacks != 2) {
+    fprintf(stderr, "interface loss did not release shared membership\n");
+    goto Fail;
+  }
+  retries = 400;
+  while (retries-- > 0) {
+    drive(server, client, NULL);
+    (void)transport_get_stats(server, &source_stats);
+    if (source_stats.flexicast_active_members == 0)
+      break;
+    usleep(5000);
+  }
+  if (source_stats.flexicast_active_members != 0) {
+    fprintf(stderr, "source did not fall back after interface loss\n");
+    goto Fail;
+  }
+
+  transport_flexicast_interface_added(client, ipv6 ? 6U : 4U, interface_address,
+                                      interface_index);
+  retries = 600;
+  while (retries-- > 0) {
+    drive(server, client, NULL);
+    (void)transport_get_stats(server, &source_stats);
+    (void)transport_get_stats(client, &receiver_stats);
+    if (source_stats.flexicast_active_members == 2 &&
+        receiver_stats.flexicast_active_memberships == 1)
+      break;
+    usleep(5000);
+  }
+  if (source_stats.flexicast_active_members != 2 ||
+      receiver_stats.flexicast_active_memberships != 1 ||
+      receiver_stats.flexicast_membership_joins != 2 ||
+      receiver_stats.flexicast_interface_rejoins != 2) {
+    fprintf(stderr,
+            "Flexicast cohort did not recover after interface return\n");
+    goto Fail;
+  }
+
   static const uint8_t probe[] = "membership timeout probe";
   for (size_t track_index = 0; track_index < 2; track_index++) {
     for (uint64_t i = 0; i < 40; i++) {
@@ -903,12 +973,12 @@ static int run_membership_lifecycle(bool ipv6) {
     drive(server, client, NULL);
     (void)transport_get_stats(client, &receiver_stats);
     if (receiver_stats.flexicast_active_memberships == 0 &&
-        receiver_stats.flexicast_membership_leaves == 1)
+        receiver_stats.flexicast_membership_leaves == 2)
       break;
     usleep(5000);
   }
-  if (receiver_stats.flexicast_membership_joins != 1 ||
-      receiver_stats.flexicast_membership_leaves != 1 ||
+  if (receiver_stats.flexicast_membership_joins != 2 ||
+      receiver_stats.flexicast_membership_leaves != 2 ||
       receiver_stats.flexicast_active_memberships != 0) {
     fprintf(stderr,
             "last flow did not drop the shared kernel membership "
@@ -962,43 +1032,52 @@ int main(int argc, char **argv) {
       return 1;
     return run_netns_noise(family, argv[3], argv[4], port, (size_t)count);
   }
-  if (argc == 2 && strcmp(argv[1], "--mesh") == 0)
-    return run_mesh(true);
-  if (argc == 2 && strcmp(argv[1], "--mesh-split") == 0)
-    return run_mesh(false);
-  if (argc == 2 && strcmp(argv[1], "--membership") == 0)
-    return run_membership_lifecycle(false);
-  if (argc == 2 && strcmp(argv[1], "--membership6") == 0)
-    return run_membership_lifecycle(true);
-  if (argc == 2 && strcmp(argv[1], "--unsubscribe") == 0)
-    return run_unsubscribe_lifecycle(false);
-  if (argc == 2 && strcmp(argv[1], "--unsubscribe6") == 0)
-    return run_unsubscribe_lifecycle(true);
+  bool matrix_adaptive = argc == 3 && strcmp(argv[2], "--cc-adaptive") == 0;
+  int mode_argc = matrix_adaptive ? 2 : argc;
+  const char *mode = mode_argc == 2 ? argv[1] : NULL;
+  if (mode_argc == 2 && strcmp(mode, "--mesh") == 0)
+    return run_mesh(true, matrix_adaptive);
+  if (mode_argc == 2 && strcmp(mode, "--mesh-split") == 0)
+    return run_mesh(false, matrix_adaptive);
+  if (mode_argc == 2 && strcmp(mode, "--membership") == 0)
+    return run_membership_lifecycle(false, matrix_adaptive);
+  if (mode_argc == 2 && strcmp(mode, "--membership6") == 0)
+    return run_membership_lifecycle(true, matrix_adaptive);
+  if (mode_argc == 2 && strcmp(mode, "--unsubscribe") == 0)
+    return run_unsubscribe_lifecycle(false, matrix_adaptive);
+  if (mode_argc == 2 && strcmp(mode, "--unsubscribe6") == 0)
+    return run_unsubscribe_lifecycle(true, matrix_adaptive);
   bool native_multicast =
-      argc == 2 &&
-      (strcmp(argv[1], "--native") == 0 || strcmp(argv[1], "--native6") == 0 ||
-       strcmp(argv[1], "--join-fallback") == 0 ||
-       strcmp(argv[1], "--ack-fallback") == 0 ||
-       strcmp(argv[1], "--pacing") == 0);
-  bool join_fallback = argc == 2 && strcmp(argv[1], "--join-fallback") == 0;
-  bool ack_fallback = argc == 2 && strcmp(argv[1], "--ack-fallback") == 0;
-  bool pacing = argc == 2 && strcmp(argv[1], "--pacing") == 0;
-  bool adaptive = argc == 2 && strcmp(argv[1], "--adaptive") == 0;
-  bool indexed_repair = argc == 2 && strcmp(argv[1], "--repair-indexed") == 0;
+      mode_argc == 2 &&
+      (strcmp(mode, "--native") == 0 || strcmp(mode, "--native6") == 0 ||
+       strcmp(mode, "--join-fallback") == 0 ||
+       strcmp(mode, "--ack-fallback") == 0 || strcmp(mode, "--pacing") == 0);
+  bool join_fallback = mode_argc == 2 && strcmp(mode, "--join-fallback") == 0;
+  bool ack_fallback = mode_argc == 2 && strcmp(mode, "--ack-fallback") == 0;
+  bool pacing = mode_argc == 2 && strcmp(mode, "--pacing") == 0;
+  bool adaptive_only = mode_argc == 2 && strcmp(mode, "--adaptive") == 0;
+  bool adaptive = adaptive_only || matrix_adaptive;
+  bool indexed_repair = mode_argc == 2 && strcmp(mode, "--repair-indexed") == 0;
   bool exhausted_repair =
-      argc == 2 && strcmp(argv[1], "--repair-exhaustion") == 0;
-  bool repair = argc == 2 && (strcmp(argv[1], "--repair") == 0 ||
-                              indexed_repair || exhausted_repair);
-  bool ipv6 = argc == 2 && strcmp(argv[1], "--native6") == 0;
-  if (argc > 2 || (argc == 2 && !native_multicast && !adaptive && !repair)) {
-    fprintf(stderr,
-            "usage: %s "
-            "[--native|--native6|--join-fallback|--ack-fallback|--pacing|"
-            "--adaptive|--repair|--repair-indexed|--repair-exhaustion|--mesh|"
-            "--mesh-split|--membership|"
-            "--membership6|--unsubscribe|"
-            "--unsubscribe6]\n",
-            argv[0]);
+      mode_argc == 2 && strcmp(mode, "--repair-exhaustion") == 0;
+  bool control_flood = mode_argc == 2 && strcmp(mode, "--control-flood") == 0;
+  bool repair = mode_argc == 2 && (strcmp(mode, "--repair") == 0 ||
+                                   indexed_repair || exhausted_repair);
+  bool base = mode_argc == 1 || (mode_argc == 2 && strcmp(mode, "--base") == 0);
+  bool ipv6 = mode_argc == 2 && strcmp(mode, "--native6") == 0;
+  if ((!matrix_adaptive && argc > 2) ||
+      (!base && !native_multicast && !adaptive_only && !repair &&
+       !control_flood)) {
+    fprintf(
+        stderr,
+        "usage: %s "
+        "[--base|--native|--native6|--join-fallback|--ack-fallback|--pacing|"
+        "--adaptive|--repair|--repair-indexed|--repair-exhaustion|"
+        "--control-flood|--mesh|"
+        "--mesh-split|--membership|"
+        "--membership6|--unsubscribe|"
+        "--unsubscribe6] [--cc-adaptive]\n",
+        argv[0]);
     return 1;
   }
   flexicast_test_state_t server_state = {0};
@@ -1052,13 +1131,12 @@ int main(int argc, char **argv) {
       client_b_config.repair_mode = TRANSPORT_REPAIR_MODE_INDEXED;
     }
   }
-  if (adaptive) {
-    server_config.flexicast_cc_mode = TRANSPORT_FLEXICAST_CC_ADAPTIVE;
+  configure_adaptive_controller(&server_config, adaptive);
+  if (adaptive_only) {
     server_config.flexicast_cc_startup_rate = 12000;
     server_config.flexicast_cc_minimum_rate = 1000;
     server_config.flexicast_cc_maximum_rate = 16000;
     server_config.flexicast_cc_aggregate_rate_limit = 16000;
-    server_config.flexicast_cc_feedback_timeout_ms = 100;
   }
 
   transport_t *server = transport_create(&server_config);
@@ -1287,12 +1365,16 @@ int main(int argc, char **argv) {
             source_stats.flexicast_acks_received);
     goto Fail;
   }
+  uint64_t expected_min_rate = adaptive_only ? 1000U : 64U * 1024U;
+  uint64_t expected_max_rate = adaptive_only ? 16000U : 256U * 1024U;
   if (adaptive &&
       (source_stats.flexicast_cc_mode != TRANSPORT_FLEXICAST_CC_ADAPTIVE ||
-       source_stats.flexicast_cc_rate_bytes_per_second < 1000 ||
-       source_stats.flexicast_cc_rate_bytes_per_second > 16000 ||
-       source_stats.flexicast_cc_burst_bytes == 0 ||
-       source_stats.flexicast_cc_rate_reduction_events != 0)) {
+       (!join_fallback &&
+        (source_stats.flexicast_cc_rate_bytes_per_second < expected_min_rate ||
+         source_stats.flexicast_cc_rate_bytes_per_second > expected_max_rate ||
+         source_stats.flexicast_cc_burst_bytes == 0)) ||
+       (adaptive_only &&
+        source_stats.flexicast_cc_rate_reduction_events != 0))) {
     fprintf(stderr,
             "adaptive controller configuration was not active (mode=%d, "
             "rate=%" PRIu64 ", burst=%" PRIu64 ", growth=%" PRIu64
@@ -1470,9 +1552,43 @@ int main(int argc, char **argv) {
     }
   }
 
+  if (control_flood) {
+    transport_flexicast_flow_t *flow =
+        transport_flexicast_find_source(server, &track);
+    if (!flow || flow->member_count < 2) {
+      fprintf(stderr, "control-throttle flow was not established\n");
+      goto Fail;
+    }
+    transport_flexicast_member_t *member = &flow->members[0];
+    quicly_flexicast_frame_t frame = {.type = QUICLY_FRAME_TYPE_FC_STATE};
+    frame.data.state.flow_id.len = QUICLY_FLEXICAST_FLOW_ID_SIZE;
+    quicly_encode64(frame.data.state.flow_id.bytes, flow->flow_id);
+    frame.data.state.sequence = flow->key_epoch;
+    for (size_t i = 0;
+         i < TRANSPORT_FLEXICAST_MEMBER_TRANSITIONS_PER_SECOND + 1U; i++) {
+      frame.data.state.action = member->joined ? QUICLY_FLEXICAST_STATE_LEAVE
+                                               : QUICLY_FLEXICAST_STATE_JOIN;
+      if (!transport_flexicast_receive_quic_frame(server, member->conn,
+                                                  &frame)) {
+        fprintf(stderr, "control transition was rejected at %zu\n", i);
+        goto Fail;
+      }
+    }
+    (void)transport_get_stats(server, &source_stats);
+    if (source_stats.flexicast_control_frames_throttled == 0 ||
+        member->joined || member->listening) {
+      fprintf(stderr,
+              "control transition flood was not safely demoted "
+              "(throttled=%" PRIu64 ")\n",
+              source_stats.flexicast_control_frames_throttled);
+      goto Fail;
+    }
+  }
+
   printf(ipv6               ? "===FLEXICAST IPV6 MULTICAST OK===\n"
          : pacing           ? "===FLEXICAST PACING OK===\n"
-         : adaptive         ? "===FLEXICAST ADAPTIVE CC OK===\n"
+         : adaptive_only    ? "===FLEXICAST ADAPTIVE CC OK===\n"
+         : control_flood    ? "===FLEXICAST CONTROL THROTTLE OK===\n"
          : ack_fallback     ? "===FLEXICAST ACK FALLBACK OK===\n"
          : join_fallback    ? "===FLEXICAST JOIN FALLBACK OK===\n"
          : native_multicast ? "===FLEXICAST MULTICAST OK===\n"

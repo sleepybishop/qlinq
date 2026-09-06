@@ -129,6 +129,34 @@ Handles remain safe to compare with already queued events until the context is
 destroyed. Applications must release popped events before destroying their
 context.
 
+## Operational lifecycle
+
+Clients can opt into bounded exponential reconnect with
+`reconnect_enabled`, `reconnect_initial_delay_ms`, and
+`reconnect_max_delay_ms`. Named subscriptions remain registered while the peer
+is unavailable and are activated again after the replacement connection is
+authenticated. Flexicast subscriptions also renegotiate their flow, group key,
+and kernel SSM membership; reconnect does not reuse the previous group key.
+
+`qlinq_endpoint_shutdown()` begins an orderly endpoint close and disables
+automatic reconnect. Continue calling `qlinq_service()` until
+`qlinq_endpoint_is_drained()` is true, then call `qlinq_endpoint_close()`.
+`qlinq_endpoint_reload_credentials()` atomically replaces the certificate and
+private key used by future handshakes without changing established TLS
+sessions.
+
+`QLINQ_EVENT_PEER_DISCONNECTED` includes the transport error, the raw library
+error, whether the error was an application or remote error, the offending
+frame type when known, and an owned reason string. The reason remains valid
+until `qlinq_event_release()`.
+
+Set `log_callback` and `log_user_data` on `qlinq_context_config_t` to receive
+structured component, severity, peer, path, and message fields. Log strings
+are borrowed for the duration of the callback. Endpoint statistics expose
+reconnect outcomes, group membership and interface fallback/rejoin counts,
+control-plane throttling, repair backlog and age, and multicast-versus-repair
+physical airtime.
+
 ## Stream lifecycle
 
 A publishing stream starts in `QLINQ_STREAM_OPEN`. `qlinq_stream_send()` may

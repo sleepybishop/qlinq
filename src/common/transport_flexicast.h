@@ -15,6 +15,7 @@
 #define TRANSPORT_FLEXICAST_REPAIR_QUEUE_CAPACITY 128U
 #define TRANSPORT_FLEXICAST_PENDING_REPAIRS 64U
 #define TRANSPORT_FLEXICAST_REPAIR_REQUESTERS 1024U
+#define TRANSPORT_FLEXICAST_MEMBER_TRANSITIONS_PER_SECOND 16U
 /* Match the minimum randomized receiver NACK backoff. A shorter source window
  * closes before independently paced receiver feedback can coalesce. */
 #define TRANSPORT_FLEXICAST_REPAIR_HOLDOFF_MS 25
@@ -44,6 +45,8 @@ typedef struct transport_flexicast_member_t {
    * distinguishes a concurrent pre-rekey LEAVE from a delayed LEAVE that
    * predates a later rejoin on the same connection. */
   uint32_t join_sequence;
+  int64_t transition_window_started_ms;
+  uint16_t transitions_in_window;
   uint64_t acknowledged_delivery_epoch;
   int64_t last_ack_time_ms;
 } transport_flexicast_member_t;
@@ -235,6 +238,17 @@ bool transport_flexicast_registry_init(transport_flexicast_registry_t *registry,
                                        size_t capacity, size_t member_capacity);
 void transport_flexicast_registry_destroy(
     transport_flexicast_registry_t *registry);
+/* Internal member-index operations are exposed for deterministic scale and
+ * churn validation without constructing thousands of network connections. */
+transport_flexicast_member_t *
+transport_flexicast_member_find(transport_flexicast_flow_t *flow,
+                                const transport_conn_t *conn);
+transport_flexicast_member_t *
+transport_flexicast_member_add(transport_flexicast_flow_t *flow,
+                               transport_conn_t *conn);
+bool transport_flexicast_member_remove(transport_t *t,
+                                       transport_flexicast_flow_t *flow,
+                                       transport_flexicast_member_t *member);
 /* Releases every flow and performs explicit kernel membership drops before
  * the owning transport closes its multicast socket. */
 void transport_flexicast_dispose(transport_t *t);
@@ -257,6 +271,14 @@ void transport_flexicast_unsubscribe(transport_t *t, transport_conn_t *conn,
                                      const moq_track_id_t *track);
 void transport_flexicast_remove_connection(transport_t *t,
                                            transport_conn_t *conn);
+/* Moves affected flows to ordinary unicast delivery when the configured
+ * multicast interface disappears and rejoins them when it returns. */
+void transport_flexicast_interface_removed(transport_t *t, uint8_t ip_version,
+                                           const uint8_t *address,
+                                           uint32_t interface_index);
+void transport_flexicast_interface_added(transport_t *t, uint8_t ip_version,
+                                         const uint8_t *address,
+                                         uint32_t interface_index);
 
 bool transport_flexicast_receive_bind(transport_t *t, transport_conn_t *conn,
                                       const qlinq_wire_flexicast_bind_t *bind);

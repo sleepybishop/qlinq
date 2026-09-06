@@ -215,11 +215,16 @@ Quicly about objects or NACK semantics.
 `transport_get_conn_stats` adds stable connection IDs, negotiated limits,
 authentication state, subscriptions, and receive counters.
 
-Component-level tests cover these ownership and lookup boundaries. End-to-end
-tests cover connection establishment, authentication, reliable streams,
-datagrams, FEC/NACK recovery, IPv4/IPv6 mutual TLS, reconnect after peer
-restart, live interface removal, multipath behavior, protected Flexicast fanout,
-multicast pacing, and shared kernel-membership teardown.
+Component-level tests cover these ownership and lookup boundaries. A dedicated
+member-index gate inserts, removes, and replaces a 1,000-member qlinq cohort
+within a 2 MiB index-storage and two-second CPU budget. End-to-end tests cover
+connection establishment, authentication, reliable streams, datagrams,
+FEC/NACK recovery, IPv4/IPv6 mutual TLS, reconnect and Flexicast rejoin after a
+peer restart, address and whole-interface removal, multipath behavior,
+protected Flexicast fanout, multicast pacing, abusive membership churn, and
+shared kernel-membership teardown. Every multicast correctness scenario runs
+against both the standard multicast and adaptive controllers; adaptive remains
+an explicit selection rather than the default.
 
 `transport_unsubscribe` queues the reliable qlinq unsubscribe, immediately
 releases the receiver flow and its reference-counted kernel SSM membership,

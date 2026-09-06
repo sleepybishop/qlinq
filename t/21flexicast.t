@@ -74,6 +74,14 @@ subtest 'Flexicast adaptive congestion controller' => sub {
        'adaptive controller drives bounded Flexicast pacing');
 };
 
+subtest 'Flexicast membership control throttling' => sub {
+    my ($stderr, $stdout) =
+        run_prog('./t/00util/test_flexicast_transport --control-flood');
+    like($stdout, qr/===FLEXICAST CONTROL THROTTLE OK===/,
+         'rapid join/leave churn demotes only the abusive member')
+        or diag($stderr);
+};
+
 subtest 'Flexicast shared rateless repair' => sub {
     my ($stderr, $stdout) =
         run_prog('./t/00util/test_flexicast_transport --repair');
@@ -128,6 +136,33 @@ subtest 'Flexicast explicit IPv6 unsubscribe and rejoin' => sub {
     like($stdout, qr/===FLEXICAST IPV6 UNSUBSCRIBE OK===/,
          'IPv6 unsubscribe drops SSM state and permits a fresh join')
         or diag($stderr);
+};
+
+subtest 'adaptive controller matches the multicast correctness matrix' => sub {
+    my @cases = (
+        ['--base',              qr/===FLEXICAST TRANSPORT OK===/],
+        ['--native',            qr/===FLEXICAST MULTICAST OK===/],
+        ['--native6',           qr/===FLEXICAST IPV6 MULTICAST OK===/],
+        ['--join-fallback',     qr/===FLEXICAST JOIN FALLBACK OK===/],
+        ['--ack-fallback',      qr/===FLEXICAST ACK FALLBACK OK===/],
+        ['--mesh',              qr/===FLEXICAST MESH OK===/],
+        ['--mesh-split',        qr/===FLEXICAST MESH OK===/],
+        ['--pacing',            qr/===FLEXICAST PACING OK===/],
+        ['--repair',            qr/===FLEXICAST RATELESS REPAIR OK===/],
+        ['--repair-exhaustion', qr/===FLEXICAST RATELESS EXHAUSTION RECOVERY OK===/],
+        ['--repair-indexed',    qr/===FLEXICAST INDEXED REPAIR OK===/],
+        ['--control-flood',     qr/===FLEXICAST CONTROL THROTTLE OK===/],
+        ['--membership',        qr/===FLEXICAST MEMBERSHIP OK===/],
+        ['--membership6',       qr/===FLEXICAST IPV6 MEMBERSHIP OK===/],
+        ['--unsubscribe',       qr/===FLEXICAST UNSUBSCRIBE OK===/],
+        ['--unsubscribe6',      qr/===FLEXICAST IPV6 UNSUBSCRIBE OK===/],
+    );
+    for my $case (@cases) {
+        my ($stderr, $stdout) = run_prog(
+            "./t/00util/test_flexicast_transport $case->[0] --cc-adaptive");
+        like($stdout, $case->[1], "$case->[0] passes with adaptive CC")
+            or diag($stderr);
+    }
 };
 
 done_testing;

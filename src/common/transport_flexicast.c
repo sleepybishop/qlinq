@@ -14,7 +14,6 @@
 #include "quicly/defaults.h"
 #include "quicly/sendstate.h"
 
-#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -150,9 +149,12 @@ queue_front(transport_flexicast_queue_t *queue) {
 
 static bool queue_push(transport_flexicast_queue_t *queue,
                        const transport_flexicast_queued_payload_t *payload) {
-  if (!queue || !payload || !payload->data || queue->count >= queue->capacity)
+  if (!queue || !payload || !payload->data || queue->count >= queue->capacity ||
+      payload->size > SIZE_MAX - queue->bytes)
     return false;
   if (!queue->entries) {
+    if (queue->capacity > SIZE_MAX / sizeof(*queue->entries))
+      return false;
     queue->entries = calloc(queue->capacity, sizeof(*queue->entries));
     if (!queue->entries)
       return false;
@@ -168,7 +170,8 @@ static void queue_pop(transport_flexicast_queue_t *queue) {
   transport_flexicast_queued_payload_t *payload = queue_front(queue);
   if (!payload)
     return;
-  queue->bytes -= payload->size;
+  queue->bytes =
+      payload->size <= queue->bytes ? queue->bytes - payload->size : 0;
   free(payload->data);
   memset(payload, 0, sizeof(*payload));
   queue->head = (queue->head + 1U) % queue->capacity;
@@ -286,6 +289,7 @@ static void dispose_flow(transport_flexicast_flow_t *flow) {
   free(flow->member_map);
   free(flow->repair_requesters.entries);
   free(flow->shadow_requesters.entries);
+  ptls_clear_memory(flow->secret, sizeof(flow->secret));
   memset(flow, 0, sizeof(*flow));
 }
 
@@ -767,9 +771,15 @@ static uintptr_t member_pointer_hash(const transport_conn_t *conn) {
 static bool member_table_init(transport_flexicast_flow_t *flow) {
   if (flow->members)
     return true;
+  if (flow->member_capacity == 0 || flow->member_capacity > SIZE_MAX / 2U)
+    return false;
   size_t map_capacity = 2;
-  while (map_capacity < flow->member_capacity * 2U)
+  size_t required_capacity = flow->member_capacity * 2U;
+  while (map_capacity < required_capacity) {
+    if (map_capacity > SIZE_MAX / 2U)
+      return false;
     map_capacity *= 2U;
+  }
   flow->members = calloc(flow->member_capacity, sizeof(*flow->members));
   flow->member_map = calloc(map_capacity, sizeof(*flow->member_map));
   if (!flow->members || !flow->member_map) {
@@ -858,17 +868,20 @@ static void member_map_update(transport_flexicast_flow_t *flow,
   }
 }
 
-static transport_flexicast_member_t *
-find_member(transport_flexicast_flow_t *flow, const transport_conn_t *conn) {
+transport_flexicast_member_t *
+transport_flexicast_member_find(transport_flexicast_flow_t *flow,
+                                const transport_conn_t *conn) {
   size_t slot;
   return flow && conn && member_map_find(flow, conn, &slot)
              ? &flow->members[slot]
              : NULL;
 }
 
-static transport_flexicast_member_t *
-add_member(transport_flexicast_flow_t *flow, transport_conn_t *conn) {
-  transport_flexicast_member_t *member = find_member(flow, conn);
+transport_flexicast_member_t *
+transport_flexicast_member_add(transport_flexicast_flow_t *flow,
+                               transport_conn_t *conn) {
+  transport_flexicast_member_t *member =
+      transport_flexicast_member_find(flow, conn);
   if (member)
     return member;
   if (!flow || !conn || flow->member_count == flow->member_capacity ||
@@ -880,26 +893,50 @@ add_member(transport_flexicast_flow_t *flow, transport_conn_t *conn) {
   return member;
 }
 
-static void set_member_listening(transport_flexicast_flow_t *flow,
+static void recount_member_feedback(transport_flexicast_flow_t *flow) {
+  flow->listening_count = 0;
+  flow->feedback_outstanding_count = 0;
+  for (size_t i = 0; i < flow->member_count; i++) {
+    const transport_flexicast_member_t *member = &flow->members[i];
+    if (!member->listening)
+      continue;
+    flow->listening_count++;
+    if (member->acknowledged_delivery_epoch < flow->delivery_epoch)
+      flow->feedback_outstanding_count++;
+  }
+}
+
+static void set_member_listening(transport_t *t,
+                                 transport_flexicast_flow_t *flow,
                                  transport_flexicast_member_t *member,
                                  bool listening, int64_t now) {
   if (member->listening == listening)
     return;
+  bool inconsistent = false;
   if (listening) {
     flow->listening_count++;
     member->acknowledged_delivery_epoch = flow->delivery_epoch;
     member->last_ack_time_ms = now;
   } else {
-    assert(flow->listening_count != 0);
+    if (flow->listening_count == 0)
+      inconsistent = true;
+    else
+      flow->listening_count--;
     if (member->acknowledged_delivery_epoch < flow->delivery_epoch) {
-      assert(flow->feedback_outstanding_count != 0);
-      flow->feedback_outstanding_count--;
+      if (flow->feedback_outstanding_count == 0)
+        inconsistent = true;
+      else
+        flow->feedback_outstanding_count--;
     }
-    flow->listening_count--;
     member->acknowledged_delivery_epoch = flow->delivery_epoch;
     member->last_ack_time_ms = 0;
   }
   member->listening = listening;
+  if (inconsistent) {
+    recount_member_feedback(flow);
+    if (t)
+      t->stats.internal_state_recoveries++;
+  }
 }
 
 static void advance_delivery_epoch(transport_flexicast_flow_t *flow) {
@@ -964,17 +1001,30 @@ feedback_demotion_timeout_ms(const transport_flexicast_flow_t *flow) {
   return timeout;
 }
 
-static void erase_member(transport_flexicast_flow_t *flow,
-                         transport_flexicast_member_t *member) {
+bool transport_flexicast_member_remove(transport_t *t,
+                                       transport_flexicast_flow_t *flow,
+                                       transport_flexicast_member_t *member) {
+  if (!flow || !flow->members || !member || flow->member_count == 0)
+    return false;
   size_t slot = (size_t)(member - flow->members);
+  if (slot >= flow->member_count) {
+    if (t)
+      t->stats.internal_state_recoveries++;
+    return false;
+  }
   size_t last = flow->member_count - 1U;
+  bool inconsistent = false;
   if (member->listening) {
-    assert(flow->listening_count != 0);
+    if (flow->listening_count == 0)
+      inconsistent = true;
+    else
+      flow->listening_count--;
     if (member->acknowledged_delivery_epoch < flow->delivery_epoch) {
-      assert(flow->feedback_outstanding_count != 0);
-      flow->feedback_outstanding_count--;
+      if (flow->feedback_outstanding_count == 0)
+        inconsistent = true;
+      else
+        flow->feedback_outstanding_count--;
     }
-    flow->listening_count--;
   }
   member_map_remove(flow, member->conn);
   if (slot != last) {
@@ -983,6 +1033,12 @@ static void erase_member(transport_flexicast_flow_t *flow,
   }
   memset(&flow->members[last], 0, sizeof(flow->members[last]));
   flow->member_count--;
+  if (inconsistent) {
+    recount_member_feedback(flow);
+    if (t)
+      t->stats.internal_state_recoveries++;
+  }
+  return true;
 }
 
 static bool flow_has_members(const transport_flexicast_flow_t *flow) {
@@ -1086,7 +1142,7 @@ static bool rekey_source_flow(transport_t *t,
     transport_flexicast_member_t *member = &flow->members[i];
     if (!member->conn || !member->joined)
       continue;
-    set_member_listening(flow, member, false, 0);
+    set_member_listening(t, flow, member, false, 0);
     member->key_pending = !send_current_key(flow, member);
   }
   t->stats.flexicast_rekeys++;
@@ -1108,7 +1164,7 @@ static void fallback_source_flow(transport_t *t,
                                      transport_get_time_ms());
     member->joined = false;
     member->key_pending = false;
-    set_member_listening(flow, member, false, 0);
+    set_member_listening(t, flow, member, false, 0);
     t->stats.flexicast_fallbacks++;
   }
 }
@@ -1145,6 +1201,95 @@ static bool maybe_send_join(transport_flexicast_flow_t *flow) {
     return false;
   flow->join_sent = true;
   return true;
+}
+
+static bool configured_interface_matches(const transport_t *t,
+                                         uint8_t ip_version,
+                                         const uint8_t *address,
+                                         uint32_t interface_index) {
+  int family = ip_version == 4 ? AF_INET : ip_version == 6 ? AF_INET6 : 0;
+  if (!t || !address || family == 0 || t->flexicast_interface_family != family)
+    return false;
+  size_t address_size = ip_version == 4 ? 4U : 16U;
+  const void *configured = ip_version == 4
+                               ? (const void *)&t->flexicast_interface_v4
+                               : (const void *)&t->flexicast_interface_v6;
+  if (memcmp(configured, address, address_size) != 0)
+    return false;
+  return interface_index == 0 || t->flexicast_interface_index == 0 ||
+         interface_index == t->flexicast_interface_index;
+}
+
+void transport_flexicast_interface_removed(transport_t *t, uint8_t ip_version,
+                                           const uint8_t *address,
+                                           uint32_t interface_index) {
+  bool whole_interface = t && ip_version == 0 && !address &&
+                         interface_index != 0 &&
+                         t->flexicast_interface_index == interface_index;
+  if (!whole_interface &&
+      !configured_interface_matches(t, ip_version, address, interface_index))
+    return;
+  for (size_t i = 0; i < t->flexicast.capacity; i++) {
+    transport_flexicast_flow_t *flow = &t->flexicast.flows[i];
+    if (!flow->active || (!whole_interface && flow->ip_version != ip_version))
+      continue;
+    if (flow->source) {
+      if (flow->native_multicast) {
+        flow->native_multicast = false;
+        t->stats.flexicast_interface_fallbacks++;
+      }
+      continue;
+    }
+    if (flow->interface_index != interface_index && interface_index != 0)
+      continue;
+    if (flow->membership_acquired)
+      release_membership(t, flow);
+    flow->native_multicast = false;
+    flow->multicast_unavailable = true;
+    if (flow->join_sent && flow->control_conn) {
+      (void)send_state(flow->control_conn, flow->flow_id, flow->key_epoch,
+                       QUICLY_FLEXICAST_STATE_LEAVE);
+      flow->join_sent = false;
+    }
+    t->stats.flexicast_interface_fallbacks++;
+  }
+}
+
+void transport_flexicast_interface_added(transport_t *t, uint8_t ip_version,
+                                         const uint8_t *address,
+                                         uint32_t interface_index) {
+  if (!configured_interface_matches(t, ip_version, address, 0))
+    return;
+  t->flexicast_interface_index = interface_index;
+  for (size_t i = 0; i < t->flexicast.capacity; i++) {
+    transport_flexicast_flow_t *flow = &t->flexicast.flows[i];
+    if (!flow->active || flow->ip_version != ip_version)
+      continue;
+    if (flow->source) {
+      if (!flow->native_multicast) {
+        flow->native_multicast = true;
+        t->stats.flexicast_interface_rejoins++;
+      }
+      continue;
+    }
+    if (!flow->announcement_received || flow->membership_acquired)
+      continue;
+    quicly_flexicast_announce_frame_t announce = {
+        .flow_id = flexicast_wire_id(flow->flow_id),
+        .sequence = flow->key_epoch,
+        .ip_version = flow->ip_version,
+        .udp_port = flow->udp_port,
+        .ack_delay_msec = flow->ack_delay_msec};
+    size_t address_size = ip_version == 4 ? 4U : 16U;
+    memcpy(announce.source_ip, flow->source_ip, address_size);
+    memcpy(announce.group_ip, flow->group_ip, address_size);
+    flow->multicast_unavailable = false;
+    if (join_announced_group(t, flow, &announce) && maybe_send_join(flow)) {
+      t->stats.flexicast_interface_rejoins++;
+    } else {
+      flow->multicast_unavailable = true;
+    }
+  }
 }
 
 static transport_flexicast_flow_t *
@@ -1211,9 +1356,10 @@ bool transport_flexicast_offer(transport_t *t, transport_conn_t *conn,
       return false;
     }
   }
-  if (!add_member(flow, conn))
+  if (!transport_flexicast_member_add(flow, conn))
     return false;
-  transport_flexicast_member_t *member = find_member(flow, conn);
+  transport_flexicast_member_t *member =
+      transport_flexicast_member_find(flow, conn);
   if (!member)
     return false;
   if (member->offer_epoch != 0)
@@ -1279,13 +1425,14 @@ bool transport_flexicast_offer(transport_t *t, transport_conn_t *conn,
 static void remove_source_member(transport_t *t,
                                  transport_flexicast_flow_t *flow,
                                  transport_conn_t *conn) {
-  transport_flexicast_member_t *member = find_member(flow, conn);
+  transport_flexicast_member_t *member =
+      transport_flexicast_member_find(flow, conn);
   if (!member)
     return;
   bool needs_rekey = member->joined || member->listening;
   (void)quicly_flexicast_detach_at(flow->crypto, conn->id,
                                    transport_get_time_ms());
-  erase_member(flow, member);
+  (void)transport_flexicast_member_remove(t, flow, member);
   if (!flow_has_members(flow))
     release_flow(t, flow);
   else if (needs_rekey)
@@ -1382,7 +1529,8 @@ bool transport_flexicast_receive_path_ack(transport_t *t,
     return true;
   if (!flow->source)
     return false;
-  transport_flexicast_member_t *member = find_member(flow, conn);
+  transport_flexicast_member_t *member =
+      transport_flexicast_member_find(flow, conn);
   if (!member || !member->listening)
     return true;
   size_t num_acked = 0, num_completed = 0;
@@ -1396,12 +1544,19 @@ bool transport_flexicast_receive_path_ack(transport_t *t,
     return false;
   t->stats.flexicast_acks_received += num_acked;
   if (num_acked > 0 && member) {
+    bool recount = false;
     if (member_delivery_debt(flow, member) != 0) {
-      assert(flow->feedback_outstanding_count != 0);
-      flow->feedback_outstanding_count--;
+      if (flow->feedback_outstanding_count != 0) {
+        flow->feedback_outstanding_count--;
+      } else {
+        t->stats.internal_state_recoveries++;
+        recount = true;
+      }
     }
     member->acknowledged_delivery_epoch = flow->delivery_epoch;
     member->last_ack_time_ms = transport_get_time_ms();
+    if (recount || flow->feedback_outstanding_count > flow->listening_count)
+      recount_member_feedback(flow);
   }
   return true;
 }
@@ -1446,6 +1601,34 @@ receive_quic_announce(transport_t *t, transport_conn_t *conn,
   return !flow->binding_received || maybe_send_join(flow);
 }
 
+static bool admit_member_transition(transport_t *t,
+                                    transport_flexicast_flow_t *flow,
+                                    transport_flexicast_member_t *member,
+                                    int64_t now) {
+  if (member->transition_window_started_ms == 0 ||
+      now < member->transition_window_started_ms ||
+      now - member->transition_window_started_ms >= 1000) {
+    member->transition_window_started_ms = now;
+    member->transitions_in_window = 0;
+  }
+  if (member->transitions_in_window <
+      TRANSPORT_FLEXICAST_MEMBER_TRANSITIONS_PER_SECOND) {
+    member->transitions_in_window++;
+    return true;
+  }
+
+  t->stats.flexicast_control_frames_throttled++;
+  if (member->joined || member->listening) {
+    (void)quicly_flexicast_detach_at(flow->crypto, member->conn->id, now);
+    member->joined = false;
+    member->key_pending = false;
+    member->recovery_baseline_pending = false;
+    set_member_listening(t, flow, member, false, 0);
+    schedule_source_rekey(t, flow, now);
+  }
+  return false;
+}
+
 static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
                                const quicly_flexicast_state_frame_t *state) {
   uint64_t flow_id;
@@ -1483,7 +1666,8 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
   }
   if (!flow->source)
     return false;
-  transport_flexicast_member_t *member = find_member(flow, conn);
+  transport_flexicast_member_t *member =
+      transport_flexicast_member_find(flow, conn);
   if (!member)
     return false;
   if (state->action == QUICLY_FLEXICAST_STATE_JOIN) {
@@ -1492,6 +1676,8 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
         member->join_sequence = (uint32_t)state->sequence;
       return true;
     }
+    if (!admit_member_transition(t, flow, member, transport_get_time_ms()))
+      return true;
     member->joined = true;
     member->key_pending = false;
     member->join_sequence = (uint32_t)state->sequence;
@@ -1509,7 +1695,7 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
                                    transport_get_time_ms()) !=
             QUICLY_FLEXICAST_OK)
       return false;
-    set_member_listening(flow, member, true, transport_get_time_ms());
+    set_member_listening(t, flow, member, true, transport_get_time_ms());
     if (member->recovery_baseline_pending) {
       if (transport_subscriptions_find_alias(&conn->subscriptions,
                                              &flow->track_id, &alias) != 0)
@@ -1523,12 +1709,15 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
     if (state->sequence < member->join_sequence)
       return true;
     bool needs_rekey = member->joined || member->listening;
+    if (needs_rekey &&
+        !admit_member_transition(t, flow, member, transport_get_time_ms()))
+      return true;
     (void)quicly_flexicast_detach_at(flow->crypto, conn->id,
                                      transport_get_time_ms());
     member->joined = false;
     member->key_pending = false;
     member->recovery_baseline_pending = false;
-    set_member_listening(flow, member, false, 0);
+    set_member_listening(t, flow, member, false, 0);
     if (transport_subscriptions_find_alias(&conn->subscriptions,
                                            &flow->track_id, &alias) == 0)
       transport_publish_checkpoint_member_removed(t, conn, &flow->track_id,
@@ -1660,7 +1849,8 @@ transport_flexicast_flow_t *transport_flexicast_find_source_member(
     transport_flexicast_member_t *member;
     if (!flow->active || !flow->source ||
         !transport_track_id_equal(&flow->track_id, track) ||
-        !(member = find_member(flow, conn)) || !member->listening)
+        !(member = transport_flexicast_member_find(flow, conn)) ||
+        !member->listening)
       continue;
     return flow;
   }
@@ -1912,6 +2102,8 @@ typedef enum {
 static flexicast_dispatch_result_t
 dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
                  ptls_iovec_t payload) {
+  if (payload.len > SIZE_MAX - 128U)
+    return FLEXICAST_DISPATCH_FAILED;
   size_t capacity = payload.len + 128U;
   uint8_t *packet = malloc(capacity);
   if (!packet)
@@ -1979,7 +2171,7 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
                                             packet_number, &complete);
     (void)quicly_flexicast_detach_at(flow->crypto, member->conn->id,
                                      transport_get_time_ms());
-    set_member_listening(flow, member, false, 0);
+    set_member_listening(t, flow, member, false, 0);
     t->stats.flexicast_fallbacks++;
   }
   if (sent_any) {
@@ -1995,8 +2187,11 @@ bool transport_flexicast_can_queue(const transport_t *t,
                                    const transport_flexicast_flow_t *flow,
                                    size_t packets, size_t bytes) {
   if (!t || !flow || packets > TRANSPORT_FLEXICAST_QUEUE_CAPACITY ||
+      flow->data_queue.count > TRANSPORT_FLEXICAST_QUEUE_CAPACITY ||
       packets > TRANSPORT_FLEXICAST_QUEUE_CAPACITY - flow->data_queue.count ||
       bytes > t->limits.max_egress_bytes_per_socket ||
+      flow->data_queue.bytes > t->limits.max_egress_bytes_per_socket ||
+      flow->repair_queue.bytes > t->limits.max_egress_bytes_per_socket ||
       flow->repair_queue.bytes >
           t->limits.max_egress_bytes_per_socket - flow->data_queue.bytes ||
       bytes > t->limits.max_egress_bytes_per_socket - flow->data_queue.bytes -
@@ -2007,7 +2202,8 @@ bool transport_flexicast_can_queue(const transport_t *t,
 
 static bool queue_payload(transport_t *t, transport_flexicast_flow_t *flow,
                           ptls_iovec_t payload) {
-  if (!transport_flexicast_can_queue(t, flow, 1, payload.len)) {
+  if (payload.len > SIZE_MAX - 128U ||
+      !transport_flexicast_can_queue(t, flow, 1, payload.len)) {
     t->stats.flexicast_pacing_backpressure++;
     return false;
   }
@@ -2031,9 +2227,12 @@ static bool repair_queue_can_accept(const transport_t *t,
                                     const transport_flexicast_flow_t *flow,
                                     size_t packets, size_t bytes) {
   if (!t || !flow || packets > TRANSPORT_FLEXICAST_REPAIR_QUEUE_CAPACITY ||
+      flow->repair_queue.count > TRANSPORT_FLEXICAST_REPAIR_QUEUE_CAPACITY ||
       packets > TRANSPORT_FLEXICAST_REPAIR_QUEUE_CAPACITY -
                     flow->repair_queue.count ||
       bytes > t->limits.max_egress_bytes_per_socket ||
+      flow->data_queue.bytes > t->limits.max_egress_bytes_per_socket ||
+      flow->repair_queue.bytes > t->limits.max_egress_bytes_per_socket ||
       flow->data_queue.bytes >
           t->limits.max_egress_bytes_per_socket - flow->repair_queue.bytes ||
       bytes > t->limits.max_egress_bytes_per_socket - flow->data_queue.bytes -
@@ -2047,7 +2246,8 @@ static bool queue_repair_payload(transport_t *t,
                                  ptls_iovec_t payload, uint64_t group_id,
                                  uint64_t object_id, uint16_t symbol_index,
                                  transport_repair_mode_t mode, int64_t now) {
-  if (!repair_queue_can_accept(t, flow, 1, payload.len))
+  if (payload.len > SIZE_MAX - 128U ||
+      !repair_queue_can_accept(t, flow, 1, payload.len))
     return false;
   uint8_t *copy = malloc(payload.len);
   if (!copy)
@@ -2106,6 +2306,8 @@ requester_store_append(transport_flexicast_requester_store_t *store) {
   size_t capacity = store->capacity == 0 ? 16U : store->capacity * 2U;
   if (capacity > TRANSPORT_FLEXICAST_REPAIR_REQUESTERS)
     capacity = TRANSPORT_FLEXICAST_REPAIR_REQUESTERS;
+  if (capacity > SIZE_MAX / sizeof(*store->entries))
+    return NULL;
   transport_flexicast_repair_requester_t *requesters =
       realloc(store->entries, capacity * sizeof(*requesters));
   if (!requesters)
@@ -2988,7 +3190,10 @@ static void materialize_pending_repairs(transport_t *t,
               : transport_repair_commit_rateless(object, &repair, queued);
       /* Repair allocation is transactional: only symbols admitted to an
        * egress queue consume an ESI (or advance the systematic fallback). */
-      assert(committed);
+      if (!committed) {
+        t->stats.repair_commit_failures++;
+        clear_pending_repair(t, flow, pending);
+      }
     }
     transport_repair_batch_destroy(&repair);
     if (queued != 0) {
@@ -3021,6 +3226,7 @@ bool transport_flexicast_send_payload(transport_t *t,
                                       transport_flexicast_flow_t *flow,
                                       ptls_iovec_t payload) {
   if (!t || !flow || !flow->source || !flow->crypto || !payload.base ||
+      payload.len > SIZE_MAX - 128U ||
       transport_flexicast_listening_members(flow) == 0)
     return false;
   refresh_pacer(t, flow, transport_get_time_ms());
@@ -3326,7 +3532,7 @@ void transport_flexicast_tick(transport_t *t) {
       (void)quicly_flexicast_detach_at(flow->crypto, member->conn->id, now);
       member->joined = false;
       member->key_pending = false;
-      set_member_listening(flow, member, false, 0);
+      set_member_listening(t, flow, member, false, 0);
       t->stats.flexicast_fallbacks++;
       t->stats.flexicast_feedback_fallbacks++;
       removed = true;

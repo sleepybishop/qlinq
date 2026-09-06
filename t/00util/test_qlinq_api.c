@@ -11,6 +11,12 @@
     }                                                                          \
   } while (0)
 
+static void count_log(void *user_data, const qlinq_log_event_t *event) {
+  size_t *count = user_data;
+  if (count && event && event->component && event->message)
+    (*count)++;
+}
+
 int main(void) {
   static const char secret[] = "qlinq-api-secret";
   static const char first_payload[] = "first record";
@@ -21,9 +27,12 @@ int main(void) {
   qlinq_stream_t *late_subscription = NULL;
   qlinq_stream_t *fixed_publisher = NULL, *fixed_subscription = NULL;
   qlinq_stream_t *abort_publisher = NULL, *abort_subscription = NULL;
+  size_t logs_seen = 0;
   int result = 1;
 
-  context = qlinq_context_create(NULL);
+  qlinq_context_config_t context_config = {.log_callback = count_log,
+                                           .log_user_data = &logs_seen};
+  context = qlinq_context_create(&context_config);
   CHECK(context, "create context");
 
   qlinq_endpoint_config_t listener_config = {
@@ -44,6 +53,9 @@ int main(void) {
       .remote_addresses = {"127.0.0.1"},
       .remote_address_count = 1,
       .port = 18991,
+      .reconnect_enabled = true,
+      .reconnect_initial_delay_ms = 10,
+      .reconnect_max_delay_ms = 100,
       .security = {.shared_secret = secret,
                    .shared_secret_size = sizeof(secret) - 1U,
                    .allow_insecure_peer = true}};
@@ -273,6 +285,35 @@ int main(void) {
   CHECK(qlinq_endpoint_get_stats(client, &stats) &&
             stats.active_connections == 1,
         "query endpoint statistics");
+  CHECK(logs_seen != 0, "structured transport logs reach the application");
+  CHECK(qlinq_endpoint_reload_credentials(listener, "t/assets/server.crt",
+                                          "t/assets/server.key") ==
+            QLINQ_STATUS_OK,
+        "atomically reload endpoint credentials");
+  CHECK(qlinq_endpoint_shutdown(client, "API hardening test") ==
+                QLINQ_STATUS_OK &&
+            qlinq_endpoint_shutdown(listener, "API hardening test") ==
+                QLINQ_STATUS_OK,
+        "start graceful endpoint shutdown");
+  bool client_drained = false, listener_drained = false;
+  bool disconnect_detail = false;
+  for (size_t attempt = 0;
+       attempt < 500 && !(client_drained && listener_drained); attempt++) {
+    CHECK(qlinq_service(context, 10) >= QLINQ_STATUS_OK,
+          "service graceful endpoint shutdown");
+    qlinq_event_t event;
+    while (qlinq_next_event(context, &event)) {
+      if (event.type == QLINQ_EVENT_PEER_DISCONNECTED &&
+          event.disconnect.reason && event.disconnect.reason[0] != '\0')
+        disconnect_detail = true;
+      qlinq_event_release(&event);
+    }
+    client_drained = qlinq_endpoint_is_drained(client);
+    listener_drained = qlinq_endpoint_is_drained(listener);
+  }
+  CHECK(client_drained && listener_drained,
+        "graceful endpoint shutdown reaches drained state");
+  CHECK(disconnect_detail, "disconnect event owns structured close details");
 
   printf("===QLINQ API OK===\n");
   result = 0;

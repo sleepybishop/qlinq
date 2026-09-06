@@ -9,7 +9,6 @@
 #include "quicly/sendstate.h"
 #include "quicly/streambuf.h"
 
-#include <assert.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
@@ -770,7 +769,8 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
                           : transport_repair_commit_rateless(cached, &repair,
                                                              repairs_queued);
                   /* A failed queue admission must not burn a repair ESI. */
-                  assert(committed);
+                  if (!committed)
+                    t->stats.repair_commit_failures++;
                 }
                 t->stats.repair_symbols_sent += repairs_queued;
                 if (repair_mode == TRANSPORT_REPAIR_MODE_RATELESS)

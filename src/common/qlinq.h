@@ -72,6 +72,24 @@ typedef enum {
   QLINQ_GROUP_CC_ADAPTIVE = 1
 } qlinq_group_cc_t;
 
+typedef enum {
+  QLINQ_LOG_DEBUG = 0,
+  QLINQ_LOG_INFO,
+  QLINQ_LOG_WARNING,
+  QLINQ_LOG_ERROR
+} qlinq_log_level_t;
+
+typedef struct {
+  qlinq_log_level_t level;
+  const char *component;
+  uint32_t peer_id;
+  size_t path_index;
+  const char *message;
+} qlinq_log_event_t;
+
+typedef void (*qlinq_log_callback_t)(void *user_data,
+                                     const qlinq_log_event_t *event);
+
 typedef struct {
   /* Zero selects the documented transport default for every limit. */
   size_t max_connections;
@@ -122,6 +140,9 @@ typedef struct {
   size_t remote_address_count;
   uint16_t port;
   uint64_t idle_timeout_ms;
+  bool reconnect_enabled;
+  uint32_t reconnect_initial_delay_ms;
+  uint32_t reconnect_max_delay_ms;
   qlinq_security_config_t security;
   qlinq_group_delivery_config_t group_delivery;
   qlinq_repair_mode_t repair_mode;
@@ -133,6 +154,9 @@ typedef struct {
   /* Zero values select 1,024 events and 64 MiB of copied event payloads. */
   size_t max_queued_events;
   size_t max_queued_event_bytes;
+  /* Log strings are borrowed and valid only during the callback. */
+  qlinq_log_callback_t log_callback;
+  void *log_user_data;
 } qlinq_context_config_t;
 
 typedef struct {
@@ -177,6 +201,16 @@ typedef enum {
 } qlinq_event_type_t;
 
 typedef struct {
+  uint64_t error_code;
+  int64_t raw_error;
+  bool application_error;
+  uint64_t offending_frame_type;
+  bool remote;
+  /* Owned by the event and valid until qlinq_event_release(). */
+  const char *reason;
+} qlinq_disconnect_t;
+
+typedef struct {
   qlinq_event_type_t type;
   qlinq_endpoint_t *endpoint;
   qlinq_stream_t *stream;
@@ -190,6 +224,7 @@ typedef struct {
     size_t peers_completed;
     size_t peers_failed;
   } completion;
+  qlinq_disconnect_t disconnect;
   qlinq_status_t status;
   const char *message;
   /* Private ownership token used by qlinq_event_release(). */
@@ -200,17 +235,37 @@ typedef struct {
   uint64_t connections_accepted;
   uint64_t connections_rejected;
   uint64_t connections_closed;
+  uint64_t reconnect_attempts;
+  uint64_t reconnect_succeeded;
+  uint64_t reconnect_failed;
   uint64_t protocol_errors;
+  uint64_t internal_state_recoveries;
   uint64_t records_received;
   uint64_t fec_objects_recovered;
   uint64_t fec_objects_lost;
   uint64_t repair_requests_sent;
   uint64_t repair_requests_received;
   uint64_t repair_symbols_sent;
+  uint64_t repair_commit_failures;
   uint64_t group_packets_sent;
   uint64_t group_packets_received;
+  uint64_t group_native_packets_sent;
+  uint64_t group_fallbacks;
+  uint64_t group_feedback_fallbacks;
+  uint64_t group_control_frames_throttled;
+  uint64_t group_rekeys;
+  uint64_t group_interface_fallbacks;
+  uint64_t group_interface_rejoins;
+  uint64_t group_rate_bytes_per_second;
+  uint64_t group_physical_bytes_sent;
+  uint64_t repair_physical_bytes_sent;
+  uint64_t repair_oldest_age_ms;
   size_t active_connections;
+  size_t active_group_flows;
+  size_t active_group_memberships;
   size_t active_group_members;
+  size_t repair_queued_packets;
+  size_t repair_queued_bytes;
   size_t queued_packets;
   size_t queued_bytes;
 } qlinq_endpoint_stats_t;
@@ -237,6 +292,17 @@ qlinq_endpoint_t *qlinq_listen(qlinq_context_t *context,
                                const qlinq_endpoint_config_t *config);
 qlinq_endpoint_t *qlinq_connect(qlinq_context_t *context,
                                 const qlinq_endpoint_config_t *config);
+/* Starts an orderly close while leaving the endpoint serviceable until its
+ * QUIC close packets and socket queues drain. Automatic reconnect is stopped.
+ */
+qlinq_status_t qlinq_endpoint_shutdown(qlinq_endpoint_t *endpoint,
+                                       const char *reason);
+bool qlinq_endpoint_is_drained(qlinq_endpoint_t *endpoint);
+/* Replaces the identity used for future handshakes. Existing sessions retain
+ * their current TLS state. Failure leaves the previous identity installed. */
+qlinq_status_t qlinq_endpoint_reload_credentials(qlinq_endpoint_t *endpoint,
+                                                 const char *certificate_file,
+                                                 const char *private_key_file);
 void qlinq_endpoint_close(qlinq_endpoint_t *endpoint);
 
 /* A publishing stream accepts records from the application. A subscribed
