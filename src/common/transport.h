@@ -480,6 +480,13 @@ typedef struct {
   size_t recovery_cache_entries, recovery_cache_peak_entries;
   size_t recovery_checkpoints_pending;
   uint64_t recovery_oldest_checkpoint_age_ms;
+  /* Cumulative encoded payload admission, unique protected packet numbers,
+   * and successful kernel submissions (one per replica) are separate. */
+  uint64_t flexicast_payloads_accepted;
+  uint64_t flexicast_plaintext_bytes_accepted;
+  uint64_t flexicast_physical_packets_sent;
+  size_t flexicast_protected_packets_queued;
+  size_t flexicast_protected_bytes_queued;
   uint64_t flexicast_packets_sent;
   uint64_t flexicast_native_packets_sent;
   uint64_t flexicast_packets_received;

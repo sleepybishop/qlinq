@@ -31,7 +31,8 @@ typedef struct {
    * correctness through an arbitrarily long outage without reusing a repair
    * ESI or requiring unbounded receiver state. */
   uint16_t next_systematic_repair_symbol;
-  /* Retain unconfirmed recovery obligations until explicit release. */
+  /* Admission by a best-effort track must not evict another track's
+   * unconfirmed recovery obligation. Released explicitly by checkpoint ACK. */
   bool recovery_protected;
 } sent_object_cache_t;
 

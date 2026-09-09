@@ -1332,8 +1332,8 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
     goto malformed_datagram;
 
   bool recoverable_data = track_uses_recovery(&resolved_track);
-  bool rateless_data = recoverable_data && (resolved_track.flags &
-                                            MOQ_TRACK_FLAG_FEC_RATELESS) != 0;
+  bool rateless_data =
+      (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0;
   transport_object_gap_state_t *object_state = &tconn->object_gaps[track_id];
   if (!allow_telemetry)
     object_state->shared_delivery = true;
@@ -1524,7 +1524,8 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
         }
       }
 
-      /* Preserve the negotiated identity for every datagram delivery mode. */
+      /* The symbol envelope is also used for plain DATAGRAM tracks. Keep
+       * their negotiated identity so application subscriptions still match. */
       transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT,
                               .conn = tconn,
                               .track_id = resolved_track,

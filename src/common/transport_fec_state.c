@@ -121,8 +121,20 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
       break;
     }
   }
-  if (!entry)
-    return false;
+  if (!entry) {
+    if (!allow_evict)
+      return false;
+    for (size_t offset = 0; offset < TRANSPORT_SENT_CACHE_SIZE; offset++) {
+      size_t index = (cache->next_entry + offset) % TRANSPORT_SENT_CACHE_SIZE;
+      if (!cache->entries[index].recovery_protected) {
+        entry = &cache->entries[index];
+        cache->next_entry = (index + 1U) % TRANSPORT_SENT_CACHE_SIZE;
+        break;
+      }
+    }
+    if (!entry)
+      return false;
+  }
   uint8_t *copy = malloc(object->size);
   if (!copy)
     return false;

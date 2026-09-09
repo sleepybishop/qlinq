@@ -204,7 +204,8 @@ static bool write_received_payload(app_ctx_t *app,
   const uint8_t *data = payload;
   size_t remaining = payload_size;
   if (track_id->type == MOQ_TRACK_DATA &&
-      (track_id->flags & MOQ_TRACK_FLAG_FEC_ENABLED) != 0) {
+      (track_id->flags &
+       (MOQ_TRACK_FLAG_FEC_ENABLED | MOQ_TRACK_FLAG_FEC_RATELESS)) != 0) {
     while (remaining != 0) {
       uint16_t record_size;
       if (remaining < 2)
@@ -240,8 +241,10 @@ static bool write_received_payload(app_ctx_t *app,
 
 static bool write_received_object(app_ctx_t *app,
                                   const transport_event_t *event) {
-  bool ordered_data = event->track_id.type == MOQ_TRACK_DATA &&
-                      (event->track_id.flags & MOQ_TRACK_FLAG_FEC_ENABLED) != 0;
+  bool ordered_data =
+      event->track_id.type == MOQ_TRACK_DATA &&
+      (event->track_id.flags &
+       (MOQ_TRACK_FLAG_FEC_ENABLED | MOQ_TRACK_FLAG_FEC_RATELESS)) != 0;
   if (!ordered_data)
     return write_received_payload(app, &event->track_id, event->object.data,
                                   event->object.size);

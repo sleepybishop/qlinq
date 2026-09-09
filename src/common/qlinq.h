@@ -247,6 +247,11 @@ typedef struct {
   uint64_t repair_requests_received;
   uint64_t repair_symbols_sent;
   uint64_t repair_commit_failures;
+  uint64_t group_payloads_accepted;
+  uint64_t group_plaintext_bytes_accepted;
+  uint64_t group_physical_packets_sent;
+  size_t group_protected_packets_queued;
+  size_t group_protected_bytes_queued;
   uint64_t group_packets_sent;
   uint64_t group_packets_received;
   uint64_t group_native_packets_sent;

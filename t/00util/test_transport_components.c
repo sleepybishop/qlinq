@@ -1074,6 +1074,8 @@ int main(void) {
       !transport_sent_cache_has_space(&bounded_cache) &&
           !transport_sent_cache_store(&bounded_cache, &object, 3, 2, 2, false),
       "unacknowledged cache refuses overwrite");
+  CHECK(!transport_sent_cache_store(&bounded_cache, &object, 3, 2, 2, true),
+        "best-effort admission cannot evict a protected recovery prefix");
   CHECK(transport_sent_cache_release_through(&bounded_cache, &track, 10, 127) ==
                 128 &&
             transport_sent_cache_has_space(&bounded_cache) &&

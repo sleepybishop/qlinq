@@ -543,9 +543,8 @@ int main(void) {
     return 1;
   }
 
-  /* Indexed FEC uses the grouped-object path, but rolling recovery
-   * checkpoints are rateless-only. Cross the 32-object checkpoint boundary
-   * and verify that the indexed session remains open. */
+  /* Fixed FEC shares the finite recovery contract with rateless delivery.
+   * Cross a checkpoint boundary and verify both peers participate. */
   for (uint64_t i = 0; i < 132; i++) {
     moq_object_t indexed_record = {.track_id = data_a,
                                    .object_id = 100 + i,
@@ -574,11 +573,11 @@ int main(void) {
       !transport_get_stats(client, &indexed_receiver_stats) ||
       indexed_source_stats.active_connections != 1 ||
       indexed_receiver_stats.active_connections != 1 ||
-      indexed_source_stats.recovery_checkpoints_sent != 0 ||
-      indexed_receiver_stats.recovery_checkpoints_received != 0 ||
+      indexed_source_stats.recovery_checkpoints_sent == 0 ||
+      indexed_receiver_stats.recovery_checkpoints_received == 0 ||
       indexed_source_stats.protocol_errors != 0 ||
       indexed_receiver_stats.protocol_errors != 0) {
-    fprintf(stderr, "indexed FEC incorrectly entered checkpoint recovery\n");
+    fprintf(stderr, "fixed FEC checkpoint recovery was not negotiated\n");
     transport_destroy(client);
     transport_destroy(server);
     return 1;
@@ -639,6 +638,10 @@ int main(void) {
     return 1;
   }
 
+  transport_stats_t checkpoint_source_baseline = {0},
+                    checkpoint_receiver_baseline = {0};
+  (void)transport_get_stats(server, &checkpoint_source_baseline);
+  (void)transport_get_stats(client, &checkpoint_receiver_baseline);
   const uint8_t checkpoint_record[] = "checkpoint-record";
   for (uint64_t i = 0; i < 260; i++) {
     moq_object_t record = {.track_id = checkpoint_track,
@@ -676,17 +679,24 @@ int main(void) {
     (void)transport_get_stats(server, &checkpoint_source_stats);
     (void)transport_get_stats(client, &checkpoint_receiver_stats);
     if (client_state.checkpoint_objects_received == 65 &&
-        checkpoint_source_stats.recovery_checkpoint_acks_received >= 3 &&
-        checkpoint_source_stats.recovery_cache_releases >= 65)
+        checkpoint_source_stats.recovery_checkpoint_acks_received >=
+            checkpoint_source_baseline.recovery_checkpoint_acks_received + 3 &&
+        checkpoint_source_stats.recovery_cache_releases >=
+            checkpoint_source_baseline.recovery_cache_releases + 65)
       break;
     usleep(10 * 1000);
   }
   if (client_state.checkpoint_objects_received != 65 ||
-      checkpoint_source_stats.recovery_checkpoints_sent != 2 ||
-      checkpoint_receiver_stats.recovery_checkpoints_received != 2 ||
-      checkpoint_source_stats.recovery_checkpoint_acks_received < 3 ||
-      checkpoint_receiver_stats.recovery_checkpoint_acks_sent < 3 ||
-      checkpoint_source_stats.recovery_cache_releases < 65 ||
+      checkpoint_source_stats.recovery_checkpoints_sent !=
+          checkpoint_source_baseline.recovery_checkpoints_sent + 2 ||
+      checkpoint_receiver_stats.recovery_checkpoints_received !=
+          checkpoint_receiver_baseline.recovery_checkpoints_received + 2 ||
+      checkpoint_source_stats.recovery_checkpoint_acks_received <
+          checkpoint_source_baseline.recovery_checkpoint_acks_received + 3 ||
+      checkpoint_receiver_stats.recovery_checkpoint_acks_sent <
+          checkpoint_receiver_baseline.recovery_checkpoint_acks_sent + 3 ||
+      checkpoint_source_stats.recovery_cache_releases <
+          checkpoint_source_baseline.recovery_cache_releases + 65 ||
       checkpoint_source_stats.track_ends_sent != 1 ||
       checkpoint_receiver_stats.track_ends_received != 1) {
     fprintf(stderr,

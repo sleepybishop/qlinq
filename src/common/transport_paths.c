@@ -95,3 +95,48 @@ size_t transport_path_select_physical(const path_t *paths, size_t num_paths,
   }
   return 0;
 }
+
+size_t
+transport_path_socket_for_source(const struct sockaddr_storage *local_addrs,
+                                 size_t num_local_addrs,
+                                 const struct sockaddr *source) {
+  if (!local_addrs || !source)
+    return SIZE_MAX;
+  size_t wildcard = SIZE_MAX;
+  for (size_t i = 0; i < num_local_addrs; i++) {
+    const struct sockaddr *local = (const struct sockaddr *)&local_addrs[i];
+    if (sockaddr_address_equal(local, source))
+      return i;
+    if (local->sa_family != source->sa_family)
+      continue;
+    if ((local->sa_family == AF_INET &&
+         ((const struct sockaddr_in *)local)->sin_addr.s_addr ==
+             htonl(INADDR_ANY)) ||
+        (local->sa_family == AF_INET6 &&
+         IN6_IS_ADDR_UNSPECIFIED(
+             &((const struct sockaddr_in6 *)local)->sin6_addr)))
+      wildcard = i;
+  }
+  return wildcard;
+}
+
+size_t transport_path_socket_for_peer(
+    quicly_conn_t *quic, const struct sockaddr_storage *local_addrs,
+    size_t num_local_addrs, struct sockaddr_storage *destination) {
+  if (!quic || !destination)
+    return SIZE_MAX;
+  for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
+    quicly_path_stats_t stats;
+    if (!quicly_is_path_available(quic, path) ||
+        quicly_get_path_stats(quic, path, &stats) != 0)
+      continue;
+    size_t socket = transport_path_socket_for_source(
+        local_addrs, num_local_addrs, &stats.local.sa);
+    if (socket == SIZE_MAX)
+      continue;
+    memset(destination, 0, sizeof(*destination));
+    memcpy(destination, &stats.remote.sa, quicly_get_socklen(&stats.remote.sa));
+    return socket;
+  }
+  return SIZE_MAX;
+}

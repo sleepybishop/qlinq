@@ -171,7 +171,8 @@ static void on_transport_event(void *user_data,
              event->track_id.type);
     }
     if (ctx->data_pipe && event->track_id.type == MOQ_TRACK_DATA &&
-        (event->track_id.flags & (MOQ_TRACK_FLAG_FEC_ENABLED | MOQ_TRACK_FLAG_FEC_RATELESS))) {
+        (event->track_id.flags &
+         (MOQ_TRACK_FLAG_FEC_ENABLED | MOQ_TRACK_FLAG_FEC_RATELESS))) {
       /* Extract datagram packets from aggregated symbol */
       size_t remaining = event->object.size;
       const uint8_t *ptr = event->object.data;

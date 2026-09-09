@@ -49,6 +49,9 @@ typedef struct transport_flexicast_member_t {
   uint16_t transitions_in_window;
   uint64_t acknowledged_delivery_epoch;
   int64_t last_ack_time_ms;
+  /* Progress for the one logical payload currently being replicated. */
+  uint64_t payload_delivery_id;
+  int64_t ready_deadline_ms;
 } transport_flexicast_member_t;
 
 typedef struct transport_flexicast_member_map_entry_t {
@@ -65,6 +68,17 @@ typedef struct transport_flexicast_queued_payload_t {
   uint64_t object_id;
   uint16_t symbol_index;
   transport_repair_mode_t repair_mode;
+  /* Ciphertext is owned here, never by the generic UDP retry queue. Retaining
+   * plaintext allows an unfinished fanout to resume safely after rekeying. */
+  uint8_t *packet;
+  size_t packet_size;
+  uint64_t packet_number;
+  uint32_t packet_epoch;
+  uint64_t delivery_id;
+  size_t next_member;
+  bool replicated;
+  bool counted;
+  uint64_t airtime_bytes;
 } transport_flexicast_queued_payload_t;
 
 typedef struct transport_flexicast_queue_t {
@@ -200,6 +214,8 @@ typedef struct transport_flexicast_flow_t {
   uint64_t pacing_burst_bytes;
   uint64_t pacing_remainder;
   int64_t pacing_last_refill_ms;
+  int64_t dispatch_retry_at_ms;
+  uint64_t next_payload_delivery_id;
   int64_t last_payload_sent_ms;
   quicly_flexicast_cc_type_t *cc_type;
   quicly_flexicast_cc_config_t cc_config;

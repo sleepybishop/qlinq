@@ -6,6 +6,12 @@ server_pid=
 client_pid=
 cleanup()
 {
+    result=$?
+    if [ "$result" -ne 0 ]; then
+        for log in "$tmp_dir"/*.log "$tmp_dir"/*.tsv; do
+            [ -f "$log" ] && tail -40 "$log" >&2
+        done
+    fi
     if [ -n "$server_pid" ]; then kill "$server_pid" 2>/dev/null || true; fi
     if [ -n "$client_pid" ]; then kill "$client_pid" 2>/dev/null || true; fi
     rm -rf "$tmp_dir"

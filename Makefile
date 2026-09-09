@@ -80,6 +80,8 @@ TRANSPORT_OBJS = src/common/cli_parse.o \
               src/common/transport_egress.o \
               src/common/transport_fec_state.o \
               src/common/transport_flexicast.o \
+              src/common/transport_flexicast_dispatch.o \
+              src/common/transport_flexicast_repair.o \
               src/common/transport_memory.o \
               src/common/transport_paths.o \
               src/common/transport_protocol.o \
@@ -199,6 +201,18 @@ t/00util/test_transport: t/00util/test_transport.o $(COMMON_OBJS)
 t/00util/test_flexicast_transport: t/00util/test_flexicast_transport.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_flexicast_transport.o $(COMMON_OBJS) $(LDFLAGS)
 
+t/00util/test_flexicast_regressions: t/00util/test_flexicast_regressions.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_qlinq_delivery: t/00util/test_qlinq_delivery.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_egress_errors: t/00util/test_egress_errors.o src/common/transport_egress.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_quicly_flexicast: deps/quicly/t/flexicast.c deps/quicly/t/flexicast-main.c deps/quicly/deps/picotest/picotest.c $(QUICLY_OBJS)
+	$(CC) $(CFLAGS_COMMON) $(INCLUDES) $(CFLAGS) -Ideps/quicly/deps/picotest -o $@ $^ $(LDFLAGS)
+
 t/00util/test_flexicast_scale: t/00util/test_flexicast_scale.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_flexicast_scale.o $(COMMON_OBJS) $(LDFLAGS)
 
@@ -228,6 +242,15 @@ t/00util/fuzz_flexicast_frames: t/00util/fuzz_flexicast_frames.c $(QUICLY_OBJS)
 	clang $(CFLAGS_COMMON) $(INCLUDES) -fsanitize=fuzzer,address,undefined \
 		-o $@ t/00util/fuzz_flexicast_frames.c deps/quicly/lib/flexicast.c \
 		$(filter-out deps/quicly/lib/flexicast.o,$(QUICLY_OBJS)) $(LDFLAGS)
+
+t/00util/fuzz_flexicast_state: t/00util/fuzz_flexicast_state.c $(COMMON_OBJS)
+	clang $(CFLAGS_COMMON) $(INCLUDES) -fsanitize=fuzzer,address,undefined -fno-sanitize=pointer-overflow \
+		-o $@ t/00util/fuzz_flexicast_state.c deps/quicly/lib/flexicast.c \
+		src/common/transport_fec_state.c \
+		$(filter-out deps/quicly/lib/flexicast.o src/common/transport_fec_state.o,$(COMMON_OBJS)) $(LDFLAGS)
+
+fuzz-flexicast-state: t/00util/fuzz_flexicast_state
+	ASAN_OPTIONS=detect_leaks=1 ./t/00util/fuzz_flexicast_state -runs=10000 -max_len=1024 -len_control=0
 
 fuzz-wire: t/00util/fuzz_transport_wire
 	ASAN_OPTIONS=detect_leaks=0 ./t/00util/fuzz_transport_wire -runs=10000
@@ -261,6 +284,7 @@ release-check: check-submodules
 	$(MAKE) check
 	$(MAKE) fuzz-wire
 	$(MAKE) fuzz-flexicast
+	$(MAKE) fuzz-flexicast-state
 	$(MAKE) check-sanitize
 	$(MAKE) clean
 	$(MAKE) all examples/data_multipath_benchmark gencerts
@@ -312,7 +336,7 @@ check: all $(CHECK_BINARIES) gencerts
 	prove -I. -v t/*.t
 
 clean: 
-	rm -f qlinqd qlinq-app qlinq-cast qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_flexicast_transport t/00util/test_flexicast_scale t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_qlinq_api t/00util/test_qlinq_reconnect t/00util/fuzz_transport_wire t/00util/fuzz_flexicast_frames t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
+	rm -f qlinqd qlinq-app qlinq-cast qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_flexicast_transport t/00util/test_flexicast_scale t/00util/test_flexicast_regressions t/00util/test_qlinq_delivery t/00util/test_egress_errors t/00util/test_quicly_flexicast t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_qlinq_api t/00util/test_qlinq_reconnect t/00util/fuzz_transport_wire t/00util/fuzz_flexicast_frames t/00util/fuzz_flexicast_state t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete
 	rm -f $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \
@@ -320,7 +344,7 @@ clean:
 		deps/nanors/deps/obl/oblas_common.d \
 		deps/nanors/deps/obl/oblas_lite.d
 
-check: qlinqd qlinq-app qlinq-cast qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_flexicast_transport t/00util/test_flexicast_scale t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_qlinq_api t/00util/test_qlinq_reconnect t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls gencerts
+check: qlinqd qlinq-app qlinq-cast qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_flexicast_transport t/00util/test_flexicast_scale t/00util/test_flexicast_regressions t/00util/test_qlinq_delivery t/00util/test_egress_errors t/00util/test_quicly_flexicast t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_qlinq_api t/00util/test_qlinq_reconnect t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls gencerts
 	prove -I. -v t/*.t
 
 # Optional Linux integration suite. It uses root/CAP_NET_ADMIN or an
@@ -367,7 +391,7 @@ indent:
 	clang-format -style=LLVM -i src/common/*.c src/common/*.h src/host/linux/*.c examples/*.c t/00util/*.c
 
 .PHONY: all clean check check-flexicast-netns benchmark fuzz-wire \
-	fuzz-flexicast \
+	fuzz-flexicast fuzz-flexicast-state \
 	check-submodules check-multipath-demo check-sanitize soak release-check \
 	indent gencerts
 

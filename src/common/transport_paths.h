@@ -30,5 +30,15 @@ size_t transport_path_get_stats_by_link(
     size_t num_local_addrs, size_t link_index, quicly_path_stats_t *stats);
 size_t transport_path_select_physical(const path_t *paths, size_t num_paths,
                                       size_t packet_index);
+/* Prefer an exact local source address, then a wildcard socket of that family.
+ */
+size_t
+transport_path_socket_for_source(const struct sockaddr_storage *local_addrs,
+                                 size_t num_local_addrs,
+                                 const struct sockaddr *source);
+/* Resolve a usable QUIC path to its physical socket and remote endpoint. */
+size_t transport_path_socket_for_peer(
+    quicly_conn_t *quic, const struct sockaddr_storage *local_addrs,
+    size_t num_local_addrs, struct sockaddr_storage *destination);
 
 #endif

@@ -1201,6 +1201,15 @@ bool qlinq_endpoint_get_stats(qlinq_endpoint_t *endpoint,
       .repair_requests_received = transport_stats.repair_requests_received,
       .repair_symbols_sent = transport_stats.repair_symbols_sent,
       .repair_commit_failures = transport_stats.repair_commit_failures,
+      .group_payloads_accepted = transport_stats.flexicast_payloads_accepted,
+      .group_plaintext_bytes_accepted =
+          transport_stats.flexicast_plaintext_bytes_accepted,
+      .group_physical_packets_sent =
+          transport_stats.flexicast_physical_packets_sent,
+      .group_protected_packets_queued =
+          transport_stats.flexicast_protected_packets_queued,
+      .group_protected_bytes_queued =
+          transport_stats.flexicast_protected_bytes_queued,
       .group_packets_sent = transport_stats.flexicast_packets_sent,
       .group_packets_received = transport_stats.flexicast_packets_received,
       .group_native_packets_sent =

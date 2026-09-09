@@ -28,7 +28,10 @@ such as `qlinq-tund`, not the primary application API.
 | `transport_subscriptions.c` | Track/alias lookup, allocation, and stream binding |
 | `transport_memory.c` | Packet arena and FEC assembler allocation ownership |
 | `transport_fec_state.c` | Reusable FEC contexts and sent-object repair cache |
-| `transport_flexicast.c` | Cohort binding, reference-counted IPv4/IPv6 SSM membership, native multicast or packet replication, physical-send accounting, token-bucket execution, and fallback |
+| `transport_flexicast.c` | Cohort binding, reference-counted IPv4/IPv6 SSM membership, epoch transitions, and fallback |
+| `transport_flexicast_dispatch.c` | Plaintext queues, resumable replication, source-path selection, pacing, and physical accounting |
+| `transport_flexicast_repair.c` | Repair intents, requester observations, suppression, and materialization |
+| `transport_flexicast_internal.h` | Shared ownership rules and the internal module boundary |
 | `transport_paths.c` | QUIC-path mapping and physical-path selection |
 | `transport_repair.c` | Bounded NACK symbol reconstruction |
 | `transport_scheduler.c` | Per-connection path and redundancy planning |
@@ -100,8 +103,10 @@ the scope ID.
   packet is outstanding. The conservative controller uses indexed rate and
   feedback-deadline heaps, so feedback and churn update the limiting receiver
   in `O(log N)`. Native multicast sends use cached listener counts and one
-  delivery epoch instead of walking the cohort; receiver ACKs clear epoch debt
-  individually.
+  delivery epoch for feedback accounting; receiver ACKs clear epoch debt
+  individually. Dispatch validates cohort readiness and recipient eligibility
+  before protecting a new packet. Replication maintains a cursor and per-member
+  completion markers so a logical packet can span many bounded pacing bursts.
 - Path measurements and scheduler state belong to a connection; one client's
   RTT, loss, or telemetry must never determine another client's schedule.
 - Incoming FEC assemblers share a 64 MiB transport-wide memory budget and each
@@ -158,25 +163,37 @@ the scope ID.
 - HELLO negotiation completes before `TRANSPORT_EVENT_CONNECTED`, so capability
   and effective-limit snapshots are valid inside the connected callback.
 
+Both immediate and deferred group sends enter the same plaintext queue and
+use the same dispatcher. A pending membership rekey blocks every data and
+repair send; the first membership change anchors the 250 ms holdoff. Queue
+entries retain their plaintext until each replica has been submitted or abandoned
+after a hard socket error.
+On rotation, unsent ciphertext is discarded and protected again under the new
+epoch. Members already served are skipped, preventing duplicate delivery after
+an interrupted fanout. A joined member that never confirms its new key is
+demoted after three configured feedback intervals, allowing survivors to resume.
+Group ciphertext never enters the generic UDP egress queue.
+
+Each successful kernel submission consumes its exact protected UDP payload
+size from the token bucket. The bucket remains bounded independently of cohort
+size. Native submission uses the configured source address and interface via
+Linux packet-info ancillary data, including with wildcard binds; replication
+selects an available connection path and its matching local socket. A permanent
+native submission failure switches the remaining packet to replicated delivery.
+Platforms without explicit source selection fall back to replication. Temporary
+socket pressure retains the packet for retry. Generic QUIC egress drops a hard
+failure at its head and continues, with at most 64 packets processed per flush.
+
+Encoded object admission respects the smallest negotiated limit among eligible
+recipients. Oversized publications are rejected before shared transmission;
+grouped DATA records also reserve their two-byte framing overhead. Application
+events preserve the negotiated track descriptor regardless of symbol encoding.
+
 `transport_publish_ex` distinguishes delivery, buffering, no recipients,
 partial delivery, backpressure, invalid input, and internal failure. The legacy
-boolean wrapper returns false for partial delivery and all failures.
-Reliable publication reports backpressure when retained storage is full.
-`max_stream_egress_bytes` defaults to 2 MiB per stream and
-`max_total_stream_egress_bytes` to 16 MiB per transport. Hard bounds also limit
-retained frames to 256 per stream and vector capacity to 8,192 per transport.
-Application data and retryable NACKs leave 64 KiB and 16 frames available on a
-control stream, plus 2 MiB and 256 vector slots across the transport, for
-essential control. Exhausting essential-control capacity closes the connection
-with a resource-limit error. Configuration must accommodate one maximum-sized
-reliable object plus control space.
-
-Datagram publication checks the smallest negotiated FEC object limit among
-eligible receivers before accepting a record into a group or emitting data.
-Grouped records include their two-byte length prefixes in this limit. Short
-objects use smaller FEC symbols instead of padding every symbol to the maximum
-UDP payload. Received objects preserve the subscribed track flags; applications
-recognize grouped FEC data when either FEC flag is present.
+boolean wrapper returns false for partial delivery and all failures. DELIVERED
+means accepted by transport queues; it is not a network-delivery confirmation.
+Finite-stream checkpoint and completion ACKs provide that stronger guarantee.
 
 Finite fixed-FEC and rateless publishers call `transport_finish_track` after
 their final application record. Publication owns per-track internal FEC object
@@ -188,7 +205,9 @@ and retries one absent object at a time rather than injecting an entire repair
 window into a constrained radio queue. Reliable completion ACKs let an
 all-capable receiver cohort release cached source objects and produce drained
 statistics; eight unacknowledged windows instead produce publication
-backpressure. `transport_abort_track` drops retained recovery state and sends a
+backpressure. Fixed FEC and rateless use the same protected-cache policy, and
+best-effort cache writes cannot evict a protected entry belonging to another
+track. `transport_abort_track` drops retained recovery state and sends a
 terminal abort to the current subscribers.
 This recovery lifecycle belongs in qlinq because it describes
 application-track/FEC object lifetime, while Quicly continues to own delivery
@@ -202,7 +221,19 @@ receiver, repair requests, suppressed, merged, or source-throttled feedback,
 repair batches, repair queue pressure and age, shared repair symbols and
 physical repair airtime, indexed-versus-rateless request counts, rateless
 symbols, ESI exhaustion, completed-object replay suppression, and kernel
-membership joins/leaves.
+membership joins/leaves. `flexicast_payloads_accepted` and
+`flexicast_plaintext_bytes_accepted` count encoded payload admission, including
+repair payloads. `flexicast_packets_sent` counts distinct protected packet
+numbers with at least one successful submission; `flexicast_physical_packets_sent`
+and `flexicast_physical_bytes_sent` count actual submissions and their UDP
+payload bytes, including each replica. They exclude IP/link headers and do not
+prove network delivery. `flexicast_protected_packets_queued` and
+`flexicast_protected_bytes_queued` report ciphertext still owned by the dispatcher;
+plaintext queue gauges remain separate. At most one active logical packet per
+flow retains an extra protected buffer of at most `max_udp_payload_size` bytes.
+The public API exposes these counters with the `group_` prefix. Quicly RTT samples
+currently include any local delay between protection and a replica submission;
+physical byte accounting does not use those timing estimates.
 Completion watermark, rolling checkpoint, ACK, cache-release, and cache-
 backpressure counts are also reported so finite-flow experiments can
 distinguish recovery-window behavior from ordinary gap repair.
@@ -224,7 +255,20 @@ peer restart, address and whole-interface removal, multipath behavior,
 protected Flexicast fanout, multicast pacing, abusive membership churn, and
 shared kernel-membership teardown. Every multicast correctness scenario runs
 against both the standard multicast and adaptive controllers; adaptive remains
-an explicit selection rather than the default.
+an explicit selection rather than the default. A further regression matrix uses
+unaltered production rates for sustained fanout to 1, 5, and 12 receivers, alias
+cohorts, partial-fanout rekeying, retained old keys, full control queues, egress
+backlog, source bind ordering, wildcard binds, incompatible limits, and fixed-FEC
+and rateless leading/interior object loss. Cache-capacity admission is tested
+with a full 256-object unconfirmed prefix. The public API matrix covers four
+delivery modes, DATA and VIDEO, over ordinary QUIC and Flexicast.
+
+`make check` includes the standalone Quicly Flexicast unit suite. CI runs it and
+the transport suites under ASan/UBSan via `make check-sanitize`.
+`make fuzz-flexicast-state` adds 10,000 stateful model-based cases for membership,
+feedback, replay, rekeying, and recovery-cache admission/release to the existing
+frame-codec fuzzing. The integration matrix separately permutes authenticated
+JOIN/READY/LEAVE transitions across rekey and unsubscribe boundaries.
 
 `transport_unsubscribe` queues the reliable qlinq unsubscribe, immediately
 releases the receiver flow and its reference-counted kernel SSM membership,

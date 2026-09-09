@@ -2465,6 +2465,19 @@ bool transport_get_stats(transport_t *t, transport_stats_t *stats) {
         flow->data_queue.count + flow->repair_queue.count;
     stats->flexicast_queued_bytes +=
         flow->data_queue.bytes + flow->repair_queue.bytes;
+    const transport_flexicast_queue_t *queues[] = {&flow->data_queue,
+                                                   &flow->repair_queue};
+    for (size_t q = 0; q < 2; q++) {
+      for (size_t i = 0; i < queues[q]->count; i++) {
+        size_t slot = (queues[q]->head + i) % queues[q]->capacity;
+        const transport_flexicast_queued_payload_t *payload =
+            &queues[q]->entries[slot];
+        if (payload->packet) {
+          stats->flexicast_protected_packets_queued++;
+          stats->flexicast_protected_bytes_queued += payload->packet_size;
+        }
+      }
+    }
     stats->repair_queued_packets += flow->repair_queue.count;
     stats->repair_queued_bytes += flow->repair_queue.bytes;
     stats->repair_pending_objects += flow->pending_repair_count;

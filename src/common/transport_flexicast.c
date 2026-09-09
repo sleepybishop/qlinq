@@ -1,4 +1,5 @@
 #include "transport_flexicast.h"
+#include "transport_flexicast_internal.h"
 
 #include "portable_sockets.h"
 #include "transport_egress.h"
@@ -9,6 +10,7 @@
 #include "transport_stream.h"
 #include "transport_subscriptions.h"
 #include "transport_tracks.h"
+#include "transport_udp.h"
 
 #include "picotls/openssl.h"
 #include "quicly/defaults.h"
@@ -21,8 +23,6 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 #endif
-
-#define FLEXICAST_EXTERNAL_LOAD_SCALE 1000000U
 
 static bool set_multicast_fd_nonblocking(int fd) {
 #ifdef _WIN32
@@ -128,74 +128,6 @@ static transport_flexicast_flow_t *find_flow(transport_t *t, uint64_t flow_id) {
   return NULL;
 }
 
-static transport_flexicast_queued_payload_t *
-queue_at(transport_flexicast_queue_t *queue, size_t index) {
-  if (!queue || index >= queue->count || !queue->entries)
-    return NULL;
-  return &queue->entries[(queue->head + index) % queue->capacity];
-}
-
-static const transport_flexicast_queued_payload_t *
-queue_at_const(const transport_flexicast_queue_t *queue, size_t index) {
-  if (!queue || index >= queue->count || !queue->entries)
-    return NULL;
-  return &queue->entries[(queue->head + index) % queue->capacity];
-}
-
-static transport_flexicast_queued_payload_t *
-queue_front(transport_flexicast_queue_t *queue) {
-  return queue_at(queue, 0);
-}
-
-static bool queue_push(transport_flexicast_queue_t *queue,
-                       const transport_flexicast_queued_payload_t *payload) {
-  if (!queue || !payload || !payload->data || queue->count >= queue->capacity ||
-      payload->size > SIZE_MAX - queue->bytes)
-    return false;
-  if (!queue->entries) {
-    if (queue->capacity > SIZE_MAX / sizeof(*queue->entries))
-      return false;
-    queue->entries = calloc(queue->capacity, sizeof(*queue->entries));
-    if (!queue->entries)
-      return false;
-  }
-  size_t tail = (queue->head + queue->count) % queue->capacity;
-  queue->entries[tail] = *payload;
-  queue->count++;
-  queue->bytes += payload->size;
-  return true;
-}
-
-static void queue_pop(transport_flexicast_queue_t *queue) {
-  transport_flexicast_queued_payload_t *payload = queue_front(queue);
-  if (!payload)
-    return;
-  queue->bytes =
-      payload->size <= queue->bytes ? queue->bytes - payload->size : 0;
-  free(payload->data);
-  memset(payload, 0, sizeof(*payload));
-  queue->head = (queue->head + 1U) % queue->capacity;
-  queue->count--;
-}
-
-static size_t queue_clear(transport_flexicast_queue_t *queue) {
-  if (!queue)
-    return 0;
-  size_t cleared = queue->count;
-  while (queue->count != 0)
-    queue_pop(queue);
-  queue->head = 0;
-  return cleared;
-}
-
-static void queue_dispose(transport_flexicast_queue_t *queue) {
-  if (!queue)
-    return;
-  (void)queue_clear(queue);
-  free(queue->entries);
-  memset(queue, 0, sizeof(*queue));
-}
-
 static transport_flexicast_flow_t *alloc_flow(transport_t *t) {
   for (size_t i = 0; i < t->flexicast.capacity; i++) {
     transport_flexicast_flow_t *flow = &t->flexicast.flows[i];
@@ -248,7 +180,7 @@ static void retire_flow_id(transport_t *t, uint64_t flow_id, uint32_t epoch) {
 static size_t clear_flow_repair_queue(transport_flexicast_flow_t *flow) {
   if (!flow)
     return 0;
-  size_t cleared = queue_clear(&flow->repair_queue);
+  size_t cleared = tf_queue_clear(&flow->repair_queue);
   memset(flow->pending_repairs, 0, sizeof(flow->pending_repairs));
   flow->pending_repair_count = 0;
   free(flow->repair_requesters.entries);
@@ -269,10 +201,10 @@ static size_t clear_flow_repair_queue(transport_flexicast_flow_t *flow) {
   return cleared;
 }
 
-static size_t clear_flow_queue(transport_flexicast_flow_t *flow) {
+size_t tf_clear_flow_queue(transport_flexicast_flow_t *flow) {
   if (!flow)
     return 0;
-  size_t cleared = queue_clear(&flow->data_queue);
+  size_t cleared = tf_queue_clear(&flow->data_queue);
   cleared += clear_flow_repair_queue(flow);
   flow->cc_interval_physical_bytes = 0;
   return cleared;
@@ -281,9 +213,9 @@ static size_t clear_flow_queue(transport_flexicast_flow_t *flow) {
 static void dispose_flow(transport_flexicast_flow_t *flow) {
   if (!flow)
     return;
-  (void)clear_flow_queue(flow);
-  queue_dispose(&flow->data_queue);
-  queue_dispose(&flow->repair_queue);
+  (void)tf_clear_flow_queue(flow);
+  tf_queue_dispose(&flow->data_queue);
+  tf_queue_dispose(&flow->repair_queue);
   quicly_flexicast_flow_free(flow->crypto);
   free(flow->members);
   free(flow->member_map);
@@ -939,7 +871,7 @@ static void set_member_listening(transport_t *t,
   }
 }
 
-static void advance_delivery_epoch(transport_flexicast_flow_t *flow) {
+void tf_advance_delivery_epoch(transport_flexicast_flow_t *flow) {
   if (flow->delivery_epoch != UINT64_MAX) {
     flow->delivery_epoch++;
     flow->feedback_outstanding_count = flow->listening_count;
@@ -1143,6 +1075,9 @@ static bool rekey_source_flow(transport_t *t,
     if (!member->conn || !member->joined)
       continue;
     set_member_listening(t, flow, member, false, 0);
+    member->ready_deadline_ms =
+        transport_get_time_ms() +
+        3 * (int64_t)flow->cc_config.feedback_timeout_msec;
     member->key_pending = !send_current_key(flow, member);
   }
   t->stats.flexicast_rekeys++;
@@ -1153,7 +1088,7 @@ static void fallback_source_flow(transport_t *t,
                                  transport_flexicast_flow_t *flow) {
   if (!t || !flow || !flow->source)
     return;
-  t->stats.flexicast_pacing_dropped += clear_flow_queue(flow);
+  t->stats.flexicast_pacing_dropped += tf_clear_flow_queue(flow);
   for (size_t i = 0; i < flow->member_count; i++) {
     transport_flexicast_member_t *member = &flow->members[i];
     if (!member->conn || (!member->joined && !member->listening))
@@ -1178,12 +1113,15 @@ static void schedule_source_rekey(transport_t *t,
    * next epoch. Repair intent is cohort-specific, so cancel only repair work;
    * surviving members can re-request it after the batched rekey. */
   t->stats.flexicast_pacing_dropped += clear_flow_repair_queue(flow);
+  /* Anchor the batch to its first change: continuing membership churn must
+   * not postpone key rotation and publication indefinitely. */
+  if (!flow->rekey_pending)
+    flow->rekey_ready_at_ms =
+        now > INT64_MAX - TRANSPORT_FLEXICAST_REKEY_HOLDOFF_MS
+            ? INT64_MAX
+            : now + TRANSPORT_FLEXICAST_REKEY_HOLDOFF_MS;
   flow->rekey_pending = true;
   flow->rekey_pending_changes++;
-  flow->rekey_ready_at_ms =
-      now > INT64_MAX - TRANSPORT_FLEXICAST_REKEY_HOLDOFF_MS
-          ? INT64_MAX
-          : now + TRANSPORT_FLEXICAST_REKEY_HOLDOFF_MS;
 }
 
 static bool maybe_send_join(transport_flexicast_flow_t *flow) {
@@ -1433,9 +1371,10 @@ static void remove_source_member(transport_t *t,
   (void)quicly_flexicast_detach_at(flow->crypto, conn->id,
                                    transport_get_time_ms());
   (void)transport_flexicast_member_remove(t, flow, member);
-  if (!flow_has_members(flow))
+  if (!flow_has_members(flow)) {
+    retire_flow_id(t, flow->flow_id, flow->key_epoch);
     release_flow(t, flow);
-  else if (needs_rekey)
+  } else if (needs_rekey)
     schedule_source_rekey(t, flow, transport_get_time_ms());
 }
 
@@ -1640,7 +1579,9 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
     /* A qlinq UNSUBSCRIBE can retire the source cohort before its redundant
      * FC_STATE(LEAVE) arrives. Treat that late LEAVE as acknowledgement of an
      * already-abandoned flow, while keeping unknown JOIN/READY strict. */
-    return retired_flow_contains(t, flow_id) ||
+    uint32_t retired_epoch;
+    return (retired_flow_epoch(t, flow_id, &retired_epoch) &&
+            state->sequence <= retired_epoch) ||
            (t->is_server && state->action == QUICLY_FLEXICAST_STATE_LEAVE);
   }
   if (state->sequence < flow->key_epoch) {
@@ -1661,6 +1602,7 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
     if (state->action != QUICLY_FLEXICAST_STATE_LEAVE || flow->source ||
         flow->control_conn != conn)
       return false;
+    retire_flow_id(t, flow_id, flow->key_epoch);
     release_flow(t, flow);
     return true;
   }
@@ -1669,7 +1611,11 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
   transport_flexicast_member_t *member =
       transport_flexicast_member_find(flow, conn);
   if (!member)
-    return false;
+    /* An application UNSUBSCRIBE can overtake an earlier READY/LEAVE on the
+     * independently retransmitted control-frame path. Neither may reattach
+     * an absent subscriber. Unknown JOINs remain invalid. */
+    return state->action == QUICLY_FLEXICAST_STATE_READY ||
+           state->action == QUICLY_FLEXICAST_STATE_LEAVE;
   if (state->action == QUICLY_FLEXICAST_STATE_JOIN) {
     if (member->joined) {
       if (state->sequence > member->join_sequence)
@@ -1688,7 +1634,11 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
   } else if (state->action == QUICLY_FLEXICAST_STATE_READY) {
     uint8_t alias = 0;
     if (!member->joined)
-      return false;
+      return member->join_sequence != 0;
+    /* A READY for the old epoch cannot satisfy admission to the pending one,
+     * including a READY retransmission that crossed LEAVE then JOIN. */
+    if (flow->rekey_pending)
+      return true;
     member->key_pending = false;
     if (!member->listening &&
         quicly_flexicast_attach_at(flow->crypto, conn->id,
@@ -1696,6 +1646,7 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
             QUICLY_FLEXICAST_OK)
       return false;
     set_member_listening(t, flow, member, true, transport_get_time_ms());
+    member->ready_deadline_ms = 0;
     if (member->recovery_baseline_pending) {
       if (transport_subscriptions_find_alias(&conn->subscriptions,
                                              &flow->track_id, &alias) != 0)
@@ -1870,1601 +1821,6 @@ bool transport_flexicast_member_is_listening(
   return member_map_find(flow, conn, &slot) && flow->members[slot].listening;
 }
 
-static size_t socket_for_peer(const transport_t *t,
-                              const struct sockaddr *peer) {
-  for (size_t i = 0; i < t->num_fds; i++)
-    if (t->local_addrs[i].ss_family == peer->sa_family)
-      return i;
-  return SIZE_MAX;
-}
-
-static uint64_t member_delivery_rate(const transport_flexicast_member_t *member,
-                                     size_t packet_size) {
-  if (!member || !member->conn || !member->conn->quic)
-    return 0;
-  quicly_stats_t stats;
-  if (quicly_get_stats(member->conn->quic, &stats) != 0)
-    return 0;
-  uint64_t rate = stats.delivery_rate.smoothed != 0
-                      ? stats.delivery_rate.smoothed
-                      : stats.delivery_rate.latest;
-  if (rate == 0) {
-    uint64_t rtt = stats.rtt.smoothed != 0 ? stats.rtt.smoothed : 100;
-    uint64_t cwnd = stats.cc.cwnd >= packet_size ? stats.cc.cwnd : packet_size;
-    rate = cwnd > UINT64_MAX / 1000U ? UINT64_MAX : cwnd * 1000U / rtt;
-  }
-  return rate;
-}
-
-static size_t repair_symbol_count(const uint64_t *symbols);
-
-static size_t pending_repair_symbol_count(
-    const transport_flexicast_pending_repair_t *pending) {
-  return pending->mode == TRANSPORT_REPAIR_MODE_RATELESS
-             ? pending->requested_dof
-             : repair_symbol_count(pending->requested_symbols);
-}
-
-static uint64_t saturating_add_u64(uint64_t left, uint64_t right) {
-  return right > UINT64_MAX - left ? UINT64_MAX : left + right;
-}
-
-static void account_controller_airtime(transport_flexicast_flow_t *flow,
-                                       uint64_t bytes, bool repair) {
-  flow->cc_interval_physical_bytes =
-      saturating_add_u64(flow->cc_interval_physical_bytes, bytes);
-  if (repair)
-    flow->cc_interval_repair_bytes =
-        saturating_add_u64(flow->cc_interval_repair_bytes, bytes);
-}
-
-static void update_external_load_hint(const transport_t *t,
-                                      transport_flexicast_flow_t *flow,
-                                      quicly_flexicast_cc_hints_t *hints,
-                                      int64_t now) {
-  uint64_t interval = t->flexicast_cc_feedback_timeout_ms != 0
-                          ? t->flexicast_cc_feedback_timeout_ms
-                          : 1000U;
-  if (flow->cc_external_load_interval_started_ms == 0) {
-    flow->cc_external_load_interval_started_ms = now;
-    if (flow->cc_external_load_epoch == 0)
-      flow->cc_external_load_epoch = 1;
-  } else if (now > flow->cc_external_load_interval_started_ms &&
-             (uint64_t)(now - flow->cc_external_load_interval_started_ms) >=
-                 interval) {
-    flow->cc_external_load_fraction_ppm =
-        flow->cc_interval_physical_bytes == 0
-            ? 0
-            : (uint32_t)((flow->cc_interval_repair_bytes >
-                                  UINT64_MAX / FLEXICAST_EXTERNAL_LOAD_SCALE
-                              ? UINT64_MAX
-                              : flow->cc_interval_repair_bytes *
-                                    FLEXICAST_EXTERNAL_LOAD_SCALE) /
-                         flow->cc_interval_physical_bytes);
-    flow->cc_interval_physical_bytes = 0;
-    flow->cc_interval_repair_bytes = 0;
-    flow->cc_external_load_interval_started_ms = now;
-    if (flow->cc_external_load_epoch != UINT64_MAX)
-      flow->cc_external_load_epoch++;
-  }
-
-  uint64_t queued = flow->repair_queue.bytes;
-  uint64_t oldest = 0;
-  size_t packet_size = t->limits.max_udp_payload_size;
-  for (size_t i = 0; i < TRANSPORT_FLEXICAST_PENDING_REPAIRS; i++) {
-    const transport_flexicast_pending_repair_t *pending =
-        &flow->pending_repairs[i];
-    if (!pending->active)
-      continue;
-    size_t symbols = pending_repair_symbol_count(pending);
-    uint64_t bytes = symbols > UINT64_MAX / packet_size
-                         ? UINT64_MAX
-                         : (uint64_t)symbols * packet_size;
-    queued = saturating_add_u64(queued, bytes);
-    if (pending->first_request_ms > 0 && now > pending->first_request_ms &&
-        (uint64_t)(now - pending->first_request_ms) > oldest)
-      oldest = (uint64_t)(now - pending->first_request_ms);
-  }
-  for (size_t i = 0; i < flow->repair_queue.count; i++) {
-    const transport_flexicast_queued_payload_t *queued =
-        queue_at_const(&flow->repair_queue, i);
-    int64_t enqueued = queued->enqueued_at_ms;
-    if (enqueued > 0 && now > enqueued && (uint64_t)(now - enqueued) > oldest)
-      oldest = (uint64_t)(now - enqueued);
-  }
-  hints->external_load_epoch = flow->cc_external_load_epoch;
-  hints->external_load_queued_bytes = queued;
-  hints->external_load_oldest_age_msec = oldest;
-  hints->external_load_fraction_ppm = flow->cc_external_load_fraction_ppm;
-}
-
-static void update_controller_hints(transport_t *t,
-                                    transport_flexicast_flow_t *flow,
-                                    int64_t now) {
-  quicly_flexicast_cc_hints_t hints = {0};
-  uint64_t rates[TRANSPORT_FLEXICAST_MAX_FLOWS];
-  size_t count = 0;
-  int64_t active_window =
-      2 * (int64_t)(t->flexicast_cc_feedback_timeout_ms != 0
-                        ? t->flexicast_cc_feedback_timeout_ms
-                        : 1000U);
-  for (size_t i = 0; i < t->flexicast.capacity; i++) {
-    transport_flexicast_flow_t *candidate = &t->flexicast.flows[i];
-    if (!candidate->active || !candidate->source || !candidate->crypto ||
-        transport_flexicast_listening_members(candidate) == 0 ||
-        (candidate != flow && candidate->data_queue.count == 0 &&
-         candidate->repair_queue.count == 0 &&
-         candidate->pending_repair_count == 0 &&
-         (candidate->last_payload_sent_ms == 0 ||
-          now - candidate->last_payload_sent_ms > active_window)))
-      continue;
-    quicly_flexicast_cc_output_t output;
-    quicly_flexicast_cc_get_flow_output(candidate->crypto, &output);
-    rates[count++] = output.rate_bytes_per_second;
-  }
-  if (count == 0) {
-    quicly_flexicast_cc_output_t output;
-    quicly_flexicast_cc_get_flow_output(flow->crypto, &output);
-    rates[0] = output.rate_bytes_per_second;
-    count = 1;
-  }
-  for (size_t i = 1; i < count; i++) {
-    uint64_t value = rates[i];
-    size_t j = i;
-    while (j > 0 && rates[j - 1] > value) {
-      rates[j] = rates[j - 1];
-      j--;
-    }
-    rates[j] = value;
-  }
-  hints.active_senders = (uint32_t)count;
-  hints.median_sender_rate_bytes_per_second = rates[count / 2];
-  if (t->flexicast_cc_aggregate_rate_limit != 0)
-    hints.aggregate_rate_limit_bytes_per_second =
-        t->flexicast_cc_aggregate_rate_limit / count;
-  update_external_load_hint(t, flow, &hints, now);
-  quicly_flexicast_cc_set_flow_hints(flow->crypto, &hints, now);
-}
-
-static void refresh_pacer(transport_t *t, transport_flexicast_flow_t *flow,
-                          int64_t now) {
-  update_controller_hints(t, flow, now);
-  quicly_flexicast_cc_output_t cc_output;
-  quicly_flexicast_cc_get_flow_output(flow->crypto, &cc_output);
-  if (flow->listening_count == 0)
-    return;
-  uint64_t rate = cc_output.rate_bytes_per_second;
-  uint64_t burst = cc_output.burst_bytes;
-  if (rate == 0) {
-    uint64_t slowest = UINT64_MAX;
-    for (size_t i = 0; i < flow->member_count; i++) {
-      transport_flexicast_member_t *member = &flow->members[i];
-      if (!member->conn || !member->listening)
-        continue;
-      uint64_t member_rate =
-          member_delivery_rate(member, t->limits.max_udp_payload_size);
-      if (member_rate != 0 && member_rate < slowest)
-        slowest = member_rate;
-    }
-    if (slowest == UINT64_MAX)
-      slowest = 64U * 1024U;
-    /* Compatibility fallback for flows created without a controller. */
-    rate = slowest * 4U / 5U;
-  }
-  if (burst == 0)
-    burst = rate / 20U;
-  uint64_t minimum_burst = t->limits.max_udp_payload_size * 4U;
-  if (burst < minimum_burst)
-    burst = minimum_burst;
-  uint64_t maximum_burst = t->limits.max_udp_payload_size * 10U;
-  if (burst > maximum_burst)
-    burst = maximum_burst;
-
-  if (flow->pacing_last_refill_ms == 0) {
-    flow->pacing_tokens = burst;
-    flow->pacing_last_refill_ms = now;
-  } else if (now > flow->pacing_last_refill_ms) {
-    uint64_t elapsed = (uint64_t)(now - flow->pacing_last_refill_ms);
-    if (elapsed > 60000U)
-      elapsed = 60000U;
-    uint64_t numerator = elapsed * rate + flow->pacing_remainder;
-    uint64_t added = numerator / 1000U;
-    flow->pacing_remainder = numerator % 1000U;
-    flow->pacing_tokens =
-        added >= burst -
-                     (flow->pacing_tokens < burst ? flow->pacing_tokens : burst)
-            ? burst
-            : flow->pacing_tokens + added;
-    flow->pacing_last_refill_ms = now;
-  }
-  flow->pacing_rate_bytes_per_second = rate;
-  flow->pacing_burst_bytes = burst;
-  if (flow->pacing_tokens > burst)
-    flow->pacing_tokens = burst;
-}
-
-static size_t pacing_cost(const transport_flexicast_flow_t *flow,
-                          size_t packet_size) {
-  if (flow->native_multicast)
-    return packet_size;
-  size_t members = transport_flexicast_listening_members(flow);
-  return members != 0 && packet_size <= SIZE_MAX / members
-             ? packet_size * members
-             : SIZE_MAX;
-}
-
-typedef enum {
-  FLEXICAST_DISPATCH_OK,
-  FLEXICAST_DISPATCH_BLOCKED,
-  FLEXICAST_DISPATCH_FAILED,
-} flexicast_dispatch_result_t;
-
-static flexicast_dispatch_result_t
-dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
-                 ptls_iovec_t payload) {
-  if (payload.len > SIZE_MAX - 128U)
-    return FLEXICAST_DISPATCH_FAILED;
-  size_t capacity = payload.len + 128U;
-  uint8_t *packet = malloc(capacity);
-  if (!packet)
-    return FLEXICAST_DISPATCH_FAILED;
-  size_t packet_size = 0;
-  uint64_t packet_number = 0;
-  int send_result = quicly_flexicast_send_datagram_at(
-      flow->crypto, payload, packet, capacity, &packet_size, &packet_number,
-      transport_get_time_ms());
-  if (send_result != QUICLY_FLEXICAST_OK) {
-    free(packet);
-    return send_result == QUICLY_FLEXICAST_ERROR_SEND_WINDOW
-               ? FLEXICAST_DISPATCH_BLOCKED
-               : FLEXICAST_DISPATCH_FAILED;
-  }
-
-  bool sent_any = false;
-  struct iovec vec = {.iov_base = packet, .iov_len = packet_size};
-  if (flow->native_multicast && t->flexicast_native_source) {
-    struct sockaddr *group = (struct sockaddr *)&t->flexicast_group_addr;
-    size_t fd_index = socket_for_peer(t, group);
-    int interface_result = -1;
-    if (fd_index != SIZE_MAX && group->sa_family == AF_INET)
-      interface_result = setsockopt(t->fds[fd_index], IPPROTO_IP,
-                                    IP_MULTICAST_IF, &t->flexicast_interface_v4,
-                                    sizeof(t->flexicast_interface_v4));
-    else if (fd_index != SIZE_MAX && group->sa_family == AF_INET6) {
-      int loopback = 1;
-      interface_result = setsockopt(
-          t->fds[fd_index], IPPROTO_IPV6, IPV6_MULTICAST_IF,
-          &t->flexicast_interface_index, sizeof(t->flexicast_interface_index));
-      if (interface_result == 0)
-        interface_result =
-            setsockopt(t->fds[fd_index], IPPROTO_IPV6, IPV6_MULTICAST_LOOP,
-                       &loopback, sizeof(loopback));
-    }
-    if (fd_index != SIZE_MAX && interface_result == 0 &&
-        transport_egress_submit(&t->egress[fd_index], t->fds[fd_index], group,
-                                t->flexicast_group_addr_len, &vec, 1)) {
-      advance_delivery_epoch(flow);
-      t->stats.flexicast_packets_sent++;
-      t->stats.flexicast_native_packets_sent++;
-      flow->last_payload_sent_ms = transport_get_time_ms();
-      free(packet);
-      return FLEXICAST_DISPATCH_OK;
-    }
-    /* Queueing or interface selection failed locally. The exact same protected
-     * packet can still be sent to every member's unicast endpoint. */
-    t->stats.flexicast_fallbacks++;
-  }
-  for (size_t i = 0; i < flow->member_count; i++) {
-    transport_flexicast_member_t *member = &flow->members[i];
-    if (!member->conn || !member->listening || !member->conn->quic)
-      continue;
-    struct sockaddr *peer = quicly_get_peername(member->conn->quic);
-    size_t fd_index = peer ? socket_for_peer(t, peer) : SIZE_MAX;
-    if (fd_index != SIZE_MAX &&
-        transport_egress_submit(&t->egress[fd_index], t->fds[fd_index], peer,
-                                quicly_get_socklen(peer), &vec, 1)) {
-      sent_any = true;
-      continue;
-    }
-    int complete = 0;
-    (void)quicly_flexicast_abandon_datagram(flow->crypto, member->conn->id,
-                                            packet_number, &complete);
-    (void)quicly_flexicast_detach_at(flow->crypto, member->conn->id,
-                                     transport_get_time_ms());
-    set_member_listening(t, flow, member, false, 0);
-    t->stats.flexicast_fallbacks++;
-  }
-  if (sent_any) {
-    advance_delivery_epoch(flow);
-    t->stats.flexicast_packets_sent++;
-    flow->last_payload_sent_ms = transport_get_time_ms();
-  }
-  free(packet);
-  return sent_any ? FLEXICAST_DISPATCH_OK : FLEXICAST_DISPATCH_FAILED;
-}
-
-bool transport_flexicast_can_queue(const transport_t *t,
-                                   const transport_flexicast_flow_t *flow,
-                                   size_t packets, size_t bytes) {
-  if (!t || !flow || packets > TRANSPORT_FLEXICAST_QUEUE_CAPACITY ||
-      flow->data_queue.count > TRANSPORT_FLEXICAST_QUEUE_CAPACITY ||
-      packets > TRANSPORT_FLEXICAST_QUEUE_CAPACITY - flow->data_queue.count ||
-      bytes > t->limits.max_egress_bytes_per_socket ||
-      flow->data_queue.bytes > t->limits.max_egress_bytes_per_socket ||
-      flow->repair_queue.bytes > t->limits.max_egress_bytes_per_socket ||
-      flow->repair_queue.bytes >
-          t->limits.max_egress_bytes_per_socket - flow->data_queue.bytes ||
-      bytes > t->limits.max_egress_bytes_per_socket - flow->data_queue.bytes -
-                  flow->repair_queue.bytes)
-    return false;
-  return true;
-}
-
-static bool queue_payload(transport_t *t, transport_flexicast_flow_t *flow,
-                          ptls_iovec_t payload) {
-  if (payload.len > SIZE_MAX - 128U ||
-      !transport_flexicast_can_queue(t, flow, 1, payload.len)) {
-    t->stats.flexicast_pacing_backpressure++;
-    return false;
-  }
-  uint8_t *copy = malloc(payload.len);
-  if (!copy)
-    return false;
-  memcpy(copy, payload.base, payload.len);
-  transport_flexicast_queued_payload_t queued = {.data = copy,
-                                                 .size = payload.len,
-                                                 .enqueued_at_ms =
-                                                     transport_get_time_ms()};
-  if (!queue_push(&flow->data_queue, &queued)) {
-    free(copy);
-    return false;
-  }
-  t->stats.flexicast_pacing_delays++;
-  return true;
-}
-
-static bool repair_queue_can_accept(const transport_t *t,
-                                    const transport_flexicast_flow_t *flow,
-                                    size_t packets, size_t bytes) {
-  if (!t || !flow || packets > TRANSPORT_FLEXICAST_REPAIR_QUEUE_CAPACITY ||
-      flow->repair_queue.count > TRANSPORT_FLEXICAST_REPAIR_QUEUE_CAPACITY ||
-      packets > TRANSPORT_FLEXICAST_REPAIR_QUEUE_CAPACITY -
-                    flow->repair_queue.count ||
-      bytes > t->limits.max_egress_bytes_per_socket ||
-      flow->data_queue.bytes > t->limits.max_egress_bytes_per_socket ||
-      flow->repair_queue.bytes > t->limits.max_egress_bytes_per_socket ||
-      flow->data_queue.bytes >
-          t->limits.max_egress_bytes_per_socket - flow->repair_queue.bytes ||
-      bytes > t->limits.max_egress_bytes_per_socket - flow->data_queue.bytes -
-                  flow->repair_queue.bytes)
-    return false;
-  return true;
-}
-
-static bool queue_repair_payload(transport_t *t,
-                                 transport_flexicast_flow_t *flow,
-                                 ptls_iovec_t payload, uint64_t group_id,
-                                 uint64_t object_id, uint16_t symbol_index,
-                                 transport_repair_mode_t mode, int64_t now) {
-  if (payload.len > SIZE_MAX - 128U ||
-      !repair_queue_can_accept(t, flow, 1, payload.len))
-    return false;
-  uint8_t *copy = malloc(payload.len);
-  if (!copy)
-    return false;
-  memcpy(copy, payload.base, payload.len);
-  bool was_empty = flow->repair_queue.count == 0;
-  transport_flexicast_queued_payload_t queued = {.data = copy,
-                                                 .size = payload.len,
-                                                 .enqueued_at_ms = now,
-                                                 .group_id = group_id,
-                                                 .object_id = object_id,
-                                                 .symbol_index = symbol_index,
-                                                 .repair_mode = mode};
-  if (!queue_push(&flow->repair_queue, &queued)) {
-    free(copy);
-    return false;
-  }
-  if (was_empty && (flow->last_repair_sent_ms == 0 ||
-                    now - flow->last_repair_sent_ms >=
-                        TRANSPORT_FLEXICAST_REPAIR_PRIORITY_IDLE_MS))
-    flow->repair_priority_available = true;
-  t->stats.flexicast_pacing_delays++;
-  return true;
-}
-
-static transport_flexicast_pending_repair_t *
-find_pending_repair(transport_flexicast_flow_t *flow, uint64_t group_id,
-                    uint64_t object_id, transport_repair_mode_t mode) {
-  for (size_t i = 0; i < TRANSPORT_FLEXICAST_PENDING_REPAIRS; i++) {
-    transport_flexicast_pending_repair_t *pending = &flow->pending_repairs[i];
-    if (pending->active && pending->group_id == group_id &&
-        pending->object_id == object_id && pending->mode == mode)
-      return pending;
-  }
-  return NULL;
-}
-
-static transport_flexicast_repair_requester_t *
-requester_store_find(transport_flexicast_requester_store_t *store,
-                     uint64_t request_id, uint64_t member_id) {
-  for (size_t i = 0; i < store->count; i++) {
-    transport_flexicast_repair_requester_t *requester = &store->entries[i];
-    if (requester->request_id == request_id &&
-        requester->member_id == member_id)
-      return requester;
-  }
-  return NULL;
-}
-
-static transport_flexicast_repair_requester_t *
-requester_store_append(transport_flexicast_requester_store_t *store) {
-  if (store->count < store->capacity)
-    return &store->entries[store->count++];
-  if (store->capacity >= TRANSPORT_FLEXICAST_REPAIR_REQUESTERS)
-    return NULL;
-  size_t capacity = store->capacity == 0 ? 16U : store->capacity * 2U;
-  if (capacity > TRANSPORT_FLEXICAST_REPAIR_REQUESTERS)
-    capacity = TRANSPORT_FLEXICAST_REPAIR_REQUESTERS;
-  if (capacity > SIZE_MAX / sizeof(*store->entries))
-    return NULL;
-  transport_flexicast_repair_requester_t *requesters =
-      realloc(store->entries, capacity * sizeof(*requesters));
-  if (!requesters)
-    return NULL;
-  store->entries = requesters;
-  store->capacity = capacity;
-  return &store->entries[store->count++];
-}
-
-static void get_requester_delivery_stats(
-    const transport_flexicast_flow_t *flow, uint64_t member_id,
-    uint64_t *delivery_rate, int64_t *last_feedback) {
-  *delivery_rate = 0;
-  *last_feedback = 0;
-  if (!flow->crypto)
-    return;
-  quicly_flexicast_member_stats_t stats;
-  if (quicly_flexicast_get_member_stats(flow->crypto, member_id, &stats) ==
-      QUICLY_FLEXICAST_OK) {
-    *delivery_rate = stats.delivery_rate_bytes_per_second;
-    *last_feedback = stats.last_feedback_at;
-  }
-}
-
-static void record_requested_symbols(
-    transport_flexicast_repair_requester_t *requester,
-    transport_repair_mode_t mode, bool whole_object, size_t deficit,
-    const uint16_t *missing, size_t missing_count) {
-  if (!requester || mode != TRANSPORT_REPAIR_MODE_INDEXED)
-    return;
-  if (whole_object) {
-    if (deficit > QLINQ_WIRE_MAX_NACK_SYMBOLS)
-      deficit = QLINQ_WIRE_MAX_NACK_SYMBOLS;
-    for (size_t i = 0; i < deficit; i++)
-      requester->requested_symbols[i / 64U] |= UINT64_C(1) << (i % 64U);
-  } else {
-    for (size_t i = 0; missing && i < missing_count; i++)
-      if (missing[i] < QLINQ_WIRE_MAX_NACK_SYMBOLS)
-        requester->requested_symbols[missing[i] / 64U] |=
-            UINT64_C(1) << (missing[i] % 64U);
-  }
-}
-
-static size_t
-requester_store_remove(transport_flexicast_requester_store_t *store,
-                       uint64_t request_id) {
-  size_t removed = 0;
-  for (size_t i = 0; i < store->count;) {
-    if (store->entries[i].request_id != request_id) {
-      i++;
-      continue;
-    }
-    store->entries[i] = store->entries[--store->count];
-    removed++;
-  }
-  if (store->count == 0) {
-    free(store->entries);
-    memset(store, 0, sizeof(*store));
-  }
-  return removed;
-}
-
-static void observe_repair_requester(
-    transport_t *t, transport_flexicast_flow_t *flow,
-    transport_flexicast_pending_repair_t *pending, uint64_t member_id,
-    size_t deficit, transport_repair_mode_t mode, bool whole_object,
-    const uint16_t *missing, size_t missing_count, int64_t now_ms) {
-  if (deficit == 0)
-    return;
-  if (deficit > UINT16_MAX)
-    deficit = UINT16_MAX;
-
-  uint64_t delivery_rate;
-  int64_t last_feedback;
-  get_requester_delivery_stats(flow, member_id, &delivery_rate, &last_feedback);
-  uint64_t feedback_age = last_feedback > 0 && now_ms > last_feedback
-                              ? (uint64_t)(now_ms - last_feedback)
-                              : 0;
-
-  transport_flexicast_repair_requester_t *requester = requester_store_find(
-      &flow->repair_requesters, pending->intent_id, member_id);
-  if (requester) {
-    if (pending->retained_deficit_sum >= requester->deficit)
-      pending->retained_deficit_sum -= requester->deficit;
-    if (deficit < requester->deficit && !requester->shared_repair_useful) {
-      requester->shared_repair_useful = true;
-      pending->shared_useful_requesters++;
-    }
-    requester->deficit = (uint16_t)deficit;
-    requester->delivery_rate_bytes_per_second = delivery_rate;
-    requester->last_feedback_ms = last_feedback;
-    requester->last_request_ms = now_ms;
-    memset(requester->requested_symbols, 0,
-           sizeof(requester->requested_symbols));
-    pending->retained_deficit_sum =
-        saturating_add_u64(pending->retained_deficit_sum, (uint64_t)deficit);
-    t->stats.repair_requester_updates++;
-  } else if (!(requester = requester_store_append(&flow->repair_requesters))) {
-    pending->overflow_requests++;
-    pending->overflow_deficit_sum =
-        saturating_add_u64(pending->overflow_deficit_sum, (uint64_t)deficit);
-    t->stats.repair_requester_overflow++;
-  } else {
-    *requester = (transport_flexicast_repair_requester_t){
-        .request_id = pending->intent_id,
-        .member_id = member_id,
-        .deficit = (uint16_t)deficit,
-        .delivery_rate_bytes_per_second = delivery_rate,
-        .first_request_ms = now_ms,
-        .last_request_ms = now_ms,
-        .last_feedback_ms = last_feedback,
-        .shared_repair_useful = true};
-    pending->retained_requesters++;
-    pending->shared_useful_requesters++;
-    pending->retained_deficit_sum =
-        saturating_add_u64(pending->retained_deficit_sum, (uint64_t)deficit);
-    if (flow->repair_requesters.count > t->stats.repair_requester_records_peak)
-      t->stats.repair_requester_records_peak = flow->repair_requesters.count;
-  }
-  if (deficit > pending->maximum_requester_deficit)
-    pending->maximum_requester_deficit = (uint16_t)deficit;
-  if (feedback_age > pending->oldest_feedback_age_ms)
-    pending->oldest_feedback_age_ms = feedback_age;
-  if (delivery_rate != 0 &&
-      (pending->minimum_delivery_rate_bytes_per_second == 0 ||
-       delivery_rate < pending->minimum_delivery_rate_bytes_per_second))
-    pending->minimum_delivery_rate_bytes_per_second = delivery_rate;
-
-  record_requested_symbols(requester, mode, whole_object, deficit, missing,
-                           missing_count);
-}
-
-static void expire_repair_requesters(transport_t *t,
-                                     transport_flexicast_flow_t *flow,
-                                     uint64_t intent_id) {
-  size_t expired = requester_store_remove(&flow->repair_requesters, intent_id);
-  t->stats.repair_requester_records_expired =
-      saturating_add_u64(t->stats.repair_requester_records_expired, expired);
-}
-
-static transport_flexicast_shadow_observation_t *
-find_shadow_observation(transport_flexicast_flow_t *flow, uint64_t group_id,
-                        uint64_t object_id, transport_repair_mode_t mode) {
-  for (size_t i = 0; i < TRANSPORT_FLEXICAST_SHADOW_OBSERVATIONS; i++) {
-    transport_flexicast_shadow_observation_t *observation =
-        &flow->shadow_observations[i];
-    if (observation->active && observation->group_id == group_id &&
-        observation->object_id == object_id && observation->mode == mode)
-      return observation;
-  }
-  return NULL;
-}
-
-static void clear_shadow_observation(
-    transport_flexicast_flow_t *flow,
-    transport_flexicast_shadow_observation_t *observation) {
-  if (!flow || !observation || !observation->active)
-    return;
-  uint64_t observation_id = observation->observation_id;
-  (void)requester_store_remove(&flow->shadow_requesters, observation_id);
-  memset(observation, 0, sizeof(*observation));
-  if (flow->shadow_observation_count != 0)
-    flow->shadow_observation_count--;
-}
-
-void transport_flexicast_observe_repair_request(
-    transport_t *t, transport_flexicast_flow_t *flow,
-    const sent_object_cache_t *object, uint64_t requester_id,
-    transport_repair_mode_t mode, bool whole_object, const uint16_t *missing,
-    size_t missing_count,
-    transport_flexicast_observation_disposition_t disposition, int64_t now_ms) {
-  if (!t || !t->repair_shadow_log || !flow || !object || requester_id == 0 ||
-      (mode != TRANSPORT_REPAIR_MODE_INDEXED &&
-       mode != TRANSPORT_REPAIR_MODE_RATELESS))
-    return;
-  size_t deficit = whole_object ? object->data_symbols : missing_count;
-  if (deficit == 0)
-    return;
-  if (deficit > UINT16_MAX)
-    deficit = UINT16_MAX;
-
-  transport_flexicast_shadow_observation_t *observation =
-      find_shadow_observation(flow, object->group_id, object->object_id, mode);
-  if (!observation) {
-    for (size_t i = 0; i < TRANSPORT_FLEXICAST_SHADOW_OBSERVATIONS; i++) {
-      if (!flow->shadow_observations[i].active) {
-        observation = &flow->shadow_observations[i];
-        break;
-      }
-    }
-    if (!observation) {
-      t->stats.repair_shadow_observation_overflow++;
-      return;
-    }
-    if (++flow->next_shadow_observation_id == 0)
-      flow->next_shadow_observation_id = 1;
-    *observation = (transport_flexicast_shadow_observation_t){
-        .active = true,
-        .observation_id = flow->next_shadow_observation_id,
-        .group_id = object->group_id,
-        .object_id = object->object_id,
-        .mode = mode,
-        .first_request_ms = now_ms,
-        .ready_at_ms = now_ms + TRANSPORT_FLEXICAST_SHADOW_OBSERVATION_MS,
-        .cohort_member_count = transport_flexicast_listening_members(flow)};
-    flow->shadow_observation_count++;
-  }
-  size_t cohort_members = transport_flexicast_listening_members(flow);
-  if (cohort_members > observation->cohort_member_count)
-    observation->cohort_member_count = cohort_members;
-  switch (disposition) {
-  case TRANSPORT_FLEXICAST_OBS_ACCEPTED:
-    observation->accepted_requests++;
-    break;
-  case TRANSPORT_FLEXICAST_OBS_SUPPRESSED:
-    observation->suppressed_requests++;
-    break;
-  case TRANSPORT_FLEXICAST_OBS_THROTTLED:
-    observation->throttled_requests++;
-    break;
-  }
-
-  transport_flexicast_repair_requester_t *requester = requester_store_find(
-      &flow->shadow_requesters, observation->observation_id, requester_id);
-  if (!requester) {
-    requester = requester_store_append(&flow->shadow_requesters);
-    if (!requester) {
-      observation->overflow_requests++;
-      t->stats.repair_shadow_observation_overflow++;
-      return;
-    }
-    *requester = (transport_flexicast_repair_requester_t){
-        .request_id = observation->observation_id,
-        .member_id = requester_id,
-        .deficit = (uint16_t)deficit,
-        .first_request_ms = now_ms,
-        .last_request_ms = now_ms};
-  } else {
-    if (deficit > requester->deficit)
-      requester->deficit = (uint16_t)deficit;
-    requester->last_request_ms = now_ms;
-  }
-
-  get_requester_delivery_stats(flow, requester_id,
-                               &requester->delivery_rate_bytes_per_second,
-                               &requester->last_feedback_ms);
-  record_requested_symbols(requester, mode, whole_object, deficit, missing,
-                           missing_count);
-}
-
-static bool repair_symbol_is_covered(const transport_flexicast_flow_t *flow,
-                                     uint64_t group_id, uint64_t object_id,
-                                     uint16_t symbol_index, int64_t now_ms) {
-  for (size_t i = 0; i < flow->repair_queue.count; i++) {
-    const transport_flexicast_queued_payload_t *queued =
-        queue_at_const(&flow->repair_queue, i);
-    if (queued->group_id == group_id && queued->object_id == object_id &&
-        queued->symbol_index == symbol_index)
-      return true;
-  }
-  for (size_t i = 0; i < TRANSPORT_FLEXICAST_RECENT_REPAIRS; i++) {
-    const transport_flexicast_recent_repair_t *recent =
-        &flow->recent_repairs[i];
-    if (recent->active && recent->expires_at_ms > now_ms &&
-        recent->group_id == group_id && recent->object_id == object_id &&
-        recent->symbol_index == symbol_index)
-      return true;
-  }
-  return false;
-}
-
-static size_t repair_symbol_count(const uint64_t *symbols) {
-  size_t count = 0;
-  for (size_t i = 0; i < QLINQ_WIRE_MAX_NACK_SYMBOLS / 64U; i++) {
-    uint64_t word = symbols[i];
-    while (word != 0) {
-      word &= word - 1U;
-      count++;
-    }
-  }
-  return count;
-}
-
-static size_t
-rateless_repair_count_covered(const transport_flexicast_flow_t *flow,
-                              uint64_t group_id, uint64_t object_id,
-                              int64_t now_ms) {
-  size_t count = 0;
-  for (size_t i = 0; i < flow->repair_queue.count; i++) {
-    const transport_flexicast_queued_payload_t *queued =
-        queue_at_const(&flow->repair_queue, i);
-    if (queued->group_id == group_id && queued->object_id == object_id &&
-        queued->repair_mode == TRANSPORT_REPAIR_MODE_RATELESS)
-      count++;
-  }
-  for (size_t i = 0; i < TRANSPORT_FLEXICAST_RECENT_REPAIRS; i++) {
-    const transport_flexicast_recent_repair_t *recent =
-        &flow->recent_repairs[i];
-    if (recent->active && recent->expires_at_ms > now_ms &&
-        recent->group_id == group_id && recent->object_id == object_id &&
-        recent->mode == TRANSPORT_REPAIR_MODE_RATELESS)
-      count++;
-  }
-  return count;
-}
-
-static transport_conn_t *find_connection_by_id(transport_t *t,
-                                               uint64_t member_id) {
-  if (!t || member_id > UINT32_MAX)
-    return NULL;
-  size_t count = t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
-  for (size_t i = 0; i < count; i++) {
-    transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
-    if (conn && conn->id == (uint32_t)member_id)
-      return conn;
-  }
-  return NULL;
-}
-
-static uint32_t shared_delivery_ppm(const transport_flexicast_flow_t *flow,
-                                    uint64_t delivery_rate) {
-  if (!flow || flow->pacing_rate_bytes_per_second == 0 || delivery_rate == 0)
-    return 0;
-  __extension__ typedef unsigned __int128 wide_t;
-  wide_t scaled = (wide_t)delivery_rate * 1000000U;
-  scaled /= flow->pacing_rate_bytes_per_second;
-  return scaled >= 1000000U ? 1000000U : (uint32_t)scaled;
-}
-
-static bool build_shadow_observation_snapshot(
-    transport_t *t, transport_flexicast_flow_t *flow,
-    const transport_flexicast_shadow_observation_t *observation,
-    const sent_object_cache_t *object, int64_t now,
-    transport_repair_planner_snapshot_t *snapshot,
-    transport_repair_planner_requester_t **allocated) {
-  if (!t || !flow || !observation || !object || !snapshot || !allocated)
-    return false;
-  size_t count = 0;
-  for (size_t i = 0; i < flow->shadow_requesters.count; i++)
-    if (flow->shadow_requesters.entries[i].request_id ==
-        observation->observation_id)
-      count++;
-  if (count == 0)
-    return false;
-  transport_repair_planner_requester_t *requesters =
-      calloc(count, sizeof(*requesters));
-  if (!requesters)
-    return false;
-
-  size_t output = 0;
-  size_t cohort_members = observation->cohort_member_count;
-  size_t current_members = transport_flexicast_listening_members(flow);
-  if (current_members > cohort_members)
-    cohort_members = current_members;
-  bool incomplete = observation->overflow_requests != 0 ||
-                    observation->throttled_requests != 0;
-  for (size_t i = 0; i < flow->shadow_requesters.count; i++) {
-    const transport_flexicast_repair_requester_t *source =
-        &flow->shadow_requesters.entries[i];
-    if (source->request_id != observation->observation_id)
-      continue;
-    transport_repair_planner_requester_t *requester = &requesters[output++];
-    requester->member_id = source->member_id;
-    requester->deficit = source->deficit;
-    requester->feedback_age_ms =
-        source->last_feedback_ms > 0 && now > source->last_feedback_ms
-            ? (uint64_t)(now - source->last_feedback_ms)
-            : 0;
-    requester->shared_delivery_probability_ppm =
-        shared_delivery_ppm(flow, source->delivery_rate_bytes_per_second);
-    memcpy(requester->requested_symbols, source->requested_symbols,
-           sizeof(requester->requested_symbols));
-
-    transport_conn_t *conn = find_connection_by_id(t, source->member_id);
-    if (!conn) {
-      incomplete = true;
-      continue;
-    }
-    requester->path_count = t->num_fds;
-    for (size_t path = 0; path < requester->path_count; path++) {
-      const path_state_t *state = &conn->path_states[path];
-      transport_repair_planner_path_t *entry = &requester->paths[path];
-      entry->resource_id = t->local_ifindices[path];
-      entry->measurement_known = state->initialized && state->b_ewma > 0;
-      entry->estimate.b = state->b_ewma > 0 ? state->b_ewma : FP_FROM_INT(100);
-      entry->estimate.l = state->l_ewma;
-      entry->estimate.p = state->p_ewma;
-      entry->estimate.q = state->q_ewma;
-    }
-  }
-
-  *snapshot = (transport_repair_planner_snapshot_t){
-      .version = TRANSPORT_REPAIR_PLANNER_VERSION,
-      .intent_id = observation->observation_id,
-      .group_id = observation->group_id,
-      .object_id = observation->object_id,
-      .mode = observation->mode,
-      .symbol_size = object->symbol_size,
-      .packet_overhead = QLINQ_WIRE_FEC_HEADER_SIZE + 128U,
-      .deadline_ms = t->repair_shadow_deadline_ms,
-      .shared_rate_bytes_per_second = flow->pacing_rate_bytes_per_second,
-      .shared_resource_id = flow->interface_index,
-      .shared_physical_copies = flow->native_multicast ? 1U : cohort_members,
-      .cohort_member_count = cohort_members,
-      .observation_window_ms = TRANSPORT_FLEXICAST_SHADOW_OBSERVATION_MS,
-      .observation_age_ms =
-          now > observation->first_request_ms
-              ? (uint64_t)(now - observation->first_request_ms)
-              : 0,
-      .accepted_request_count = observation->accepted_requests,
-      .suppressed_request_count = observation->suppressed_requests,
-      .throttled_request_count = observation->throttled_requests,
-      .observation_overflow_count = observation->overflow_requests,
-      .incomplete_requester_state = incomplete,
-      .requesters = requesters,
-      .requester_count = count};
-  *allocated = requesters;
-  return true;
-}
-
-static void emit_ready_shadow_observations(transport_t *t,
-                                           transport_flexicast_flow_t *flow,
-                                           int64_t now) {
-  if (!t || !flow || !t->repair_shadow_log)
-    return;
-  for (size_t index = 0; index < TRANSPORT_FLEXICAST_SHADOW_OBSERVATIONS;
-       index++) {
-    transport_flexicast_shadow_observation_t *observation =
-        &flow->shadow_observations[index];
-    if (!observation->active || now < observation->ready_at_ms)
-      continue;
-    sent_object_cache_t *object = transport_sent_cache_find(
-        &t->sent_cache, &flow->track_id, observation->group_id,
-        observation->object_id);
-    if (!object) {
-      clear_shadow_observation(flow, observation);
-      continue;
-    }
-    transport_repair_planner_snapshot_t snapshot;
-    transport_repair_planner_requester_t *requesters = NULL;
-    transport_repair_planner_evaluation_t evaluation;
-    if (!build_shadow_observation_snapshot(t, flow, observation, object, now,
-                                           &snapshot, &requesters) ||
-        !transport_repair_planner_evaluate(&snapshot, &evaluation)) {
-      t->stats.repair_shadow_log_errors++;
-      free(requesters);
-      clear_shadow_observation(flow, observation);
-      continue;
-    }
-    t->stats.repair_shadow_plans_evaluated++;
-    switch (evaluation.chosen.action) {
-    case TRANSPORT_REPAIR_PLAN_ALL_SHARED:
-      t->stats.repair_shadow_all_shared++;
-      break;
-    case TRANSPORT_REPAIR_PLAN_ALL_UNICAST:
-      t->stats.repair_shadow_all_unicast++;
-      break;
-    case TRANSPORT_REPAIR_PLAN_MIXED:
-      t->stats.repair_shadow_mixed++;
-      break;
-    }
-    if (evaluation.chosen.uncertain || evaluation.chosen.approximate)
-      t->stats.repair_shadow_uncertain++;
-    if (!evaluation.chosen.feasible)
-      t->stats.repair_shadow_infeasible++;
-    t->stats.repair_shadow_last_airtime_us =
-        evaluation.chosen.aggregate_airtime_us;
-    t->stats.repair_shadow_last_physical_bytes =
-        evaluation.chosen.physical_bytes;
-    t->stats.repair_shadow_last_savings_ppm =
-        evaluation.chosen_savings_vs_shared_ppm;
-    if (t->repair_shadow_log &&
-        (!transport_repair_planner_record_write(t->repair_shadow_log, &snapshot,
-                                                &evaluation) ||
-         fflush(t->repair_shadow_log) != 0))
-      t->stats.repair_shadow_log_errors++;
-    free(requesters);
-    clear_shadow_observation(flow, observation);
-  }
-}
-
-static void clear_pending_repair(transport_t *t,
-                                 transport_flexicast_flow_t *flow,
-                                 transport_flexicast_pending_repair_t *pending);
-
-bool transport_flexicast_schedule_repair(
-    transport_t *t, transport_flexicast_flow_t *flow,
-    const sent_object_cache_t *object, uint64_t requester_id,
-    transport_repair_mode_t mode, bool whole_object, const uint16_t *missing,
-    size_t missing_count, int64_t now_ms) {
-  if (!t || !flow || !flow->source || !object ||
-      !transport_track_id_equal(&flow->track_id, &object->track_id) ||
-      (mode != TRANSPORT_REPAIR_MODE_INDEXED &&
-       mode != TRANSPORT_REPAIR_MODE_RATELESS) ||
-      (mode == TRANSPORT_REPAIR_MODE_INDEXED && !whole_object &&
-       (!missing || missing_count == 0)) ||
-      (mode == TRANSPORT_REPAIR_MODE_RATELESS && !whole_object &&
-       missing_count == 0))
-    return false;
-  if (mode == TRANSPORT_REPAIR_MODE_INDEXED && !whole_object)
-    for (size_t i = 0; i < missing_count; i++)
-      if (missing[i] >= QLINQ_WIRE_MAX_NACK_SYMBOLS)
-        return false;
-
-  size_t requester_deficit =
-      whole_object ? object->data_symbols : missing_count;
-  if (requester_deficit > TRANSPORT_REPAIR_MAX_SYMBOLS)
-    requester_deficit = TRANSPORT_REPAIR_MAX_SYMBOLS;
-  transport_flexicast_pending_repair_t *pending =
-      find_pending_repair(flow, object->group_id, object->object_id, mode);
-  bool merging = pending != NULL;
-  if (mode == TRANSPORT_REPAIR_MODE_RATELESS) {
-    size_t covered =
-        t->flexicast_repair_route == TRANSPORT_FLEXICAST_REPAIR_SHARED
-            ? rateless_repair_count_covered(flow, object->group_id,
-                                            object->object_id, now_ms)
-            : 0;
-    if (requester_deficit <= covered) {
-      t->stats.repair_requests_merged++;
-      return true;
-    }
-    missing_count = requester_deficit - covered;
-  }
-  if (!pending) {
-    bool fully_queued =
-        t->flexicast_repair_route == TRANSPORT_FLEXICAST_REPAIR_SHARED;
-    if (mode == TRANSPORT_REPAIR_MODE_RATELESS) {
-      fully_queued = false;
-    } else if (whole_object) {
-      size_t count = object->data_symbols;
-      if (count > TRANSPORT_REPAIR_MAX_SYMBOLS)
-        count = TRANSPORT_REPAIR_MAX_SYMBOLS;
-      for (size_t i = 0; i < count; i++)
-        fully_queued &= repair_symbol_is_covered(
-            flow, object->group_id, object->object_id, (uint16_t)i, now_ms);
-    } else {
-      for (size_t i = 0; i < missing_count; i++)
-        fully_queued &= repair_symbol_is_covered(
-            flow, object->group_id, object->object_id, missing[i], now_ms);
-    }
-    if (fully_queued) {
-      t->stats.repair_requests_merged++;
-      return true;
-    }
-  }
-  if (!pending) {
-    for (size_t i = 0; i < TRANSPORT_FLEXICAST_PENDING_REPAIRS; i++) {
-      if (!flow->pending_repairs[i].active) {
-        pending = &flow->pending_repairs[i];
-        break;
-      }
-    }
-    if (!pending) {
-      t->stats.repair_queue_backpressure++;
-      return false;
-    }
-    memset(pending, 0, sizeof(*pending));
-    pending->active = true;
-    if (++flow->next_repair_intent_id == 0)
-      flow->next_repair_intent_id = 1;
-    pending->intent_id = flow->next_repair_intent_id;
-    pending->group_id = object->group_id;
-    pending->object_id = object->object_id;
-    pending->mode = mode;
-    pending->first_request_ms = now_ms;
-    pending->ready_at_ms = now_ms + TRANSPORT_FLEXICAST_REPAIR_HOLDOFF_MS;
-    flow->pending_repair_count++;
-  }
-
-  size_t before = pending_repair_symbol_count(pending);
-  if (mode == TRANSPORT_REPAIR_MODE_RATELESS) {
-    if (missing_count > pending->requested_dof)
-      pending->requested_dof = (uint16_t)missing_count;
-  } else if (whole_object) {
-    size_t count = object->data_symbols;
-    if (count > TRANSPORT_REPAIR_MAX_SYMBOLS)
-      count = TRANSPORT_REPAIR_MAX_SYMBOLS;
-    for (size_t i = 0; i < count; i++)
-      if (!repair_symbol_is_covered(flow, object->group_id, object->object_id,
-                                    (uint16_t)i, now_ms))
-        pending->requested_symbols[i / 64U] |= UINT64_C(1) << (i % 64U);
-  } else {
-    for (size_t i = 0; i < missing_count; i++) {
-      if (!repair_symbol_is_covered(flow, object->group_id, object->object_id,
-                                    missing[i], now_ms))
-        pending->requested_symbols[missing[i] / 64U] |= UINT64_C(1)
-                                                        << (missing[i] % 64U);
-    }
-  }
-  size_t after = pending_repair_symbol_count(pending);
-  if (merging || after == before)
-    t->stats.repair_requests_merged++;
-  observe_repair_requester(t, flow, pending, requester_id, requester_deficit,
-                           mode, whole_object, missing, missing_count, now_ms);
-  if (after == 0)
-    clear_pending_repair(t, flow, pending);
-  return true;
-}
-
-static void
-clear_pending_repair(transport_t *t, transport_flexicast_flow_t *flow,
-                     transport_flexicast_pending_repair_t *pending) {
-  if (!pending->active)
-    return;
-  expire_repair_requesters(t, flow, pending->intent_id);
-  memset(pending, 0, sizeof(*pending));
-  if (flow->pending_repair_count != 0)
-    flow->pending_repair_count--;
-}
-
-static size_t cancel_flow_repairs(transport_t *t,
-                                  transport_flexicast_flow_t *flow,
-                                  bool entire_track, uint64_t group_id,
-                                  uint64_t object_id) {
-  size_t pending_symbols = 0;
-  for (size_t i = 0; i < TRANSPORT_FLEXICAST_PENDING_REPAIRS; i++) {
-    transport_flexicast_pending_repair_t *pending = &flow->pending_repairs[i];
-    if (!pending->active || (!entire_track && (pending->group_id != group_id ||
-                                               pending->object_id > object_id)))
-      continue;
-    pending_symbols += pending_repair_symbol_count(pending);
-    clear_pending_repair(t, flow, pending);
-  }
-  for (size_t i = 0; i < TRANSPORT_FLEXICAST_RECENT_REPAIRS; i++) {
-    transport_flexicast_recent_repair_t *recent = &flow->recent_repairs[i];
-    if (recent->active && (entire_track || (recent->group_id == group_id &&
-                                            recent->object_id <= object_id)))
-      memset(recent, 0, sizeof(*recent));
-  }
-  for (size_t i = 0; i < TRANSPORT_FLEXICAST_SHADOW_OBSERVATIONS; i++) {
-    transport_flexicast_shadow_observation_t *observation =
-        &flow->shadow_observations[i];
-    if (observation->active &&
-        (entire_track || (observation->group_id == group_id &&
-                          observation->object_id <= object_id)))
-      clear_shadow_observation(flow, observation);
-  }
-
-  transport_flexicast_queued_payload_t
-      retained[TRANSPORT_FLEXICAST_REPAIR_QUEUE_CAPACITY] = {0};
-  size_t retained_count = 0;
-  size_t retained_bytes = 0;
-  size_t cancelled = 0;
-  for (size_t i = 0; i < flow->repair_queue.count; i++) {
-    transport_flexicast_queued_payload_t *queued =
-        queue_at(&flow->repair_queue, i);
-    if (entire_track ||
-        (queued->group_id == group_id && queued->object_id <= object_id)) {
-      free(queued->data);
-      cancelled++;
-    } else {
-      retained[retained_count++] = *queued;
-      retained_bytes += queued->size;
-    }
-    memset(queued, 0, sizeof(*queued));
-  }
-  if (retained_count != 0)
-    memcpy(flow->repair_queue.entries, retained,
-           retained_count * sizeof(*retained));
-  flow->repair_queue.head = 0;
-  flow->repair_queue.count = retained_count;
-  flow->repair_queue.bytes = retained_bytes;
-  if (retained_count == 0) {
-    flow->repair_priority_available = false;
-    flow->data_airtime_since_repair = 0;
-  }
-  t->stats.repair_packets_cancelled += cancelled;
-  t->stats.repair_pending_symbols_cancelled += pending_symbols;
-  return cancelled + pending_symbols;
-}
-
-size_t transport_flexicast_cancel_repairs_through(transport_t *t,
-                                                  const moq_track_id_t *track,
-                                                  uint64_t group_id,
-                                                  uint64_t object_id) {
-  if (!t || !track)
-    return 0;
-  size_t cancelled = 0;
-  for (size_t i = 0; i < t->flexicast.capacity; i++) {
-    transport_flexicast_flow_t *flow = &t->flexicast.flows[i];
-    if (flow->active && flow->source &&
-        transport_track_id_equal(&flow->track_id, track))
-      cancelled += cancel_flow_repairs(t, flow, false, group_id, object_id);
-  }
-  return cancelled;
-}
-
-size_t transport_flexicast_cancel_track_repairs(transport_t *t,
-                                                const moq_track_id_t *track) {
-  if (!t || !track)
-    return 0;
-  size_t cancelled = 0;
-  for (size_t i = 0; i < t->flexicast.capacity; i++) {
-    transport_flexicast_flow_t *flow = &t->flexicast.flows[i];
-    if (flow->active && flow->source &&
-        transport_track_id_equal(&flow->track_id, track))
-      cancelled += cancel_flow_repairs(t, flow, true, 0, 0);
-  }
-  return cancelled;
-}
-
-static bool requester_needs_repair_symbol(
-    const transport_flexicast_repair_requester_t *requester,
-    transport_repair_mode_t mode, uint16_t symbol_index,
-    size_t rateless_ordinal) {
-  if (mode == TRANSPORT_REPAIR_MODE_RATELESS)
-    return rateless_ordinal < requester->deficit;
-  return symbol_index < QLINQ_WIRE_MAX_NACK_SYMBOLS &&
-         (requester->requested_symbols[symbol_index / 64U] &
-          (UINT64_C(1) << (symbol_index % 64U))) != 0;
-}
-
-static bool
-unicast_repair_can_accept(transport_t *t, transport_flexicast_flow_t *flow,
-                          const transport_flexicast_pending_repair_t *pending,
-                          const uint16_t *indices, size_t count) {
-  size_t matched = 0;
-  for (size_t r = 0; r < flow->repair_requesters.count; r++) {
-    const transport_flexicast_repair_requester_t *requester =
-        &flow->repair_requesters.entries[r];
-    if (requester->request_id != pending->intent_id)
-      continue;
-    transport_conn_t *conn = find_connection_by_id(t, requester->member_id);
-    if (!conn || !conn->quic)
-      return false;
-    size_t needed = 0;
-    for (size_t i = 0; i < count; i++) {
-      uint16_t symbol_index =
-          pending->mode == TRANSPORT_REPAIR_MODE_RATELESS ? 0 : indices[i];
-      if (requester_needs_repair_symbol(requester, pending->mode, symbol_index,
-                                        i))
-        needed++;
-    }
-    if (needed > QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY ||
-        conn->queued_datagrams[0] > QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - needed)
-      return false;
-    matched++;
-  }
-  return matched != 0;
-}
-
-static bool
-queue_unicast_repair_symbol(transport_t *t, transport_flexicast_flow_t *flow,
-                            const transport_flexicast_pending_repair_t *pending,
-                            ptls_iovec_t packet, uint16_t symbol_index,
-                            size_t rateless_ordinal, size_t *transmissions) {
-  bool matched = false;
-  for (size_t r = 0; r < flow->repair_requesters.count; r++) {
-    const transport_flexicast_repair_requester_t *requester =
-        &flow->repair_requesters.entries[r];
-    if (requester->request_id != pending->intent_id ||
-        !requester_needs_repair_symbol(requester, pending->mode, symbol_index,
-                                       rateless_ordinal))
-      continue;
-    transport_conn_t *conn = find_connection_by_id(t, requester->member_id);
-    if (!conn || !transport_queue_datagram(conn, 0, packet))
-      return false;
-    (*transmissions)++;
-    matched = true;
-  }
-  return matched;
-}
-
-static void materialize_pending_repairs(transport_t *t,
-                                        transport_flexicast_flow_t *flow,
-                                        int64_t now) {
-  for (size_t pending_index = 0;
-       pending_index < TRANSPORT_FLEXICAST_PENDING_REPAIRS; pending_index++) {
-    transport_flexicast_pending_repair_t *pending =
-        &flow->pending_repairs[pending_index];
-    if (!pending->active || now < pending->ready_at_ms)
-      continue;
-    sent_object_cache_t *object = transport_sent_cache_find(
-        &t->sent_cache, &flow->track_id, pending->group_id, pending->object_id);
-    if (!object) {
-      clear_pending_repair(t, flow, pending);
-      continue;
-    }
-    uint16_t indices[TRANSPORT_REPAIR_MAX_SYMBOLS];
-    size_t count = 0;
-    if (pending->mode == TRANSPORT_REPAIR_MODE_RATELESS) {
-      count = pending->requested_dof;
-    } else {
-      for (size_t word_index = 0;
-           word_index < QLINQ_WIRE_MAX_NACK_SYMBOLS / 64U &&
-           count < TRANSPORT_REPAIR_MAX_SYMBOLS;
-           word_index++) {
-        uint64_t word = pending->requested_symbols[word_index];
-        for (uint16_t bit = 0;
-             bit < 64U && count < TRANSPORT_REPAIR_MAX_SYMBOLS; bit++)
-          if ((word & (UINT64_C(1) << bit)) != 0)
-            indices[count++] = (uint16_t)(word_index * 64U + bit);
-      }
-    }
-    if (count == 0) {
-      clear_pending_repair(t, flow, pending);
-      continue;
-    }
-    size_t packet_size = QLINQ_WIRE_FEC_HEADER_SIZE + object->symbol_size;
-    bool forced_unicast =
-        t->flexicast_repair_route == TRANSPORT_FLEXICAST_REPAIR_UNICAST;
-    bool capacity_available =
-        forced_unicast
-            ? unicast_repair_can_accept(t, flow, pending, indices, count)
-            : repair_queue_can_accept(t, flow, count, packet_size * count);
-    if (packet_size > SIZE_MAX / count || !capacity_available) {
-      if (!pending->backpressure_reported) {
-        t->stats.repair_queue_backpressure++;
-        pending->backpressure_reported = true;
-      }
-      continue;
-    }
-
-    transport_repair_batch_t repair;
-    bool systematic_fallback = false;
-    bool built = pending->mode == TRANSPORT_REPAIR_MODE_RATELESS
-                     ? transport_repair_build_rateless(&t->fec_cache, object,
-                                                       count, &repair)
-                     : transport_repair_build(&t->fec_cache, object, false,
-                                              indices, count, &repair);
-    if (!built && pending->mode == TRANSPORT_REPAIR_MODE_RATELESS &&
-        object->next_repair_symbol >= QLINQ_FEC_MAX_TOTAL_SYMBOLS) {
-      t->stats.repair_rateless_exhausted++;
-      built = transport_repair_build_systematic_fallback(&t->fec_cache, object,
-                                                         count, &repair);
-      systematic_fallback = built;
-    }
-    if (!built) {
-      clear_pending_repair(t, flow, pending);
-      continue;
-    }
-    size_t queued = 0, unicast_transmissions = 0;
-    for (size_t i = 0; i < repair.count; i++) {
-      uint8_t packet[QLINQ_WIRE_FEC_HEADER_SIZE + QLINQ_FEC_MAX_SYMBOL_SIZE];
-      size_t encoded_size = QLINQ_WIRE_FEC_HEADER_SIZE + repair.symbol_size;
-      qlinq_wire_fec_header_t header = {.alias = flow->alias,
-                                        .is_keyframe = object->is_keyframe,
-                                        .priority = object->priority,
-                                        .path_id = 0,
-                                        .group_id = object->group_id,
-                                        .object_id = object->object_id,
-                                        .symbol_index = repair.indices[i],
-                                        .total_symbols = repair.total_symbols,
-                                        .data_symbols = object->data_symbols,
-                                        .symbol_size = repair.symbol_size,
-                                        .original_size = (uint32_t)object->size,
-                                        .send_time_ns =
-                                            transport_get_time_ns()};
-      if (qlinq_wire_encode_fec_header(packet, sizeof(packet), &header) !=
-              QLINQ_WIRE_OK ||
-          encoded_size > sizeof(packet))
-        break;
-      memcpy(packet + QLINQ_WIRE_FEC_HEADER_SIZE,
-             repair.symbols + i * repair.symbol_size, repair.symbol_size);
-      bool sent =
-          forced_unicast
-              ? queue_unicast_repair_symbol(
-                    t, flow, pending, ptls_iovec_init(packet, encoded_size),
-                    repair.indices[i], i, &unicast_transmissions)
-              : queue_repair_payload(t, flow,
-                                     ptls_iovec_init(packet, encoded_size),
-                                     object->group_id, object->object_id,
-                                     repair.indices[i], pending->mode, now);
-      if (!sent)
-        break;
-      if (pending->mode == TRANSPORT_REPAIR_MODE_RATELESS) {
-        if (pending->requested_dof != 0)
-          pending->requested_dof--;
-      } else {
-        pending->requested_symbols[repair.indices[i] / 64U] &=
-            ~(UINT64_C(1) << (repair.indices[i] % 64U));
-      }
-      queued++;
-    }
-    if (queued != 0 && pending->mode == TRANSPORT_REPAIR_MODE_RATELESS) {
-      bool committed =
-          systematic_fallback
-              ? transport_repair_commit_systematic_fallback(object, &repair,
-                                                            queued)
-              : transport_repair_commit_rateless(object, &repair, queued);
-      /* Repair allocation is transactional: only symbols admitted to an
-       * egress queue consume an ESI (or advance the systematic fallback). */
-      if (!committed) {
-        t->stats.repair_commit_failures++;
-        clear_pending_repair(t, flow, pending);
-      }
-    }
-    transport_repair_batch_destroy(&repair);
-    if (queued != 0) {
-      size_t physical_symbols = forced_unicast ? unicast_transmissions : queued;
-      t->stats.repair_symbols_sent += physical_symbols;
-      if (forced_unicast) {
-        t->stats.repair_unicast_symbols_sent += unicast_transmissions;
-        uint64_t unicast_bytes =
-            unicast_transmissions > UINT64_MAX / packet_size
-                ? UINT64_MAX
-                : (uint64_t)unicast_transmissions * packet_size;
-        t->stats.repair_unicast_payload_bytes_queued = saturating_add_u64(
-            t->stats.repair_unicast_payload_bytes_queued, unicast_bytes);
-      } else {
-        t->stats.repair_multicast_symbols_sent += queued;
-      }
-      if (pending->mode == TRANSPORT_REPAIR_MODE_RATELESS)
-        t->stats.repair_rateless_symbols_sent += physical_symbols;
-      t->stats.repair_batches_emitted++;
-      pending->backpressure_reported = false;
-    }
-    if (pending_repair_symbol_count(pending) == 0)
-      clear_pending_repair(t, flow, pending);
-    else
-      pending->ready_at_ms = now;
-  }
-}
-
-bool transport_flexicast_send_payload(transport_t *t,
-                                      transport_flexicast_flow_t *flow,
-                                      ptls_iovec_t payload) {
-  if (!t || !flow || !flow->source || !flow->crypto || !payload.base ||
-      payload.len > SIZE_MAX - 128U ||
-      transport_flexicast_listening_members(flow) == 0)
-    return false;
-  refresh_pacer(t, flow, transport_get_time_ms());
-  size_t cost = pacing_cost(flow, payload.len + 128U);
-  if (flow->data_queue.count != 0 || flow->repair_queue.count != 0 ||
-      cost > flow->pacing_tokens)
-    return queue_payload(t, flow, payload);
-  flexicast_dispatch_result_t result = dispatch_payload(t, flow, payload);
-  if (result == FLEXICAST_DISPATCH_BLOCKED)
-    return queue_payload(t, flow, payload);
-  if (result != FLEXICAST_DISPATCH_OK)
-    return false;
-  flow->pacing_tokens -= cost;
-  t->stats.flexicast_paced_packets++;
-  t->stats.flexicast_physical_bytes_sent += cost;
-  account_controller_airtime(flow, cost, false);
-  return true;
-}
-
-static bool repair_has_priority(const transport_flexicast_flow_t *flow,
-                                size_t repair_cost) {
-  if (flow->repair_queue.count == 0)
-    return false;
-  if (flow->data_queue.count == 0 || flow->repair_priority_available)
-    return true;
-  return repair_cost <= UINT64_MAX / 3U &&
-         flow->data_airtime_since_repair >= repair_cost * 3U;
-}
-
-typedef struct {
-  transport_flexicast_queued_payload_t *payload;
-  size_t cost;
-  bool repair;
-} flexicast_queue_selection_t;
-
-static flexicast_queue_selection_t
-select_queued_payload(transport_flexicast_flow_t *flow) {
-  transport_flexicast_queued_payload_t *repair =
-      queue_front(&flow->repair_queue);
-  size_t repair_cost =
-      repair ? pacing_cost(flow, repair->size + 128U) : SIZE_MAX;
-  bool use_repair = repair_has_priority(flow, repair_cost);
-  transport_flexicast_queued_payload_t *payload =
-      use_repair ? repair : queue_front(&flow->data_queue);
-  if (!payload)
-    payload = repair;
-  if (!payload)
-    return (flexicast_queue_selection_t){0};
-
-  size_t cost = pacing_cost(flow, payload->size + 128U);
-  if (use_repair && cost > flow->pacing_tokens && flow->data_queue.count != 0) {
-    transport_flexicast_queued_payload_t *data = queue_front(&flow->data_queue);
-    size_t data_cost = pacing_cost(flow, data->size + 128U);
-    if (data_cost < cost) {
-      payload = data;
-      cost = data_cost;
-      use_repair = false;
-    }
-  }
-  return (flexicast_queue_selection_t){
-      .payload = payload, .cost = cost, .repair = use_repair};
-}
-
-static void account_data_airtime(transport_flexicast_flow_t *flow,
-                                 size_t cost) {
-  uint64_t maximum = flow->pacing_burst_bytes;
-  if (maximum <= UINT64_MAX / 4U)
-    maximum *= 4U;
-  else
-    maximum = UINT64_MAX;
-  uint64_t current = flow->data_airtime_since_repair < maximum
-                         ? flow->data_airtime_since_repair
-                         : maximum;
-  flow->data_airtime_since_repair =
-      cost >= maximum - current ? maximum : current + cost;
-}
-
-static void
-record_sent_repair(transport_flexicast_flow_t *flow,
-                   const transport_flexicast_queued_payload_t *queued,
-                   int64_t now_ms) {
-  transport_flexicast_recent_repair_t *recent =
-      &flow->recent_repairs[flow->next_recent_repair];
-  *recent = (transport_flexicast_recent_repair_t){
-      .active = true,
-      .group_id = queued->group_id,
-      .object_id = queued->object_id,
-      .symbol_index = queued->symbol_index,
-      .mode = queued->repair_mode,
-      .expires_at_ms =
-          now_ms <= INT64_MAX - TRANSPORT_FLEXICAST_REPAIR_REISSUE_MS
-              ? now_ms + TRANSPORT_FLEXICAST_REPAIR_REISSUE_MS
-              : INT64_MAX};
-  flow->next_recent_repair =
-      (flow->next_recent_repair + 1U) % TRANSPORT_FLEXICAST_RECENT_REPAIRS;
-}
-
-static void drain_paced_payloads(transport_t *t,
-                                 transport_flexicast_flow_t *flow) {
-  if (flow->data_queue.count == 0 && flow->repair_queue.count == 0)
-    return;
-  if (flow->rekey_pending)
-    return;
-  if (transport_flexicast_listening_members(flow) == 0) {
-    bool awaiting_rekey_ready = false;
-    for (size_t i = 0; i < flow->member_count; i++)
-      awaiting_rekey_ready |= flow->members[i].conn && flow->members[i].joined;
-    if (!awaiting_rekey_ready)
-      t->stats.flexicast_pacing_dropped += clear_flow_queue(flow);
-    return;
-  }
-  refresh_pacer(t, flow, transport_get_time_ms());
-  while (flow->data_queue.count != 0 || flow->repair_queue.count != 0) {
-    flexicast_queue_selection_t selection = select_queued_payload(flow);
-    transport_flexicast_queued_payload_t *queued = selection.payload;
-    if (!queued || !queued->data)
-      break;
-    size_t cost = selection.cost;
-    bool is_repair = selection.repair;
-    if (cost > flow->pacing_tokens)
-      break;
-    flexicast_dispatch_result_t result =
-        dispatch_payload(t, flow, ptls_iovec_init(queued->data, queued->size));
-    if (result == FLEXICAST_DISPATCH_BLOCKED)
-      break;
-    if (result == FLEXICAST_DISPATCH_OK) {
-      flow->pacing_tokens -= cost;
-      t->stats.flexicast_paced_packets++;
-      t->stats.flexicast_physical_bytes_sent += cost;
-      account_controller_airtime(flow, cost, is_repair);
-      if (is_repair) {
-        t->stats.repair_physical_bytes_sent += cost;
-        flow->last_repair_sent_ms = transport_get_time_ms();
-        record_sent_repair(flow, queued, flow->last_repair_sent_ms);
-        flow->repair_priority_available = false;
-        flow->data_airtime_since_repair = 0;
-      } else {
-        account_data_airtime(flow, cost);
-      }
-    } else {
-      t->stats.flexicast_pacing_dropped++;
-    }
-    queue_pop(is_repair ? &flow->repair_queue : &flow->data_queue);
-    if (result != FLEXICAST_DISPATCH_OK)
-      break;
-  }
-}
-
-bool transport_flexicast_track_ready(transport_t *t,
-                                     const moq_track_id_t *track) {
-  if (!t || !track)
-    return false;
-  for (size_t i = 0; i < t->flexicast.capacity; i++) {
-    transport_flexicast_flow_t *flow = &t->flexicast.flows[i];
-    if (!flow->active || !flow->source ||
-        !transport_track_id_equal(&flow->track_id, track) ||
-        transport_flexicast_listening_members(flow) == 0)
-      continue;
-    refresh_pacer(t, flow, transport_get_time_ms());
-    if (flow->data_queue.count >=
-            TRANSPORT_FLEXICAST_QUEUE_CAPACITY * 3U / 4U ||
-        flow->data_queue.bytes + flow->repair_queue.bytes >=
-            t->limits.max_egress_bytes_per_socket * 3U / 4U ||
-        (flow->data_queue.count != 0 &&
-         flow->pacing_tokens < t->limits.max_udp_payload_size))
-      return false;
-  }
-  return true;
-}
-
-int64_t transport_flexicast_get_first_timeout(transport_t *t) {
-  if (!t || !t->flexicast_enabled)
-    return INT64_MAX;
-  int64_t now = transport_get_time_ms();
-  int64_t first_timeout = INT64_MAX;
-  for (size_t i = 0; i < t->flexicast.capacity; i++) {
-    transport_flexicast_flow_t *flow = &t->flexicast.flows[i];
-    if (!flow->active || flow->source || !flow->crypto)
-      continue;
-    int64_t deadline = quicly_flexicast_get_ack_deadline(flow->crypto);
-    if (deadline < first_timeout)
-      first_timeout = deadline;
-  }
-  if (!t->is_server)
-    return first_timeout;
-  for (size_t i = 0; i < t->flexicast.capacity; i++) {
-    transport_flexicast_flow_t *flow = &t->flexicast.flows[i];
-    if (!flow->active || !flow->source || !flow->crypto)
-      continue;
-    if (flow->rekey_pending && flow->rekey_ready_at_ms < first_timeout)
-      first_timeout = flow->rekey_ready_at_ms;
-    if (flow->feedback_outstanding_count != 0) {
-      quicly_flexicast_cc_output_t output;
-      quicly_flexicast_cc_get_flow_output(flow->crypto, &output);
-      if (output.next_timeout < first_timeout)
-        first_timeout = output.next_timeout;
-    }
-    for (size_t pending_index = 0;
-         pending_index < TRANSPORT_FLEXICAST_PENDING_REPAIRS; pending_index++) {
-      const transport_flexicast_pending_repair_t *pending =
-          &flow->pending_repairs[pending_index];
-      if (pending->active && pending->ready_at_ms < first_timeout)
-        first_timeout = pending->ready_at_ms;
-    }
-    for (size_t observation_index = 0;
-         observation_index < TRANSPORT_FLEXICAST_SHADOW_OBSERVATIONS;
-         observation_index++) {
-      const transport_flexicast_shadow_observation_t *observation =
-          &flow->shadow_observations[observation_index];
-      if (observation->active && observation->ready_at_ms < first_timeout)
-        first_timeout = observation->ready_at_ms;
-    }
-    if ((flow->data_queue.count == 0 && flow->repair_queue.count == 0) ||
-        transport_flexicast_listening_members(flow) == 0)
-      continue;
-    refresh_pacer(t, flow, now);
-    flexicast_queue_selection_t selection = select_queued_payload(flow);
-    if (!selection.payload)
-      continue;
-    size_t cost = selection.cost;
-    if (cost <= flow->pacing_tokens)
-      return now;
-    if (flow->pacing_rate_bytes_per_second == 0)
-      continue;
-    uint64_t deficit = cost - flow->pacing_tokens;
-    uint64_t delay =
-        (deficit * 1000U + flow->pacing_rate_bytes_per_second - 1U) /
-        flow->pacing_rate_bytes_per_second;
-    if (delay == 0)
-      delay = 1;
-    int64_t timeout =
-        delay > (uint64_t)(INT64_MAX - now) ? INT64_MAX : now + (int64_t)delay;
-    if (timeout < first_timeout)
-      first_timeout = timeout;
-  }
-  return first_timeout;
-}
-
 void transport_flexicast_tick(transport_t *t) {
   if (!t || !t->flexicast_enabled)
     return;
@@ -3520,12 +1876,16 @@ void transport_flexicast_tick(transport_t *t) {
     bool removed = false;
     for (size_t i = 0; i < flow->member_count; i++) {
       transport_flexicast_member_t *member = &flow->members[i];
-      if (!member->conn || !member->listening ||
-          member_delivery_debt(flow, member) <
-              TRANSPORT_FLEXICAST_ACK_PACKET_THRESHOLD ||
-          member->last_ack_time_ms <= 0 ||
-          (uint64_t)(now - member->last_ack_time_ms) <
-              feedback_demotion_timeout_ms(flow))
+      bool readiness_expired = member->joined && !member->listening &&
+                               member->ready_deadline_ms > 0 &&
+                               now >= member->ready_deadline_ms;
+      bool feedback_expired = member->listening &&
+                              member_delivery_debt(flow, member) >=
+                                  TRANSPORT_FLEXICAST_ACK_PACKET_THRESHOLD &&
+                              member->last_ack_time_ms > 0 &&
+                              (uint64_t)(now - member->last_ack_time_ms) >=
+                                  feedback_demotion_timeout_ms(flow);
+      if (!member->conn || (!readiness_expired && !feedback_expired))
         continue;
       (void)send_state(member->conn, flow->flow_id, flow->key_epoch,
                        QUICLY_FLEXICAST_STATE_LEAVE);
@@ -3542,11 +1902,11 @@ void transport_flexicast_tick(transport_t *t) {
        * been demoted. Drop it at the cohort boundary; members that remain on
        * the flow will re-request any symbol they still need, while the demoted
        * member's subsequent NACKs take the ordinary unicast repair path. */
-      (void)cancel_flow_repairs(t, flow, true, 0, 0);
+      (void)tf_cancel_flow_repairs(t, flow, true, 0, 0);
       schedule_source_rekey(t, flow, now);
     }
-    materialize_pending_repairs(t, flow, now);
-    emit_ready_shadow_observations(t, flow, now);
-    drain_paced_payloads(t, flow);
+    tf_materialize_pending_repairs(t, flow, now);
+    tf_emit_ready_shadow_observations(t, flow, now);
+    tf_drain_paced_payloads(t, flow);
   }
 }

@@ -25,7 +25,7 @@ bool transport_publish_recipient_eligible(const transport_t *t,
          conn->authenticated &&
          quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
          (!t->is_server ||
-          transport_subscriptions_contains(&conn->send_subscriptions, track));
+          transport_subscriptions_contains(&conn->subscriptions, track));
 }
 
 static size_t publication_fec_limit(const transport_t *t,
@@ -679,7 +679,7 @@ transport_publish_flush_grouped_ex(transport_t *t) {
   t->fec_buf_len = 0;
   t->fec_first_pkt_time = 0;
   t->fec_pkt_count = 0;
-  if ((track_state->track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0 &&
+  if (track_uses_recovery(&track_state->track_id) &&
       track_state->next_object_id % QLINQ_RECOVERY_WINDOW_OBJECTS == 0) {
     uint64_t first_object_id =
         track_state->next_object_id - QLINQ_RECOVERY_WINDOW_OBJECTS;
@@ -725,6 +725,8 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
       (existing_state->finish_started || existing_state->aborted))
     return TRANSPORT_PUBLISH_INVALID;
 
+  size_t fec_limit = publication_fec_limit(t, &obj->track_id);
+
   /* route to grouping buffer if it's data and we're not flushing */
   if (obj->track_id.type == MOQ_TRACK_DATA && !t->fec_in_flush) {
     bool use_fec = false;
@@ -759,10 +761,11 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
     }
 
     if (use_fec) {
-      size_t group_limit = fec_limit < 16384U ? fec_limit : 16384U;
       if (obj->size > TRANSPORT_MAX_FEC_RECORD_SIZE || fec_limit < 2U ||
           obj->size > fec_limit - 2U)
         return TRANSPORT_PUBLISH_INVALID;
+
+      size_t group_limit = fec_limit < 16384U ? fec_limit : 16384U;
 
       if (t->fec_buf_len > 0 &&
           (!transport_track_id_equal(&t->fec_track_id, &obj->track_id) ||
@@ -897,6 +900,8 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
 
   /* audio, video, text tracks go over unreliable datagram frames with FEC */
   size_t data_size = obj->size;
+  /* A shared publication is admitted atomically with respect to peer limits;
+   * no recipient can be counted as served by a packet it must reject. */
   if (data_size == 0 || data_size > fec_limit)
     return TRANSPORT_PUBLISH_INVALID;
   size_t symbol_size = transport_get_datagram_symbol_size(t);
@@ -907,8 +912,7 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
   if (data_symbols == 0)
     data_symbols = 1;
 
-  bool protect_repair_cache = obj->track_id.type == MOQ_TRACK_DATA &&
-                              profile.fec_rateless &&
+  bool protect_repair_cache = track_uses_recovery(&obj->track_id) &&
                               checkpoint_cache_is_protected(t, &obj->track_id);
   if (obj->track_id.type == MOQ_TRACK_DATA &&
       !transport_sent_cache_can_store(&t->sent_cache, obj,

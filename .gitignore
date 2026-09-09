@@ -55,20 +55,8 @@ tmp/
 
 .tmp.dprobes.h
 
+t/00util/test_flexicast_regressions
+t/00util/test_qlinq_delivery
 t/00util/test_egress_errors
-t/00util/test_transport_bind
-t/00util/test_interleaved_receive
-
-t/00util/test_publication_limits
-t/00util/test_directional_subscriptions
-t/00util/test_stream_budget
-
-/t/00util/test_reliable_bidirectional
-
-/t/00util/test_generic_ports
-
-/t/00util/test_qlinq_delivery
-/t/00util/test_qlinq_event_ownership
-/t/00util/test_qlinq_event_overflow
-/t/00util/test_qlinq_compat
-/t/00util/test_qlinq_reconnect
+t/00util/test_quicly_flexicast
+t/00util/fuzz_flexicast_state

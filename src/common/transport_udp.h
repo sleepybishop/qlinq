@@ -12,4 +12,11 @@ ssize_t transport_udp_send_batch(int fd, const struct sockaddr *destination,
                                  socklen_t destination_len,
                                  const struct iovec *datagrams, size_t count);
 
+/* Single datagram with an explicit source address/interface, including on a
+ * wildcard-bound socket. Same complete-datagram return convention as above. */
+ssize_t transport_udp_send_from(int fd, const struct sockaddr *destination,
+                                const struct sockaddr *source,
+                                unsigned interface_index,
+                                const struct iovec *datagram);
+
 #endif
