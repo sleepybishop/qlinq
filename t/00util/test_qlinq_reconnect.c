@@ -51,7 +51,7 @@ int main(void) {
   CHECK(listener && client, "create initial endpoints");
 
   qlinq_stream_config_t stream_config = {.content_type = QLINQ_CONTENT_DATA,
-                                         .delivery = QLINQ_DELIVERY_FEC,
+                                         .delivery = QLINQ_DELIVERY_FIXED_FEC,
                                          .name = "api/reconnect"};
   publisher = qlinq_publish(listener, &stream_config);
   subscription = qlinq_subscribe(client, &stream_config);

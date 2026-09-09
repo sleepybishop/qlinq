@@ -272,7 +272,7 @@ static bool parse_options(int argc, char **argv, cast_options_t *options) {
       if (strcmp(value, "rateless") == 0)
         options->delivery = QLINQ_DELIVERY_RATELESS;
       else if (strcmp(value, "fec") == 0)
-        options->delivery = QLINQ_DELIVERY_FEC;
+        options->delivery = QLINQ_DELIVERY_FIXED_FEC;
       else
         return false;
     } else if (strcmp(argv[i], "--repair-mode") == 0) {

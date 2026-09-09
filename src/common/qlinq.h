@@ -49,7 +49,7 @@ typedef enum {
 typedef enum {
   QLINQ_DELIVERY_DATAGRAM = 0,
   QLINQ_DELIVERY_RELIABLE = 1,
-  QLINQ_DELIVERY_FEC = 2,
+  QLINQ_DELIVERY_FIXED_FEC = 2,
   QLINQ_DELIVERY_RATELESS = 3
 } qlinq_delivery_t;
 

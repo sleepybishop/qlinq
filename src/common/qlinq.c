@@ -86,14 +86,15 @@ static bool content_type_valid(qlinq_content_type_t type) {
 static bool delivery_valid(qlinq_delivery_t delivery) {
   return delivery == QLINQ_DELIVERY_DATAGRAM ||
          delivery == QLINQ_DELIVERY_RELIABLE ||
-         delivery == QLINQ_DELIVERY_FEC || delivery == QLINQ_DELIVERY_RATELESS;
+         delivery == QLINQ_DELIVERY_FIXED_FEC ||
+         delivery == QLINQ_DELIVERY_RATELESS;
 }
 
 static uint8_t delivery_flags(qlinq_delivery_t delivery) {
   switch (delivery) {
   case QLINQ_DELIVERY_RELIABLE:
     return MOQ_TRACK_FLAG_RELIABLE;
-  case QLINQ_DELIVERY_FEC:
+  case QLINQ_DELIVERY_FIXED_FEC:
     return MOQ_TRACK_FLAG_FEC_ENABLED;
   case QLINQ_DELIVERY_RATELESS:
     return MOQ_TRACK_FLAG_FEC_RATELESS;
@@ -109,7 +110,7 @@ static qlinq_delivery_t flags_delivery(uint8_t flags) {
   if ((flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0)
     return QLINQ_DELIVERY_RATELESS;
   if ((flags & MOQ_TRACK_FLAG_FEC_ENABLED) != 0)
-    return QLINQ_DELIVERY_FEC;
+    return QLINQ_DELIVERY_FIXED_FEC;
   return QLINQ_DELIVERY_DATAGRAM;
 }
 
@@ -959,7 +960,7 @@ qlinq_send_result_t qlinq_stream_send(qlinq_stream_t *stream,
                          .priority = record->priority};
   uint8_t *encoded = NULL;
   bool frame_record = stream->content_type == QLINQ_CONTENT_DATA &&
-                      (stream->delivery == QLINQ_DELIVERY_FEC ||
+                      (stream->delivery == QLINQ_DELIVERY_FIXED_FEC ||
                        stream->delivery == QLINQ_DELIVERY_RATELESS);
   if (frame_record) {
     if (record->size > UINT16_MAX - QLINQ_RECORD_HEADER_SIZE ||
@@ -999,7 +1000,7 @@ qlinq_status_t qlinq_stream_finish(qlinq_stream_t *stream) {
   if (!stream || !stream->active || stream->state != QLINQ_STREAM_OPEN ||
       stream->direction != QLINQ_STREAM_PUBLISH ||
       stream->content_type != QLINQ_CONTENT_DATA ||
-      (stream->delivery != QLINQ_DELIVERY_FEC &&
+      (stream->delivery != QLINQ_DELIVERY_FIXED_FEC &&
        stream->delivery != QLINQ_DELIVERY_RATELESS) ||
       !stream->endpoint->transport) {
     if (stream)

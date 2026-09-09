@@ -182,7 +182,7 @@ int main(void) {
   CHECK(late_aborted, "completed transfer rejects a late subscriber");
 
   qlinq_stream_config_t fixed_config = {.content_type = QLINQ_CONTENT_DATA,
-                                        .delivery = QLINQ_DELIVERY_FEC,
+                                        .delivery = QLINQ_DELIVERY_FIXED_FEC,
                                         .name = "api/fixed-fec"};
   fixed_publisher = qlinq_publish(listener, &fixed_config);
   fixed_subscription = qlinq_subscribe(client, &fixed_config);
