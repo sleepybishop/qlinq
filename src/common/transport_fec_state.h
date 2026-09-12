@@ -25,6 +25,8 @@ typedef struct {
   uint16_t symbol_size;
   uint16_t next_repair_symbol;
   uint16_t next_systematic_repair_symbol;
+  /* Retain unconfirmed recovery obligations until explicit release. */
+  bool recovery_protected;
 } sent_object_cache_t;
 
 typedef struct {

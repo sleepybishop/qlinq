@@ -20,7 +20,54 @@
     }                                                                          \
   } while (0)
 
+static int test_recovery_cache_protection(void) {
+  transport_sent_cache_t cache = {0};
+  uint8_t payload[] = {1, 2, 3};
+  moq_object_t object = {
+      .track_id = {.type = MOQ_TRACK_DATA, .name = "protected"},
+      .data = payload,
+      .size = sizeof(payload)};
+  CHECK(transport_sent_cache_store(&cache, &object, 2, 1, 3, false),
+        "retain required recovery object");
+  for (size_t i = 1; i < TRANSPORT_SENT_CACHE_SIZE; i++) {
+    object.object_id = i;
+    CHECK(transport_sent_cache_store(&cache, &object, 2, 1, 3, true),
+          "fill best-effort cache entries");
+  }
+  object.object_id = TRANSPORT_SENT_CACHE_SIZE;
+  CHECK(transport_sent_cache_store(&cache, &object, 2, 1, 3, true),
+        "best-effort replacement can skip protected entry");
+  CHECK(transport_sent_cache_find(&cache, &object.track_id, 0, 0) != NULL &&
+            transport_sent_cache_find(&cache, &object.track_id, 0, 1) == NULL,
+        "evict best-effort entry instead of recovery obligation");
+  /* Promote existing entries, then ensure best-effort retries cannot revoke
+   * the recovery protection. */
+  for (size_t i = 2; i <= TRANSPORT_SENT_CACHE_SIZE; i++) {
+    object.object_id = i;
+    CHECK(transport_sent_cache_store(&cache, &object, 2, 1, 3, false) &&
+              transport_sent_cache_store(&cache, &object, 2, 1, 3, true),
+          "retry preserves promoted recovery protection");
+  }
+  object.object_id++;
+  CHECK(!transport_sent_cache_store(&cache, &object, 2, 1, 3, true),
+        "reject best-effort admission when every entry is protected");
+  CHECK(transport_sent_cache_release_through(&cache, &object.track_id, 0, 0) ==
+            1,
+        "checkpoint releases protected entry");
+  CHECK(transport_sent_cache_store(&cache, &object, 2, 1, 3, true),
+        "released entry admits new publication");
+  object.object_id++;
+  CHECK(transport_sent_cache_store(&cache, &object, 2, 1, 3, true),
+        "reused entry no longer inherits old protection");
+  CHECK(transport_sent_cache_release_track(&cache, &object.track_id) ==
+            TRANSPORT_SENT_CACHE_SIZE,
+        "track release retires protected and best-effort entries");
+  transport_sent_cache_destroy(&cache);
+  return 0;
+}
+
 int main(void) {
+  CHECK(test_recovery_cache_protection() == 0, "recovery cache protection");
   transport_limits_t configured = {0};
   transport_limits_t resolved_limits;
   char limit_error[128];

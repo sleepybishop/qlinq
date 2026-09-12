@@ -61,6 +61,7 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
     existing->symbol_size = symbol_size;
     existing->priority = object->priority;
     existing->is_keyframe = object->is_keyframe;
+    existing->recovery_protected |= !allow_evict;
     return true;
   }
 
@@ -76,8 +77,16 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
   if (!entry) {
     if (!allow_evict)
       return false;
-    entry = &cache->entries[cache->next_entry];
-    cache->next_entry = (cache->next_entry + 1U) % TRANSPORT_SENT_CACHE_SIZE;
+    for (size_t offset = 0; offset < TRANSPORT_SENT_CACHE_SIZE; offset++) {
+      size_t index = (cache->next_entry + offset) % TRANSPORT_SENT_CACHE_SIZE;
+      if (!cache->entries[index].recovery_protected) {
+        entry = &cache->entries[index];
+        cache->next_entry = (index + 1U) % TRANSPORT_SENT_CACHE_SIZE;
+        break;
+      }
+    }
+    if (!entry)
+      return false;
   }
   uint8_t *copy = malloc(object->size);
   if (!copy)
@@ -96,6 +105,7 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
   entry->symbol_size = symbol_size;
   entry->next_repair_symbol = total_symbols;
   entry->next_systematic_repair_symbol = 0;
+  entry->recovery_protected = !allow_evict;
   entry->data = copy;
   return true;
 }
