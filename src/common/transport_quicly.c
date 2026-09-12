@@ -431,6 +431,22 @@ static bool set_fd_nonblocking(int fd) {
   return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
+static int open_unicast_socket(int family) {
+  int fd = socket(family, SOCK_DGRAM, 0);
+  if (fd >= 0 && family == AF_INET6) {
+    /* A wildcard IPv6 path must not claim a separately configured IPv4 path's
+     * port. Each physical socket and its address matching stay family-specific.
+     */
+    int v6_only = 1;
+    if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6_only, sizeof(v6_only)) !=
+        0) {
+      CLOSE_SOCKET(fd);
+      return -1;
+    }
+  }
+  return fd;
+}
+
 static void configure_socket_buffers(transport_t *t, int fd) {
   int buf_size = 2 * 1024 * 1024; /* 2mb buffer size */
   if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size)) != 0)
@@ -800,7 +816,7 @@ transport_t *transport_create(const transport_config_t *config) {
       }
       sin6->sin6_port = t->is_server ? htons(config->port) : 0;
       t->local_addrs_len[i] = sizeof(struct sockaddr_in6);
-      t->fds[i] = socket(AF_INET6, SOCK_DGRAM, 0);
+      t->fds[i] = open_unicast_socket(AF_INET6);
     } else {
       struct sockaddr_in *sin = (struct sockaddr_in *)&t->local_addrs[i];
       sin->sin_family = AF_INET;
@@ -812,7 +828,7 @@ transport_t *transport_create(const transport_config_t *config) {
       }
       sin->sin_port = t->is_server ? htons(config->port) : 0;
       t->local_addrs_len[i] = sizeof(struct sockaddr_in);
-      t->fds[i] = socket(AF_INET, SOCK_DGRAM, 0);
+      t->fds[i] = open_unicast_socket(AF_INET);
     }
     if (t->fds[i] < 0) {
       transport_log(t, TRANSPORT_LOG_ERROR, "udp", 0, i,
@@ -821,11 +837,10 @@ transport_t *transport_create(const transport_config_t *config) {
       return NULL;
     }
 
-    int reuse = 1;
-    if (setsockopt(t->fds[i], SOL_SOCKET, SO_REUSEADDR, &reuse,
-                   sizeof(reuse)) != 0)
-      transport_log(t, TRANSPORT_LOG_WARNING, "udp", 0, i,
-                    "SO_REUSEADDR failed: %s", strerror(errno));
+    /* Unicast endpoints must own their local UDP tuple exclusively. On Linux,
+     * SO_REUSEADDR also permits bind(port=0) to reuse an occupied ephemeral
+     * port: a later endpoint then steals an earlier endpoint's QUIC replies.
+     * Only the separate multicast receive sockets need address reuse. */
 
     if (bind(t->fds[i], (struct sockaddr *)&t->local_addrs[i],
              t->local_addrs_len[i]) != 0) {
@@ -1244,13 +1259,9 @@ void transport_tick(transport_t *t) {
             continue;
           }
 
-          int fd = socket(msg.addr.ss_family, SOCK_DGRAM, 0);
+          int fd = open_unicast_socket(msg.addr.ss_family);
           if (fd >= 0) {
-            int reuse = 1;
-            if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
-                           sizeof(reuse)) != 0)
-              transport_log(t, TRANSPORT_LOG_WARNING, "ifmon", 0, t->num_fds,
-                            "SO_REUSEADDR failed: %s", strerror(errno));
+            /* Keep dynamically discovered unicast paths exclusive too. */
             configure_socket_buffers(t, fd);
             if (msg.addr.ss_family == AF_INET) {
               ((struct sockaddr_in *)&msg.addr)->sin_port =
