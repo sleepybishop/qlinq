@@ -6,7 +6,7 @@
 
 bool cli_parse_u64(const char *text, uint64_t maximum, uint64_t *value) {
   char *end = NULL;
-  if (!text || !text[0] || text[0] == '-' || !value)
+  if (!text || !text[0] || text[0] < '0' || text[0] > '9' || !value)
     return false;
   errno = 0;
   unsigned long long parsed = strtoull(text, &end, 10);

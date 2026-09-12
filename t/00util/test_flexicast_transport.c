@@ -85,17 +85,17 @@ static void dump_recovery_state(const char *label, transport_t *transport,
                                 const moq_track_id_t *track) {
   transport_conn_t *conn = transport ? transport->client_conn : NULL;
   uint8_t alias = 0;
-  if (!conn ||
-      transport_subscriptions_find_alias(&conn->subscriptions, track, &alias) !=
-          0) {
+  if (!conn || transport_subscriptions_find_alias(&conn->receive_subscriptions,
+                                                  track, &alias) != 0) {
     fprintf(stderr, "%s recovery state unavailable\n", label);
     return;
   }
-  transport_object_gap_state_t *gap = &conn->object_gaps[alias];
+  transport_object_gap_state_t *gap = transport_object_gap(conn, alias);
+  if (!gap)
+    return;
   fprintf(stderr,
-          "%s recovery alias=%u pending=%08" PRIx32
-          " requested=%08" PRIx32 " attempt=%u checkpoint=%d last=%" PRIu64
-          " finish=%d emitted=%d\n",
+          "%s recovery alias=%u pending=%08" PRIx32 " requested=%08" PRIx32
+          " attempt=%u checkpoint=%d last=%" PRIu64 " finish=%d emitted=%d\n",
           label, alias, gap->pending_mask, gap->requested_mask,
           gap->nack_attempt, gap->checkpoint_initialized,
           gap->last_checkpoint_object_id, gap->finish_pending,
@@ -105,12 +105,10 @@ static void dump_recovery_state(const char *label, transport_t *transport,
     if (!window->active)
       continue;
     fprintf(stderr,
-            "%s window=%zu objects=%" PRIu64 "-%" PRIu64
-            " missing=%08" PRIx32 " requested=%08" PRIx32
-            " attempt=%u age=%" PRId64 "\n",
+            "%s window=%zu objects=%" PRIu64 "-%" PRIu64 " missing=%08" PRIx32
+            " requested=%08" PRIx32 " attempt=%u age=%" PRId64 "\n",
             label, i, window->first_object_id, window->final_object_id,
-            window->missing_mask, window->requested_mask,
-            window->nack_attempt,
+            window->missing_mask, window->requested_mask, window->nack_attempt,
             transport_get_time_ms() - window->last_request_ms);
   }
 }
@@ -125,10 +123,11 @@ static void dump_source_recovery_state(transport_t *transport,
   for (size_t i = 0; i < transport->conn_count; i++) {
     transport_conn_t *conn = transport->conns[i];
     uint8_t alias = 0;
-    if (!conn || transport_subscriptions_find_alias(&conn->subscriptions,
+    if (!conn || transport_subscriptions_find_alias(&conn->send_subscriptions,
                                                     track, &alias) != 0)
       continue;
-    transport_checkpoint_ack_state_t *ack = &conn->checkpoint_acks[alias];
+    transport_checkpoint_ack_state_t *ack =
+        transport_checkpoint_ack(conn, alias);
     fprintf(stderr,
             "source member=%u alias=%u participating=%d sent=%d:%" PRIu64
             " acked=%d:%" PRIu64 " finish=%d/%d\n",

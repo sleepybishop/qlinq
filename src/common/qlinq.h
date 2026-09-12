@@ -206,6 +206,8 @@ typedef struct {
   bool application_error;
   uint64_t offending_frame_type;
   bool remote;
+  bool was_ready;
+  bool outgoing;
   /* Owned by the event and valid until qlinq_event_release(). */
   const char *reason;
 } qlinq_disconnect_t;
@@ -297,6 +299,20 @@ qlinq_endpoint_t *qlinq_listen(qlinq_context_t *context,
                                const qlinq_endpoint_config_t *config);
 qlinq_endpoint_t *qlinq_connect(qlinq_context_t *context,
                                 const qlinq_endpoint_config_t *config);
+
+typedef struct {
+  uint32_t peer_id;
+  bool outgoing;
+  bool ready;
+  bool quic_ready;
+  bool protocol_ready;
+  bool authenticated;
+  uint64_t paths_validated;
+  uint64_t paths_validation_failed;
+} qlinq_peer_info_t;
+
+bool qlinq_endpoint_get_peer(qlinq_endpoint_t *endpoint, uint32_t peer_id,
+                             qlinq_peer_info_t *info);
 /* Starts an orderly close while leaving the endpoint serviceable until its
  * QUIC close packets and socket queues drain. Automatic reconnect is stopped.
  */

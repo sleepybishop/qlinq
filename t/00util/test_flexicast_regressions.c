@@ -213,8 +213,10 @@ static void test_delivery(fixture_t *fixture, bool native) {
   CHECK(source->stats.flexicast_payloads_accepted == 4 * cohorts);
   size_t copies = native ? 1 : fixture->count;
   CHECK(source->stats.flexicast_physical_packets_sent == 4 * copies);
-  size_t plaintext =
-      QLINQ_WIRE_FEC_HEADER_SIZE + transport_get_datagram_symbol_size(source);
+  size_t symbol_size = transport_get_datagram_symbol_size(source);
+  if (symbol_size > sizeof(bytes))
+    symbol_size = sizeof(bytes);
+  size_t plaintext = QLINQ_WIRE_FEC_HEADER_SIZE + symbol_size;
   CHECK(source->stats.flexicast_plaintext_bytes_accepted ==
         4 * cohorts * plaintext);
   uint64_t expected =
@@ -285,15 +287,18 @@ static void test_rekey(fixture_t *fixture, const char *mode) {
     /* Precisely one replica can pass. The logical packet stays owned by the
      * flow, allowing rotation of its remaining replicas. */
     flow->pacing_tokens = quicly_flexicast_datagram_size(
-        flow->crypto, QLINQ_WIRE_FEC_HEADER_SIZE +
-                          transport_get_datagram_symbol_size(source));
+        flow->crypto,
+        QLINQ_WIRE_FEC_HEADER_SIZE +
+            (sizeof(bytes) < transport_get_datagram_symbol_size(source)
+                 ? sizeof(bytes)
+                 : transport_get_datagram_symbol_size(source)));
     flow->pacing_last_refill_ms = transport_get_time_ms();
     CHECK(transport_publish_ex(source, &object) == TRANSPORT_PUBLISH_DELIVERED);
     CHECK(flow->data_queue.count == 1);
     CHECK(flow->data_queue.entries[flow->data_queue.head].next_member >= 1);
   }
-  transport_subscriptions_remove(&departed->subscriptions, fixture->track.type,
-                                 fixture->track.name);
+  transport_subscriptions_remove(&departed->send_subscriptions,
+                                 fixture->track.type, fixture->track.name);
   transport_flexicast_remove_member(source, departed, &fixture->track);
   CHECK(flow->rekey_pending);
   uint64_t packet_number =
@@ -417,9 +422,9 @@ static void test_recovery(fixture_t *fixture) {
   for (size_t i = 0; i < fixture->count; i++) {
     transport_conn_t *conn = fixture->clients[i].transport->client_conn;
     uint8_t alias;
-    CHECK(transport_subscriptions_find_alias(&conn->subscriptions,
+    CHECK(transport_subscriptions_find_alias(&conn->receive_subscriptions,
                                              &fixture->track, &alias) == 0);
-    CHECK(conn->object_gaps[alias].finish_emitted);
+    CHECK(transport_object_gap(conn, alias)->finish_emitted);
   }
 }
 

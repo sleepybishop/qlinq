@@ -482,6 +482,7 @@ static void on_transport_event(void *user_data,
     }
     break;
   case TRANSPORT_EVENT_DISCONNECTED: {
+    qlinq_peer_state_t *peer = find_peer(endpoint, source->conn);
     qlinq_event_t event = {
         .type = QLINQ_EVENT_PEER_DISCONNECTED,
         .endpoint = endpoint,
@@ -492,7 +493,9 @@ static void on_transport_event(void *user_data,
                            source->disconnect.application_error,
                        .offending_frame_type =
                            source->disconnect.offending_frame_type,
-                       .remote = source->disconnect.remote},
+                       .remote = source->disconnect.remote,
+                       .was_ready = peer && peer->ready,
+                       .outgoing = !endpoint->listener},
         .status = QLINQ_STATUS_OK};
     const char *reason =
         source->disconnect.reason && source->disconnect.reason[0] != '\0'
@@ -788,6 +791,32 @@ qlinq_endpoint_t *qlinq_listen(qlinq_context_t *context,
 qlinq_endpoint_t *qlinq_connect(qlinq_context_t *context,
                                 const qlinq_endpoint_config_t *config) {
   return open_endpoint(context, config, false);
+}
+
+bool qlinq_endpoint_get_peer(qlinq_endpoint_t *endpoint, uint32_t id,
+                             qlinq_peer_info_t *info) {
+  if (!endpoint || !endpoint->active || !endpoint->transport || !info ||
+      id == 0)
+    return false;
+  for (qlinq_peer_state_t *peer = endpoint->peers; peer; peer = peer->next) {
+    if (peer->id != id)
+      continue;
+    transport_conn_stats_t stats;
+    if (!transport_get_conn_stats(endpoint->transport, peer->connection,
+                                  &stats))
+      return false;
+    *info = (qlinq_peer_info_t){.peer_id = id,
+                                .outgoing = !endpoint->listener,
+                                .ready = peer->ready,
+                                .quic_ready = stats.quic_ready,
+                                .protocol_ready = stats.protocol_ready,
+                                .authenticated = stats.authenticated,
+                                .paths_validated = stats.quic_paths_validated,
+                                .paths_validation_failed =
+                                    stats.quic_paths_validation_failed};
+    return true;
+  }
+  return false;
 }
 
 qlinq_status_t qlinq_endpoint_shutdown(qlinq_endpoint_t *endpoint,

@@ -520,11 +520,11 @@ static void release_membership(transport_t *t,
 
   size_t slot = ip_version_slot(membership->ip_version);
   int fd = slot != SIZE_MAX ? t->flexicast_fds[slot] : -1;
-  int result = fd >= 0 ? change_source_group(
-                             t, fd, membership->ip_version,
-                             membership->source_ip, membership->group_ip,
-                             membership->interface_index, false)
-                       : -1;
+  int result =
+      fd >= 0 ? change_source_group(t, fd, membership->ip_version,
+                                    membership->source_ip, membership->group_ip,
+                                    membership->interface_index, false)
+              : -1;
   if (fd >= 0) {
     if (result != 0)
       fprintf(stderr, "transport: unable to leave Flexicast group: %s\n",
@@ -676,9 +676,9 @@ join_announced_group(transport_t *t, transport_flexicast_flow_t *flow,
     if (!allocate_membership(t, announce->source_ip, announce->group_ip,
                              announce->ip_version, announce->udp_port,
                              interface_index)) {
-      (void)change_source_group(t, t->flexicast_fds[slot],
-                                announce->ip_version, announce->source_ip,
-                                announce->group_ip, interface_index, false);
+      (void)change_source_group(t, t->flexicast_fds[slot], announce->ip_version,
+                                announce->source_ip, announce->group_ip,
+                                interface_index, false);
       return false;
     }
   } else {
@@ -1429,8 +1429,8 @@ bool transport_flexicast_receive_bind(transport_t *t, transport_conn_t *conn,
   if (!t || !conn || !bind || !t->flexicast_enabled || t->is_server)
     return false;
   moq_track_id_t track;
-  if (transport_subscriptions_find_by_alias(&conn->subscriptions, bind->alias,
-                                            &track) != 0 ||
+  if (transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
+                                            bind->alias, &track) != 0 ||
       (track.flags & MOQ_TRACK_FLAG_RELIABLE) != 0)
     return false;
   transport_flexicast_flow_t *flow = find_flow(t, bind->flow_id);
@@ -1648,7 +1648,7 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
     set_member_listening(t, flow, member, true, transport_get_time_ms());
     member->ready_deadline_ms = 0;
     if (member->recovery_baseline_pending) {
-      if (transport_subscriptions_find_alias(&conn->subscriptions,
+      if (transport_subscriptions_find_alias(&conn->send_subscriptions,
                                              &flow->track_id, &alias) != 0)
         return false;
       transport_publish_checkpoint_member_added(t, conn, &flow->track_id,
@@ -1669,7 +1669,7 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
     member->key_pending = false;
     member->recovery_baseline_pending = false;
     set_member_listening(t, flow, member, false, 0);
-    if (transport_subscriptions_find_alias(&conn->subscriptions,
+    if (transport_subscriptions_find_alias(&conn->send_subscriptions,
                                            &flow->track_id, &alias) == 0)
       transport_publish_checkpoint_member_removed(t, conn, &flow->track_id,
                                                   alias);

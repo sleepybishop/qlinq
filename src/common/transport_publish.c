@@ -25,7 +25,7 @@ bool transport_publish_recipient_eligible(const transport_t *t,
          conn->authenticated &&
          quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
          (!t->is_server ||
-          transport_subscriptions_contains(&conn->subscriptions, track));
+          transport_subscriptions_contains(&conn->send_subscriptions, track));
 }
 
 static size_t publication_fec_limit(const transport_t *t,
@@ -208,8 +208,8 @@ static transport_publish_result_t publish_datagram_to_flexicast(
     path_state_t active_states[TRANSPORT_MAX_PATHS];
     size_t active_paths = 0;
     for (size_t physical = 0; physical < t->num_fds; physical++) {
-      size_t mapped = transport_path_find_by_link(
-          member->quic, t->local_addrs, t->num_fds, physical);
+      size_t mapped = transport_path_find_by_link(member->quic, t->local_addrs,
+                                                  t->num_fds, physical);
       if (mapped >= TRANSPORT_MAX_QUIC_PATHS ||
           !quicly_is_path_available(member->quic, mapped))
         continue;
@@ -466,16 +466,17 @@ void transport_publish_checkpoint_member_removed(transport_t *t,
                                                  uint8_t alias) {
   if (!t || !conn || !track_id)
     return;
-  transport_checkpoint_ack_state_t *ack = &conn->checkpoint_acks[alias];
+  transport_checkpoint_ack_state_t *ack = transport_checkpoint_ack(conn, alias);
+  if (!ack)
+    return;
   transport_fec_track_state_t *track = find_fec_track_state(t, track_id, false);
   if (track && track->finish_started && ack->finish_target &&
       !ack->finish_accounted) {
     ack->finish_accounted = true;
     track->finish_failed++;
   }
-  memset(&conn->checkpoint_acks[alias], 0,
-         sizeof(conn->checkpoint_acks[alias]));
-  conn->checkpoint_acks[alias].retired = true;
+  memset(ack, 0, sizeof(*ack));
+  ack->retired = true;
   release_acked_checkpoints(t, track_id);
 }
 
@@ -491,7 +492,8 @@ void transport_publish_checkpoint_connection_removed(transport_t *t,
     if (!(*transport_checkpoint_ack(conn, alias)).participating)
       continue;
     moq_track_id_t track_id = subscription->track_id;
-    transport_checkpoint_ack_state_t *ack = &conn->checkpoint_acks[alias];
+    transport_checkpoint_ack_state_t *ack =
+        transport_checkpoint_ack(conn, alias);
     transport_fec_track_state_t *track =
         find_fec_track_state(t, &track_id, false);
     if (track && track->finish_started && ack->finish_target &&
@@ -499,8 +501,7 @@ void transport_publish_checkpoint_connection_removed(transport_t *t,
       ack->finish_accounted = true;
       track->finish_failed++;
     }
-    memset(&conn->checkpoint_acks[alias], 0,
-           sizeof(conn->checkpoint_acks[alias]));
+    memset(ack, 0, sizeof(*ack));
     release_acked_checkpoints(t, &track_id);
   }
 }
@@ -627,9 +628,11 @@ static bool emit_rolling_checkpoint(transport_t *t,
     /* A clean Flexicast LEAVE retires this subscription from recovery until a
      * later JOIN reaches READY and establishes a fresh baseline. Do not let a
      * rolling checkpoint silently re-enlist a departed member. */
-    if (conn->checkpoint_acks[alias].retired)
+    transport_checkpoint_ack_state_t *ack =
+        transport_checkpoint_ack(conn, alias);
+    if (ack->retired)
       continue;
-    if (!conn->checkpoint_acks[alias].participating)
+    if (!ack->participating)
       transport_publish_checkpoint_member_added(t, conn, &track->track_id,
                                                 alias);
     if (!transport_stream_write_track_checkpoint_frame(
@@ -638,7 +641,6 @@ static bool emit_rolling_checkpoint(transport_t *t,
       succeeded = false;
       continue;
     }
-    transport_checkpoint_ack_state_t *ack = &conn->checkpoint_acks[alias];
     checkpoint_mark_sent(ack, group_id, final_object_id);
     t->stats.recovery_checkpoints_sent++;
   }
@@ -1080,7 +1082,7 @@ bool transport_finish_track(transport_t *t, moq_track_id_t track_id) {
                                            &alias) != 0)
       continue;
     if ((conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) != 0 &&
-        conn->checkpoint_acks[alias].retired)
+        transport_checkpoint_ack(conn, alias)->retired)
       continue;
     state->finish_targets++;
     if (transport_stream_write_track_end_frame(conn->stream, alias, 0,
@@ -1090,7 +1092,8 @@ bool transport_finish_track(transport_t *t, moq_track_id_t track_id) {
           0) {
         if (!(*transport_checkpoint_ack(conn, alias)).participating)
           transport_publish_checkpoint_member_added(t, conn, &track_id, alias);
-        transport_checkpoint_ack_state_t *ack = &conn->checkpoint_acks[alias];
+        transport_checkpoint_ack_state_t *ack =
+            transport_checkpoint_ack(conn, alias);
         checkpoint_mark_sent(ack, 0, final_object_id);
         ack->finish_target = true;
         ack->finish_accounted = false;
@@ -1125,7 +1128,7 @@ bool transport_abort_track(transport_t *t, moq_track_id_t track_id) {
     uint8_t alias = 0;
     if (!conn || !conn->quic || !conn->protocol_ready || !conn->authenticated ||
         !conn->stream || !quicly_sendstate_is_open(&conn->stream->sendstate) ||
-        transport_subscriptions_find_alias(&conn->subscriptions, &track_id,
+        transport_subscriptions_find_alias(&conn->send_subscriptions, &track_id,
                                            &alias) != 0)
       continue;
     (void)transport_stream_write_track_abort_frame(conn->stream, alias);
@@ -1170,8 +1173,9 @@ bool transport_get_track_stats(transport_t *t, const moq_track_id_t *track_id,
   size_t active_count = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
   for (size_t i = 0; i < active_count; i++) {
     transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
-    if (conn &&
-        transport_subscriptions_contains(&conn->subscriptions, track_id))
+    if (conn && conn->authenticated && conn->quic &&
+        quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
+        transport_subscriptions_contains(&conn->send_subscriptions, track_id))
       stats->subscribers++;
   }
   for (size_t i = 0; i < t->flexicast.capacity; i++) {

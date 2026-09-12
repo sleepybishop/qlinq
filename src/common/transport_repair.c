@@ -28,6 +28,25 @@ static bool refill_limiter(transport_repair_limiter_t *limiter,
     limiter->last_refill_ms = now_ms;
   }
 
+  return true;
+}
+
+uint64_t transport_repair_limiter_wait_ms(transport_repair_limiter_t *limiter,
+                                          size_t requests_per_second,
+                                          int64_t now_ms) {
+  if (!refill_limiter(limiter, requests_per_second, now_ms))
+    return UINT64_MAX;
+  if (limiter->tokens_milli >= 1000U)
+    return 0;
+  uint64_t missing = 1000U - limiter->tokens_milli;
+  return (missing + requests_per_second - 1U) / requests_per_second;
+}
+
+bool transport_repair_limiter_take(transport_repair_limiter_t *limiter,
+                                   size_t requests_per_second, int64_t now_ms) {
+  if (!refill_limiter(limiter, requests_per_second, now_ms))
+    return false;
+
   if (limiter->tokens_milli < 1000U)
     return false;
   limiter->tokens_milli -= 1000U;

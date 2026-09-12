@@ -64,6 +64,9 @@ void transport_repair_batch_destroy(transport_repair_batch_t *batch);
 
 /* Smooth token bucket used for receiver and source-wide feedback failsafes.
  * One token represents one repair request. */
+uint64_t transport_repair_limiter_wait_ms(transport_repair_limiter_t *limiter,
+                                          size_t requests_per_second,
+                                          int64_t now_ms);
 bool transport_repair_limiter_take(transport_repair_limiter_t *limiter,
                                    size_t requests_per_second, int64_t now_ms);
 

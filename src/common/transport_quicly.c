@@ -1221,8 +1221,7 @@ uint64_t transport_multicast_nack_retry_backoff_ms(uint16_t attempt) {
 static int64_t repair_feedback_delay_ms(const transport_conn_t *conn,
                                         bool shared_delivery, uint8_t alias,
                                         uint64_t group_id, uint64_t object_id,
-                                        uint16_t salt,
-                                        uint16_t retry_attempt) {
+                                        uint16_t salt, uint16_t retry_attempt) {
   if (!shared_delivery)
     return QLINQ_FEC_NACK_DELAY_MS;
   uint64_t value = conn->transport->repair_feedback_nonce;
@@ -1271,47 +1270,40 @@ void transport_tick(transport_t *t) {
     }
   }
 
-  /* Expiration releases memory and reports loss even when the receiver-wide
-   * NACK budget is exhausted. It must not be gated by request admission. */
+  /* Rotate recovery admission across peers and keep the aggregate deadline
+   * visible to the poller without suppressing assembler expiration. */
+  uint64_t aggregate_wait = transport_repair_limiter_wait_ms(
+      &t->aggregate_nack_limiter,
+      t->limits.max_aggregate_nack_requests_per_second, now_nack_ms);
+  size_t object_nack_budget = aggregate_wait == 0 ? 32 : 0;
+  t->aggregate_nack_retry_at_ms =
+      aggregate_wait == 0 ? 0
+      : aggregate_wait == UINT64_MAX ||
+              aggregate_wait > (uint64_t)(INT64_MAX - now_nack_ms)
+          ? INT64_MAX
+          : now_nack_ms + (int64_t)aggregate_wait;
   size_t active_conns = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
-  for (size_t c = 0; c < active_conns; c++) {
+  size_t recovery_start =
+      active_conns == 0 ? 0 : t->recovery_conn_cursor % active_conns;
+  for (size_t offset = 0; offset < active_conns; offset++) {
+    size_t c = (recovery_start + offset) % active_conns;
     transport_conn_t *conn = t->is_server ? t->conns[c] : t->client_conn;
     if (!conn || !conn->quic ||
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
       continue;
-    for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++) {
-      frame_assembler_t *asm_slot = &conn->assemblers[i];
-      if (asm_slot->total_symbols == 0)
-        continue;
-      if (now_nack_ms - asm_slot->last_activity_time_ms >=
-          t->fec_assembler_timeout_ms) {
-        moq_track_id_t resolved_track;
-        if (transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
-                                                  asm_slot->track_id,
-                                                  &resolved_track) == 0) {
-          transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT_LOST,
-                                  .conn = conn,
-                                  .track_id = resolved_track,
-                                  .object = {.track_id = resolved_track,
-                                             .group_id = asm_slot->group_id,
-                                             .object_id = asm_slot->object_id}};
-          t->stats.fec_objects_lost++;
-          transport_emit_event(t, &ev);
-        }
-        transport_release_assembler(t, asm_slot);
-        continue;
-      }
-    }
-  }
 
     for (size_t alias = 0; alias <= UINT8_MAX && object_nack_budget > 0;
          alias++) {
-      transport_object_gap_state_t *gap = &conn->object_gaps[alias];
+      transport_object_gap_state_t *gap =
+          transport_object_gap(conn, (uint8_t)alias);
+      if (!gap)
+        continue;
       moq_track_id_t feedback_track;
       bool shared_rateless_feedback =
           gap->shared_delivery &&
-          transport_subscriptions_find_by_alias(
-              &conn->subscriptions, (uint8_t)alias, &feedback_track) == 0 &&
+          transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
+                                                (uint8_t)alias,
+                                                &feedback_track) == 0 &&
           transport_get_effective_repair_mode(t, conn, &feedback_track) ==
               TRANSPORT_REPAIR_MODE_RATELESS;
       if (gap->pending_mask != 0) {
@@ -1322,8 +1314,7 @@ void transport_tick(transport_t *t) {
                (gap->requested_mask & bit_mask) != 0))
             continue;
           uint64_t object_id = gap->pending_base + bit;
-          uint16_t feedback_salt =
-              shared_rateless_feedback ? (uint16_t)bit : 0;
+          uint16_t feedback_salt = shared_rateless_feedback ? (uint16_t)bit : 0;
           uint16_t retry_attempt =
               shared_rateless_feedback ? gap->nack_attempt : 0;
           if (now_nack_ms - gap->detected_at_ms <
@@ -1342,6 +1333,11 @@ void transport_tick(transport_t *t) {
               gap->detected_at_ms = now_nack_ms;
             object_nack_budget--;
             t->recovery_conn_cursor = (c + 1U) % active_conns;
+            if (transport_repair_limiter_wait_ms(
+                    &t->aggregate_nack_limiter,
+                    t->limits.max_aggregate_nack_requests_per_second,
+                    now_nack_ms) != 0)
+              object_nack_budget = 0;
           } else {
             break;
           }
@@ -1397,11 +1393,6 @@ void transport_tick(transport_t *t) {
           }
           if (assembling)
             continue;
-          aggregate_wait = transport_repair_limiter_wait_ms(
-              &t->aggregate_nack_limiter,
-              t->limits.max_aggregate_nack_requests_per_second, now_nack_ms);
-          if (aggregate_wait != 0)
-            goto aggregate_nack_exhausted;
           if (transport_protocol_send_nack(conn, (uint8_t)alias,
                                            window->group_id, object_id, NULL, 0,
                                            true)) {
@@ -1413,6 +1404,11 @@ void transport_tick(transport_t *t) {
               window->last_request_ms = now_nack_ms;
             object_nack_budget--;
             t->recovery_conn_cursor = (c + 1U) % active_conns;
+            if (transport_repair_limiter_wait_ms(
+                    &t->aggregate_nack_limiter,
+                    t->limits.max_aggregate_nack_requests_per_second,
+                    now_nack_ms) != 0)
+              object_nack_budget = 0;
           }
           if (!shared_rateless_feedback)
             break;
@@ -1434,9 +1430,9 @@ void transport_tick(transport_t *t) {
         continue;
 
       if (now_nack_ms - asm_slot->last_activity_time_ms >=
-          QLINQ_FEC_ASSEMBLER_TIMEOUT_MS) {
+          t->fec_assembler_timeout_ms) {
         moq_track_id_t resolved_track;
-        if (transport_subscriptions_find_by_alias(&conn->subscriptions,
+        if (transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
                                                   asm_slot->track_id,
                                                   &resolved_track) == 0) {
           transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT_LOST,
@@ -1455,28 +1451,28 @@ void transport_tick(transport_t *t) {
       if (asm_slot->decoded)
         continue;
       moq_track_id_t resolved_track;
-      if (transport_subscriptions_find_by_alias(&conn->subscriptions,
+      if (transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
                                                 asm_slot->track_id,
                                                 &resolved_track) != 0 ||
           !(resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS))
         continue; /* Fixed RS-FEC does not send NACKs */
       transport_repair_mode_t repair_mode =
           transport_get_effective_repair_mode(t, conn, &resolved_track);
-      uint16_t retry_attempt =
-          repair_mode == TRANSPORT_REPAIR_MODE_RATELESS ? asm_slot->nack_attempt
-                                                        : 0;
-      if (now_nack_ms - asm_slot->first_symbol_time_ms >=
+      uint16_t retry_attempt = repair_mode == TRANSPORT_REPAIR_MODE_RATELESS
+                                   ? asm_slot->nack_attempt
+                                   : 0;
+      if (object_nack_budget > 0 &&
+          now_nack_ms - asm_slot->first_symbol_time_ms >=
               repair_feedback_delay_ms(conn, asm_slot->shared_delivery,
                                        asm_slot->track_id, asm_slot->group_id,
                                        asm_slot->object_id,
                                        asm_slot->nack_attempt, retry_attempt) &&
           (!asm_slot->nack_sent ||
            now_nack_ms - asm_slot->last_nack_time_ms >=
-               repair_feedback_delay_ms(conn, asm_slot->shared_delivery,
-                                        asm_slot->track_id, asm_slot->group_id,
-                                        asm_slot->object_id,
-                                        asm_slot->nack_attempt,
-                                        retry_attempt))) {
+               repair_feedback_delay_ms(
+                   conn, asm_slot->shared_delivery, asm_slot->track_id,
+                   asm_slot->group_id, asm_slot->object_id,
+                   asm_slot->nack_attempt, retry_attempt))) {
         uint16_t missing_count = 0;
         const uint16_t *missing = NULL;
         if (repair_mode == TRANSPORT_REPAIR_MODE_RATELESS) {
@@ -1496,11 +1492,6 @@ void transport_tick(transport_t *t) {
           missing = asm_slot->missing_indices;
         }
         if (missing_count > 0) {
-          aggregate_wait = transport_repair_limiter_wait_ms(
-              &t->aggregate_nack_limiter,
-              t->limits.max_aggregate_nack_requests_per_second, now_nack_ms);
-          if (aggregate_wait != 0)
-            goto aggregate_nack_exhausted;
           if (transport_protocol_send_nack(
                   conn, asm_slot->track_id, asm_slot->group_id,
                   asm_slot->object_id, missing, missing_count, false)) {
@@ -1508,22 +1499,24 @@ void transport_tick(transport_t *t) {
             asm_slot->last_nack_time_ms = now_nack_ms;
             if (asm_slot->nack_attempt != UINT16_MAX)
               asm_slot->nack_attempt++;
+            t->recovery_conn_cursor = (c + 1U) % active_conns;
+            object_nack_budget--;
           }
         }
       }
     }
   }
 
-  goto recovery_sweep_done;
+  aggregate_wait = transport_repair_limiter_wait_ms(
+      &t->aggregate_nack_limiter,
+      t->limits.max_aggregate_nack_requests_per_second, now_nack_ms);
+  if (aggregate_wait != 0)
+    t->aggregate_nack_retry_at_ms =
+        aggregate_wait == UINT64_MAX ||
+                aggregate_wait > (uint64_t)(INT64_MAX - now_nack_ms)
+            ? INT64_MAX
+            : now_nack_ms + (int64_t)aggregate_wait;
 
-aggregate_nack_exhausted:
-  t->aggregate_nack_retry_at_ms =
-      aggregate_wait == UINT64_MAX ||
-              aggregate_wait > (uint64_t)(INT64_MAX - now_nack_ms)
-          ? INT64_MAX
-          : now_nack_ms + (int64_t)aggregate_wait;
-
-recovery_sweep_done:
   /* Check for FEC grouping buffer timeout (3 milliseconds) */
   if (t->fec_buf_len > 0) {
     uint64_t now = ptls_get_time.cb(&ptls_get_time);
@@ -1578,7 +1571,6 @@ recovery_sweep_done:
 
           int fd = open_unicast_socket(msg.addr.ss_family);
           if (fd >= 0) {
-            /* Keep dynamically discovered unicast paths exclusive too. */
             configure_socket_buffers(t, fd);
             if (msg.addr.ss_family == AF_INET) {
               ((struct sockaddr_in *)&msg.addr)->sin_port =
@@ -1755,8 +1747,15 @@ recovery_sweep_done:
         t->stats.flexicast_multicast_datagrams_rejected++;
     }
   }
-  for (size_t fd_idx = 0; fd_idx < t->num_fds && receive_budget > 0; fd_idx++) {
-    while (receive_budget > 0) {
+  size_t receive_start = t->num_fds ? t->receive_cursor % t->num_fds : 0;
+  t->receive_cursor = t->num_fds ? (receive_start + 1U) % t->num_fds : 0;
+  size_t quantum =
+      t->num_fds ? (receive_budget + t->num_fds - 1U) / t->num_fds : 0;
+  for (size_t visited = 0; visited < t->num_fds && receive_budget > 0;
+       visited++) {
+    size_t fd_idx = (receive_start + visited) % t->num_fds;
+    size_t serviced = 0;
+    while (receive_budget > 0 && serviced < quantum) {
       uint8_t buf[2048];
       struct sockaddr_storage sa;
       socklen_t sa_len = sizeof(sa);
@@ -1768,7 +1767,7 @@ recovery_sweep_done:
           break;
         if (SOCKET_ERROR_CODE == SOCKET_EINTR)
           continue;
-        break; /* A persistent socket error must not spin the owner thread. */
+        break;
       }
       receive_budget--;
       serviced++;
@@ -1797,10 +1796,6 @@ recovery_sweep_done:
 
         transport_conn_t *target = NULL;
         if (t->is_server) {
-          /* Ordinary short-header traffic carries our stable master CID.
-           * Avoid testing every earlier peer's reset tokens for each packet.
-           * Initials, unknown CIDs and cache collisions retain the full path.
-           */
           if (t->quic_ctx.cid_encryptor != NULL &&
               !QUICLY_PACKET_IS_LONG_HEADER(decoded.octets.base[0])) {
             transport_conn_t *hint =
@@ -2131,7 +2126,7 @@ static bool subscribe_connection(transport_conn_t *conn,
     return false;
   uint8_t alias;
   bool newly_added = false;
-  if (transport_subscriptions_find_alias(&conn->subscriptions, track_id,
+  if (transport_subscriptions_find_alias(&conn->receive_subscriptions, track_id,
                                          &alias) != 0) {
     if (transport_subscriptions_count(&conn->receive_subscriptions) >=
         conn->negotiated_limits.max_subscriptions_per_connection)
@@ -2158,10 +2153,10 @@ static bool subscribe_connection(transport_conn_t *conn,
       transport_subscriptions_remove(&conn->receive_subscriptions,
                                      track_id->type, track_id->name);
     return false;
-  if (newly_added)
-    memset(&conn->object_gaps[alias], 0, sizeof(conn->object_gaps[alias]));
-  transport_publish_checkpoint_member_added(conn->transport, conn, track_id,
-                                            alias);
+  }
+  if (newly_added && transport_object_gap(conn, alias))
+    memset(transport_object_gap(conn, alias), 0,
+           sizeof(*transport_object_gap(conn, alias)));
   return true;
 }
 
@@ -2208,11 +2203,15 @@ static bool unsubscribe_connection(transport_t *t, transport_conn_t *conn,
                                           alias, &subscribed_track))
     return false;
 
-  transport_publish_checkpoint_member_removed(t, conn, &subscribed_track,
-                                              alias);
   transport_flexicast_unsubscribe(t, conn, &subscribed_track);
-  transport_subscriptions_remove(&conn->subscriptions, subscribed_track.type,
-                                 subscribed_track.name);
+  memset(transport_object_gap(conn, alias), 0,
+         sizeof(*transport_object_gap(conn, alias)));
+  for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++)
+    if (conn->assemblers[i].total_symbols &&
+        conn->assemblers[i].track_id == alias)
+      transport_release_assembler(t, &conn->assemblers[i]);
+  transport_subscriptions_remove(&conn->receive_subscriptions,
+                                 subscribed_track.type, subscribed_track.name);
   return true;
 }
 
@@ -2922,23 +2921,7 @@ size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
       fds[count].revents = 0;
       count++;
     }
+  if (t->ifmon_pipe[0] >= 0 && count < max_fds)
+    fds[count++] = (struct pollfd){.fd = t->ifmon_pipe[0], .events = POLLIN};
   return count;
-}
-
-bool transport_get_track_stats(transport_t *t, const moq_track_id_t *track,
-                               transport_track_stats_t *stats) {
-  if (!transport_owner_ok(t) || !transport_track_id_valid(track) || !stats)
-    return false;
-  *stats = (transport_track_stats_t){0};
-  size_t count = t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
-  for (size_t i = 0; i < count; i++) {
-    transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
-    uint8_t alias;
-    if (conn && conn->authenticated && conn->quic &&
-        quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
-        transport_subscriptions_find_alias(&conn->send_subscriptions, track,
-                                           &alias) == 0)
-      stats->subscribers++;
-  }
-  return true;
 }

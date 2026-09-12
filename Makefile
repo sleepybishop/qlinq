@@ -135,7 +135,7 @@ t/%.o: t/%.c
 deps/%.o: deps/%.c
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -w -c $< -o $@
 
-all: qlinqd qlinq-app qlinq-cast qlinq-tund
+all: qlinqd qlinq-app qlinq-cast qlinq-tund qlinq-tun
 
 libqlinq.a: $(TRANSPORT_OBJS)
 	$(AR) rcs $@ $(TRANSPORT_OBJS)
@@ -149,9 +149,11 @@ qlinq-app: $(APP_OBJS) libqlinq.a
 qlinq-cast: $(CAST_OBJS) libqlinq.a
 	$(CC) -o $@ $(CAST_OBJS) libqlinq.a $(LDFLAGS)
 
-qlinq-tund: src/host/linux/tund.c
-	$(CC) $(CFLAGS_COMMON) $(INCLUDES) $(CFLAGS) -o $@ src/host/linux/tund.c \
-		$(LDFLAGS)
+qlinq-tund: src/host/linux/tund.o src/host/linux/tun_device.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+qlinq-tun: src/host/linux/tun_direct.o src/host/linux/tun_device.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS)
 
 examples/data_multipath_benchmark: examples/data_multipath_benchmark.o $(COMMON_OBJS)
 	$(CC) -o $@ examples/data_multipath_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
@@ -198,16 +200,13 @@ t/00util/test_stream_budget: t/00util/test_stream_budget.o $(COMMON_OBJS)
 t/00util/test_transport: t/00util/test_transport.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_transport.o $(COMMON_OBJS) $(LDFLAGS)
 
+t/00util/test_reliable_bidirectional: t/00util/test_reliable_bidirectional.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
 t/00util/test_flexicast_transport: t/00util/test_flexicast_transport.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_flexicast_transport.o $(COMMON_OBJS) $(LDFLAGS)
 
 t/00util/test_flexicast_regressions: t/00util/test_flexicast_regressions.o $(COMMON_OBJS)
-	$(CC) -o $@ $^ $(LDFLAGS)
-
-t/00util/test_qlinq_delivery: t/00util/test_qlinq_delivery.o $(COMMON_OBJS)
-	$(CC) -o $@ $^ $(LDFLAGS)
-
-t/00util/test_egress_errors: t/00util/test_egress_errors.o src/common/transport_egress.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 t/00util/test_quicly_flexicast: deps/quicly/t/flexicast.c deps/quicly/t/flexicast-main.c deps/quicly/deps/picotest/picotest.c $(QUICLY_OBJS)
@@ -230,9 +229,6 @@ t/00util/test_transport_components: t/00util/test_transport_components.o $(COMMO
 
 t/00util/test_qlinq_api: t/00util/test_qlinq_api.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_qlinq_api.o $(COMMON_OBJS) $(LDFLAGS)
-
-t/00util/test_qlinq_reconnect: t/00util/test_qlinq_reconnect.o $(COMMON_OBJS)
-	$(CC) -o $@ t/00util/test_qlinq_reconnect.o $(COMMON_OBJS) $(LDFLAGS)
 
 t/00util/fuzz_transport_wire: t/00util/fuzz_transport_wire.c src/common/transport_wire.c
 	clang $(CFLAGS_COMMON) $(INCLUDES) -fsanitize=fuzzer,address,undefined \
@@ -327,6 +323,9 @@ CHECK_BINARIES = t/00util/test_fec \
 	t/00util/test_qlinq_reconnect t/00util/test_qlinq_delivery \
 	t/00util/test_qlinq_event_ownership t/00util/test_generic_ports \
 	t/00util/test_stream_budget t/00util/test_transport \
+	t/00util/test_flexicast_transport t/00util/test_flexicast_scale \
+	t/00util/test_flexicast_regressions t/00util/test_quicly_flexicast \
+	t/00util/test_qlinq_api \
 	t/00util/test_reliable_bidirectional t/00util/test_tund \
 	t/00util/test_data_uds t/00util/test_transport_wire \
 	t/00util/test_transport_components t/00util/test_multipath \
@@ -343,9 +342,6 @@ clean:
 		$(PATHFLOW_OBJS:.o=.d) deps/nanors/rs.d \
 		deps/nanors/deps/obl/oblas_common.d \
 		deps/nanors/deps/obl/oblas_lite.d
-
-check: qlinqd qlinq-app qlinq-cast qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_flexicast_transport t/00util/test_flexicast_scale t/00util/test_flexicast_regressions t/00util/test_qlinq_delivery t/00util/test_egress_errors t/00util/test_quicly_flexicast t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_qlinq_api t/00util/test_qlinq_reconnect t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls gencerts
-	prove -I. -v t/*.t
 
 # Optional Linux integration suite. It uses root/CAP_NET_ADMIN or an
 # unprivileged user namespace to verify native IPv4/IPv6 SSM across a bridge.
