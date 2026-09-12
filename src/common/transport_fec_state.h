@@ -32,7 +32,20 @@ typedef struct {
 typedef struct {
   sent_object_cache_t entries[TRANSPORT_SENT_CACHE_SIZE];
   size_t next_entry;
+  size_t max_payload_bytes;
+  size_t payload_bytes, peak_payload_bytes;
+  size_t count, peak_count;
 } transport_sent_cache_t;
+
+static inline size_t
+transport_sent_cache_byte_limit(const transport_sent_cache_t *cache) {
+  return cache->max_payload_bytes ? cache->max_payload_bytes
+                                  : TRANSPORT_DEFAULT_RECOVERY_CACHE_BYTES;
+}
+
+bool transport_sent_cache_can_store(const transport_sent_cache_t *cache,
+                                    const moq_object_t *object,
+                                    bool allow_evict);
 
 sent_object_cache_t *transport_sent_cache_find(transport_sent_cache_t *cache,
                                                const moq_track_id_t *track,

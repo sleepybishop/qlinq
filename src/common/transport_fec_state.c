@@ -39,6 +39,52 @@ bool transport_sent_cache_has_space(const transport_sent_cache_t *cache) {
   return false;
 }
 
+static bool source_overlaps_entry(const moq_object_t *object,
+                                  const sent_object_cache_t *entry) {
+  uintptr_t source = (uintptr_t)object->data;
+  uintptr_t retained = (uintptr_t)entry->data;
+  return source >= retained ? source - retained < entry->size
+                            : retained - source < object->size;
+}
+
+bool transport_sent_cache_can_store(const transport_sent_cache_t *cache,
+                                    const moq_object_t *object,
+                                    bool allow_evict) {
+  if (!cache || !object || !object->data || object->size == 0 ||
+      object->size > transport_sent_cache_byte_limit(cache) ||
+      cache->payload_bytes > transport_sent_cache_byte_limit(cache))
+    return false;
+  size_t available =
+      transport_sent_cache_byte_limit(cache) - cache->payload_bytes;
+  bool slot_available = false;
+  for (size_t i = 0; i < TRANSPORT_SENT_CACHE_SIZE; i++) {
+    const sent_object_cache_t *entry = &cache->entries[i];
+    if (!entry->data) {
+      slot_available = true;
+    } else if (track_equal(&entry->track_id, &object->track_id) &&
+               entry->group_id == object->group_id &&
+               entry->object_id == object->object_id) {
+      return entry->size == object->size &&
+             memcmp(entry->data, object->data, object->size) == 0;
+    } else if (allow_evict && !entry->recovery_protected &&
+               !source_overlaps_entry(object, entry)) {
+      available += entry->size;
+      slot_available = true;
+    }
+  }
+  return slot_available && object->size <= available;
+}
+
+static void release_entry(transport_sent_cache_t *cache,
+                          sent_object_cache_t *entry) {
+  if (entry->data) {
+    cache->payload_bytes -= entry->size;
+    cache->count--;
+    free(entry->data);
+  }
+  memset(entry, 0, sizeof(*entry));
+}
+
 bool transport_sent_cache_store(transport_sent_cache_t *cache,
                                 const moq_object_t *object,
                                 uint16_t total_symbols, uint16_t data_symbols,
@@ -48,8 +94,9 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
   sent_object_cache_t *existing = transport_sent_cache_find(
       cache, &object->track_id, object->group_id, object->object_id);
   if (existing) {
-    /* Publication retries retain one recovery entry. Reusing an identity for
-     * different bytes is invalid because receivers cannot distinguish it. */
+    /* A partially queued publication is retried with the same object
+     * identity. Keep one recovery entry and preserve any rateless ESI already
+     * allocated from it. Conflicting reuse of an identity is invalid. */
     if (existing->size != object->size ||
         memcmp(existing->data, object->data, object->size) != 0)
       return false;
@@ -64,36 +111,44 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
     existing->recovery_protected |= !allow_evict;
     return true;
   }
+  if (!transport_sent_cache_can_store(cache, object, allow_evict))
+    return false;
 
+  /* Reclaim only evictable best-effort payloads, before allocating the new
+   * copy, so the byte cap also holds during replacement. Required recovery
+   * objects survive pressure. Allocation failure may retire best-effort cache
+   * entries, but cannot destroy a protected obligation. */
+  for (size_t offset = 0;
+       object->size >
+           transport_sent_cache_byte_limit(cache) - cache->payload_bytes ||
+       cache->count == TRANSPORT_SENT_CACHE_SIZE;
+       offset++) {
+    if (!allow_evict || offset == TRANSPORT_SENT_CACHE_SIZE)
+      return false;
+    size_t index = (cache->next_entry + offset) % TRANSPORT_SENT_CACHE_SIZE;
+    if (cache->entries[index].data &&
+        !cache->entries[index].recovery_protected &&
+        !source_overlaps_entry(object, &cache->entries[index]))
+      release_entry(cache, &cache->entries[index]);
+  }
   sent_object_cache_t *entry = NULL;
+  size_t next_entry = cache->next_entry;
   for (size_t offset = 0; offset < TRANSPORT_SENT_CACHE_SIZE; offset++) {
     size_t index = (cache->next_entry + offset) % TRANSPORT_SENT_CACHE_SIZE;
     if (!cache->entries[index].data) {
       entry = &cache->entries[index];
-      cache->next_entry = (index + 1U) % TRANSPORT_SENT_CACHE_SIZE;
+      next_entry = (index + 1U) % TRANSPORT_SENT_CACHE_SIZE;
       break;
     }
   }
-  if (!entry) {
-    if (!allow_evict)
-      return false;
-    for (size_t offset = 0; offset < TRANSPORT_SENT_CACHE_SIZE; offset++) {
-      size_t index = (cache->next_entry + offset) % TRANSPORT_SENT_CACHE_SIZE;
-      if (!cache->entries[index].recovery_protected) {
-        entry = &cache->entries[index];
-        cache->next_entry = (index + 1U) % TRANSPORT_SENT_CACHE_SIZE;
-        break;
-      }
-    }
-    if (!entry)
-      return false;
-  }
+  if (!entry)
+    return false;
   uint8_t *copy = malloc(object->size);
   if (!copy)
     return false;
   memcpy(copy, object->data, object->size);
 
-  free(entry->data);
+  cache->next_entry = next_entry;
   entry->track_id = object->track_id;
   entry->group_id = object->group_id;
   entry->object_id = object->object_id;
@@ -107,12 +162,13 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
   entry->next_systematic_repair_symbol = 0;
   entry->recovery_protected = !allow_evict;
   entry->data = copy;
+  cache->payload_bytes += object->size;
+  cache->count++;
+  if (cache->payload_bytes > cache->peak_payload_bytes)
+    cache->peak_payload_bytes = cache->payload_bytes;
+  if (cache->count > cache->peak_count)
+    cache->peak_count = cache->count;
   return true;
-}
-
-static void release_entry(sent_object_cache_t *entry) {
-  free(entry->data);
-  memset(entry, 0, sizeof(*entry));
 }
 
 size_t transport_sent_cache_release_through(transport_sent_cache_t *cache,
@@ -126,7 +182,7 @@ size_t transport_sent_cache_release_through(transport_sent_cache_t *cache,
     sent_object_cache_t *entry = &cache->entries[i];
     if (entry->data && track_equal(&entry->track_id, track) &&
         entry->group_id == group_id && entry->object_id <= object_id) {
-      release_entry(entry);
+      release_entry(cache, entry);
       released++;
     }
   }
@@ -141,7 +197,7 @@ size_t transport_sent_cache_release_track(transport_sent_cache_t *cache,
   for (size_t i = 0; i < TRANSPORT_SENT_CACHE_SIZE; i++) {
     sent_object_cache_t *entry = &cache->entries[i];
     if (entry->data && track_equal(&entry->track_id, track)) {
-      release_entry(entry);
+      release_entry(cache, entry);
       released++;
     }
   }

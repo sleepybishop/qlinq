@@ -4,6 +4,9 @@
 #include "transport_internal.h"
 #include "transport_wire.h"
 
+bool transport_publish_recovery_ready(transport_t *t,
+                                      const moq_track_id_t *track_id);
+
 bool transport_publish_flush_grouped(transport_t *t);
 bool transport_publish_finish_grouped(transport_t *t,
                                       const moq_track_id_t *track_id,

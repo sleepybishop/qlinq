@@ -144,6 +144,8 @@ typedef void (*transport_callback_t)(void *user_data,
 #define TRANSPORT_DEFAULT_MAX_AGGREGATE_REPAIR_REQUESTS_PER_SECOND 256U
 #define TRANSPORT_DEFAULT_MAX_EGRESS_PACKETS 1024U
 #define TRANSPORT_DEFAULT_MAX_EGRESS_BYTES (2U * 1024U * 1024U)
+#define TRANSPORT_RECOVERY_WINDOW_OBJECTS 32U
+#define TRANSPORT_DEFAULT_RECOVERY_CACHE_BYTES (16U * 1024U * 1024U)
 #define TRANSPORT_DEFAULT_ASSEMBLER_MEMORY_BUDGET (64U * 1024U * 1024U)
 #define TRANSPORT_DEFAULT_MAX_PACKETS_PER_TICK 1024U
 #define TRANSPORT_DEFAULT_RECONNECT_INITIAL_DELAY_MS 250U
@@ -163,6 +165,8 @@ typedef struct {
   size_t max_egress_packets_per_socket;
   size_t max_egress_bytes_per_socket;
   size_t max_assembler_memory_bytes;
+  /* Retained recovery payloads, in addition to the fixed cache entry table. */
+  size_t max_recovery_cache_bytes;
   size_t max_reliable_object_size;
   size_t max_fec_object_size;
   size_t max_udp_payload_size;
@@ -355,6 +359,8 @@ typedef struct {
   uint64_t recovery_checkpoint_acks_received;
   uint64_t recovery_cache_releases;
   uint64_t recovery_cache_backpressure;
+  size_t recovery_cache_payload_bytes, recovery_cache_peak_payload_bytes;
+  size_t recovery_cache_entries, recovery_cache_peak_entries;
   size_t recovery_checkpoints_pending;
   uint64_t recovery_oldest_checkpoint_age_ms;
   uint64_t events_emitted;

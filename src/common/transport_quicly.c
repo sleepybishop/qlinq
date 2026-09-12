@@ -691,6 +691,7 @@ transport_t *transport_create(const transport_config_t *config) {
   t->owner_thread = pthread_self();
   atomic_init(&t->cross_thread_violations, 0);
   t->limits = limits;
+  t->sent_cache.max_payload_bytes = limits.max_recovery_cache_bytes;
   if (config->repair_mode != TRANSPORT_REPAIR_MODE_AUTO &&
       config->repair_mode != TRANSPORT_REPAIR_MODE_INDEXED &&
       config->repair_mode != TRANSPORT_REPAIR_MODE_RATELESS) {
@@ -1981,6 +1982,10 @@ bool transport_get_stats(transport_t *t, transport_stats_t *stats) {
   if (!transport_owner_ok(t) || !stats)
     return false;
   *stats = t->stats;
+  stats->recovery_cache_payload_bytes = t->sent_cache.payload_bytes;
+  stats->recovery_cache_peak_payload_bytes = t->sent_cache.peak_payload_bytes;
+  stats->recovery_cache_entries = t->sent_cache.count;
+  stats->recovery_cache_peak_entries = t->sent_cache.peak_count;
   stats->api_thread_violations +=
       atomic_load_explicit(&t->cross_thread_violations, memory_order_relaxed);
   stats->active_connections =
@@ -2234,6 +2239,9 @@ size_t transport_get_datagram_symbol_size(const transport_t *t) {
 
 bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
   if (!transport_owner_ok(t) || !transport_track_id_valid(track_id))
+    return false;
+
+  if (!transport_publish_recovery_ready(t, track_id))
     return false;
 
   for (size_t i = 0; i < t->num_fds; i++) {

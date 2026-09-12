@@ -379,6 +379,40 @@ static bool checkpoint_cache_is_protected(transport_t *t,
   return found;
 }
 
+bool transport_publish_recovery_ready(transport_t *t,
+                                      const moq_track_id_t *track_id) {
+  if (!t || !track_id)
+    return false;
+  if (track_id->type != MOQ_TRACK_DATA ||
+      (track_id->flags & MOQ_TRACK_FLAG_RELIABLE) != 0)
+    return true;
+  const transport_sent_cache_t *cache = &t->sent_cache;
+  size_t needed = t->fec_buf_len != 0 ? t->fec_buf_len : 1;
+  if (cache->payload_bytes > transport_sent_cache_byte_limit(cache))
+    return false;
+  size_t available =
+      transport_sent_cache_byte_limit(cache) - cache->payload_bytes;
+  bool slot = cache->count < TRANSPORT_SENT_CACHE_SIZE;
+  /* The normal query stays constant-time. Recipient and eviction scans are
+   * needed only when the count or byte budget actually prevents admission. */
+  if (slot && needed <= available)
+    return true;
+  const moq_track_id_t *pending_track =
+      t->fec_buf_len != 0 ? &t->fec_track_id : track_id;
+  if (checkpoint_cache_is_protected(t, pending_track))
+    return false;
+  /* Preserve legacy eviction, without advertising protected entries as free
+   * space to a different track. Actual send still performs exact admission. */
+  for (size_t i = 0; i < TRANSPORT_SENT_CACHE_SIZE; i++) {
+    const sent_object_cache_t *entry = &cache->entries[i];
+    if (entry->data && !entry->recovery_protected) {
+      available += entry->size;
+      slot = true;
+    }
+  }
+  return slot && needed <= available;
+}
+
 static bool emit_rolling_checkpoint(transport_t *t,
                                     transport_fec_track_state_t *track,
                                     uint64_t group_id, uint64_t first_object_id,
@@ -670,7 +704,9 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
   bool protect_repair_cache = obj->track_id.type == MOQ_TRACK_DATA &&
                               profile.fec_rateless &&
                               checkpoint_cache_is_protected(t, &obj->track_id);
-  if (protect_repair_cache && !transport_sent_cache_has_space(&t->sent_cache)) {
+  if (obj->track_id.type == MOQ_TRACK_DATA &&
+      !transport_sent_cache_can_store(&t->sent_cache, obj,
+                                      !protect_repair_cache)) {
     t->stats.recovery_cache_backpressure++;
     return TRANSPORT_PUBLISH_BACKPRESSURE;
   }

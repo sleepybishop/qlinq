@@ -472,6 +472,139 @@ int main(void) {
         "checkpoint release restores bounded cache capacity");
   transport_sent_cache_destroy(&bounded_cache);
 
+  /* Entry limits alone admit 256 MiB of retained source payload. Exercise
+   * byte pressure well before the entry limit, preserving required repairs. */
+  uint8_t *large_payload = malloc(1024U * 1024U);
+  CHECK(large_payload != NULL, "source-cache byte-budget fixture allocation");
+  memset(large_payload, 0x5a, 1024U * 1024U);
+  moq_object_t large_object = object;
+  large_object.data = large_payload;
+  large_object.size = 1024U * 1024U;
+  for (size_t i = 0; i < 16; i++) {
+    large_object.object_id = i;
+    CHECK(transport_sent_cache_store(&bounded_cache, &large_object, 1024, 1024,
+                                     1024, false),
+          "source-cache byte-budget fill");
+  }
+  CHECK(bounded_cache.payload_bytes == TRANSPORT_DEFAULT_RECOVERY_CACHE_BYTES &&
+            bounded_cache.peak_payload_bytes ==
+                TRANSPORT_DEFAULT_RECOVERY_CACHE_BYTES &&
+            bounded_cache.count == 16 && bounded_cache.peak_count == 16,
+        "source-cache allocation counters include the full retained payload");
+  large_object.object_id = 0;
+  sent_object_cache_t *full_retry =
+      transport_sent_cache_find(&bounded_cache, &large_object.track_id,
+                                large_object.group_id, large_object.object_id);
+  CHECK(transport_sent_cache_can_store(&bounded_cache, &large_object, false) &&
+            transport_sent_cache_store(&bounded_cache, &large_object, 1024,
+                                       1024, 1024, false) &&
+            transport_sent_cache_find(&bounded_cache, &large_object.track_id,
+                                      large_object.group_id, 0) == full_retry &&
+            bounded_cache.payload_bytes ==
+                TRANSPORT_DEFAULT_RECOVERY_CACHE_BYTES &&
+            bounded_cache.count == 16,
+        "a retry at the byte limit reuses its retained allocation");
+  large_payload[0] ^= 1;
+  CHECK(!transport_sent_cache_can_store(&bounded_cache, &large_object, false) &&
+            !transport_sent_cache_store(&bounded_cache, &large_object, 1024,
+                                        1024, 1024, false),
+        "conflicting identity cannot replace a protected source object");
+  large_payload[0] ^= 1;
+  large_object.object_id = 16;
+  CHECK(!transport_sent_cache_store(&bounded_cache, &large_object, 1024, 1024,
+                                    1024, false),
+        "source cache must backpressure at 16 MiB before its entry limit");
+  CHECK(!transport_sent_cache_store(&bounded_cache, &large_object, 1024, 1024,
+                                    1024, true),
+        "byte pressure cannot evict protected source objects");
+  CHECK(transport_sent_cache_release_through(&bounded_cache,
+                                             &large_object.track_id,
+                                             large_object.group_id, 0) == 1 &&
+            transport_sent_cache_store(&bounded_cache, &large_object, 1024,
+                                       1024, 1024, false),
+        "checkpoint release restores source-cache byte admission");
+  transport_sent_cache_destroy(&bounded_cache);
+  CHECK(bounded_cache.payload_bytes == 0 && bounded_cache.count == 0,
+        "source-cache destruction clears retained allocation accounting");
+
+  for (size_t i = 0; i < 15; i++) {
+    large_object.object_id = i;
+    CHECK(transport_sent_cache_store(&bounded_cache, &large_object, 1024, 1024,
+                                     1024, false),
+          "mixed source-cache protected fill");
+  }
+  large_object.size = 256U * 1024U;
+  for (size_t i = 15; i < 19; i++) {
+    large_object.object_id = i;
+    CHECK(transport_sent_cache_store(&bounded_cache, &large_object, 256, 256,
+                                     1024, true),
+          "mixed source-cache best-effort fill");
+  }
+  large_object.object_id = 19;
+  large_object.size = 1024U * 1024U;
+  CHECK(
+      !transport_sent_cache_can_store(&bounded_cache, &large_object, false) &&
+          transport_sent_cache_can_store(&bounded_cache, &large_object, true) &&
+          transport_sent_cache_store(&bounded_cache, &large_object, 1024, 1024,
+                                     1024, true) &&
+          bounded_cache.payload_bytes ==
+              TRANSPORT_DEFAULT_RECOVERY_CACHE_BYTES &&
+          bounded_cache.peak_payload_bytes ==
+              TRANSPORT_DEFAULT_RECOVERY_CACHE_BYTES &&
+          bounded_cache.count == 16 && bounded_cache.peak_count == 19,
+      "best-effort replacement reclaims multiple payloads within the byte cap");
+  for (size_t i = 0; i < 19; i++)
+    CHECK((transport_sent_cache_find(&bounded_cache, &large_object.track_id,
+                                     large_object.group_id, i) != NULL) ==
+              (i < 15),
+          "byte reclamation preserves every protected recovery object");
+  large_object.data =
+      transport_sent_cache_find(&bounded_cache, &large_object.track_id,
+                                large_object.group_id, 19)
+          ->data;
+  large_object.object_id = 20;
+  CHECK(!transport_sent_cache_can_store(&bounded_cache, &large_object, true) &&
+            !transport_sent_cache_store(&bounded_cache, &large_object, 1024,
+                                        1024, 1024, true) &&
+            large_object.data[0] == 0x5a && bounded_cache.count == 16,
+        "replacement cannot reclaim its own borrowed source allocation");
+  large_object.data = large_payload;
+  CHECK(transport_sent_cache_release_track(&bounded_cache,
+                                           &large_object.track_id) == 16 &&
+            bounded_cache.payload_bytes == 0 && bounded_cache.count == 0 &&
+            bounded_cache.peak_payload_bytes ==
+                TRANSPORT_DEFAULT_RECOVERY_CACHE_BYTES,
+        "track release clears current usage and preserves its high-water mark");
+  large_object.object_id = 20;
+  large_object.size = (size_t)TRANSPORT_DEFAULT_RECOVERY_CACHE_BYTES + 1;
+  CHECK(!transport_sent_cache_can_store(&bounded_cache, &large_object, true) &&
+            !transport_sent_cache_store(&bounded_cache, &large_object, 1, 1, 1,
+                                        true),
+        "oversized cache payload fails before reading or allocating its data");
+  transport_sent_cache_destroy(&bounded_cache);
+  free(large_payload);
+
+  bounded_cache.max_payload_bytes = 6;
+  object.size = 4;
+  object.object_id = 1000;
+  CHECK(transport_sent_cache_store(&bounded_cache, &object, 2, 2, 2, false),
+        "custom cache budget");
+  object.object_id++;
+  CHECK(!transport_sent_cache_store(&bounded_cache, &object, 2, 2, 2, false),
+        "custom byte cap enforced");
+  transport_sent_cache_destroy(&bounded_cache);
+
+  configured = (transport_limits_t){.max_fec_object_size = 32,
+                                    .max_recovery_cache_bytes = 32};
+  CHECK(!transport_limits_resolve(&configured, &resolved_limits, limit_error,
+                                  sizeof(limit_error)),
+        "cache limit cannot prevent reaching one rolling checkpoint");
+  configured.max_recovery_cache_bytes = 32 * TRANSPORT_RECOVERY_WINDOW_OBJECTS;
+  CHECK(transport_limits_resolve(&configured, &resolved_limits, limit_error,
+                                 sizeof(limit_error)) &&
+            resolved_limits.max_recovery_cache_bytes ==
+                configured.max_recovery_cache_bytes,
+        "custom recovery byte limit resolves");
   transport_fec_cache_t fec_cache = {0};
   fec_t *fec = transport_fec_cache_get(&fec_cache, FEC_REED_SOLOMON, 2, 1, 8);
   CHECK(fec != NULL, "FEC cache creation");

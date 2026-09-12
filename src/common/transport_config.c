@@ -46,6 +46,9 @@ bool transport_limits_resolve(const transport_limits_t *configured,
   resolved->max_assembler_memory_bytes =
       value_or_default(configured->max_assembler_memory_bytes,
                        TRANSPORT_DEFAULT_ASSEMBLER_MEMORY_BUDGET);
+  resolved->max_recovery_cache_bytes =
+      value_or_default(configured->max_recovery_cache_bytes,
+                       TRANSPORT_DEFAULT_RECOVERY_CACHE_BYTES);
   resolved->max_reliable_object_size = value_or_default(
       configured->max_reliable_object_size, TRANSPORT_MAX_RELIABLE_OBJECT_SIZE);
   resolved->max_fec_object_size = value_or_default(
@@ -87,6 +90,18 @@ bool transport_limits_resolve(const transport_limits_t *configured,
   if (resolved->max_fec_object_size > TRANSPORT_MAX_FEC_OBJECT_SIZE)
     return fail(error, error_capacity,
                 "max_fec_object_size exceeds wire implementation");
+  /* One active track must reach its rolling checkpoint before the cache
+   * fills. Grouped records have a two-byte prefix and a 16-bit length. */
+  size_t grouped_max =
+      resolved->max_fec_object_size < TRANSPORT_MAX_FEC_RECORD_SIZE + 2U
+          ? resolved->max_fec_object_size
+          : TRANSPORT_MAX_FEC_RECORD_SIZE + 2U;
+  size_t minimum_cache = TRANSPORT_RECOVERY_WINDOW_OBJECTS * grouped_max;
+  if (minimum_cache < resolved->max_fec_object_size)
+    minimum_cache = resolved->max_fec_object_size;
+  if (resolved->max_recovery_cache_bytes < minimum_cache)
+    return fail(error, error_capacity,
+                "recovery cache must hold one recovery window");
   if (resolved->max_udp_payload_size < 1200U ||
       resolved->max_udp_payload_size > 1500U)
     return fail(error, error_capacity,
