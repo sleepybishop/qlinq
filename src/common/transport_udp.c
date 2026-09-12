@@ -27,7 +27,11 @@ static bool try_gso(int fd, const struct sockaddr *destination,
   size_t segment_size = datagrams[0].iov_len;
   size_t total_size = 0;
   for (size_t i = 0; i < count; i++) {
-    if ((i + 1U < count && datagrams[i].iov_len != segment_size) ||
+    /* GSO cannot preserve an empty datagram or a tail larger than its segment
+     * size. Use sendmmsg for those batches rather than splitting or dropping
+     * an application datagram. */
+    if (datagrams[i].iov_len == 0 || datagrams[i].iov_len > segment_size ||
+        (i + 1U < count && datagrams[i].iov_len != segment_size) ||
         datagrams[i].iov_len > SIZE_MAX - total_size)
       return false;
     total_size += datagrams[i].iov_len;

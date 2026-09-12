@@ -9,8 +9,14 @@
 #include "transport_subscriptions.h"
 #include "transport_wire.h"
 
+#include "transport_udp.h"
+
+#include <errno.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 #define CHECK(condition, message)                                              \
   do {                                                                         \
@@ -66,7 +72,62 @@ static int test_recovery_cache_protection(void) {
   return 0;
 }
 
+static int test_udp_batch_boundaries(void) {
+  static const struct {
+    size_t count;
+    size_t lengths[3];
+  } cases[] = {{3, {40, 40, 40}}, {3, {80, 80, 40}}, {2, {40, 80}},
+               {3, {80, 40, 80}}, {2, {40, 0}},      {2, {0, 40}},
+               {3, {80, 0, 40}}};
+  int sender = socket(AF_INET, SOCK_DGRAM, 0);
+  int receiver = socket(AF_INET, SOCK_DGRAM, 0);
+  CHECK(sender >= 0 && receiver >= 0, "UDP batch sockets");
+  struct sockaddr_in address = {.sin_family = AF_INET,
+                                .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+  socklen_t address_len = sizeof(address);
+  CHECK(bind(receiver, (struct sockaddr *)&address, address_len) == 0 &&
+            getsockname(receiver, (struct sockaddr *)&address, &address_len) ==
+                0,
+        "UDP batch receiver address");
+  struct timeval timeout = {.tv_sec = 1};
+  CHECK(setsockopt(receiver, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                   sizeof(timeout)) == 0,
+        "UDP batch receive deadline");
+  uint8_t payloads[3][80], received[256];
+  for (size_t i = 0; i < 3; i++)
+    for (size_t j = 0; j < sizeof(payloads[i]); j++)
+      payloads[i][j] = (uint8_t)(i * 23 + j);
+  for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    struct iovec datagrams[3];
+    for (size_t i = 0; i < cases[c].count; i++)
+      datagrams[i] = (struct iovec){.iov_base = payloads[i],
+                                    .iov_len = cases[c].lengths[i]};
+    CHECK(transport_udp_send_batch(sender, (struct sockaddr *)&address,
+                                   address_len, datagrams,
+                                   cases[c].count) == (ssize_t)cases[c].count,
+          "UDP batch reports complete datagrams");
+    for (size_t i = 0; i < cases[c].count; i++) {
+      ssize_t size = recv(receiver, received, sizeof(received), MSG_TRUNC);
+      if (size != (ssize_t)datagrams[i].iov_len)
+        fprintf(stderr,
+                "UDP batch case %zu datagram %zu: received %zd, expected %zu\n",
+                c, i, size, datagrams[i].iov_len);
+      CHECK(size == (ssize_t)datagrams[i].iov_len &&
+                memcmp(received, datagrams[i].iov_base, datagrams[i].iov_len) ==
+                    0,
+            "UDP batch preserves each datagram's length and contents");
+    }
+    CHECK(recv(receiver, received, sizeof(received), MSG_DONTWAIT) < 0 &&
+              (errno == EAGAIN || errno == EWOULDBLOCK),
+          "UDP batch does not create extra datagrams");
+  }
+  close(sender);
+  close(receiver);
+  return 0;
+}
+
 int main(void) {
+  CHECK(test_udp_batch_boundaries() == 0, "UDP batch boundaries");
   CHECK(test_recovery_cache_protection() == 0, "recovery cache protection");
   transport_limits_t configured = {0};
   transport_limits_t resolved_limits;
