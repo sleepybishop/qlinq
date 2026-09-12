@@ -3,6 +3,7 @@ qlinqd
 qlinq-app
 qlinq-cast
 qlinq-tund
+qlinq-tun
 t/00util/test_fec
 t/00util/test_transport
 t/00util/test_flexicast_transport
@@ -18,6 +19,16 @@ t/00util/test_transport_wire
 t/00util/test_transport_components
 t/00util/test_qlinq_api
 t/00util/test_qlinq_reconnect
+t/00util/test_qlinq_compat
+t/00util/test_qlinq_event_overflow
+t/00util/test_qlinq_event_ownership
+t/00util/test_reliable_bidirectional
+t/00util/test_stream_budget
+t/00util/test_transport_bind
+t/00util/test_interleaved_receive
+t/00util/test_publication_limits
+t/00util/test_directional_subscriptions
+t/00util/test_generic_ports
 t/00util/fuzz_transport_wire
 t/00util/fuzz_flexicast_frames
 t/00util/test_benchmark
