@@ -1262,8 +1262,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
         }
       }
 
-      resolved_track.flags |= MOQ_TRACK_FLAG_FEC_ENABLED;
-      resolved_track.flags &= ~MOQ_TRACK_FLAG_RELIABLE;
+      /* Preserve the negotiated identity for every datagram delivery mode. */
       transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT,
                               .conn = tconn,
                               .track_id = resolved_track,

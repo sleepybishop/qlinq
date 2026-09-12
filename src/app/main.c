@@ -186,7 +186,7 @@ static bool parse_peer(const char *endpoint, char *host, size_t capacity,
 static bool write_payload(app_t *app, const moq_track_id_t *track,
                           const uint8_t *data, size_t size) {
   if (track->type == MOQ_TRACK_DATA &&
-      (track->flags & MOQ_TRACK_FLAG_FEC_ENABLED) != 0) {
+      (track->flags & (MOQ_TRACK_FLAG_FEC_ENABLED | MOQ_TRACK_FLAG_FEC_RATELESS)) != 0) {
     while (size != 0) {
       uint16_t record_size;
       if (size < 2)
@@ -221,7 +221,7 @@ static bool write_payload(app_t *app, const moq_track_id_t *track,
 
 static bool write_object(app_t *app, const transport_event_t *event) {
   bool ordered = event->track_id.type == MOQ_TRACK_DATA &&
-                 (event->track_id.flags & MOQ_TRACK_FLAG_FEC_ENABLED) != 0;
+                 (event->track_id.flags & (MOQ_TRACK_FLAG_FEC_ENABLED | MOQ_TRACK_FLAG_FEC_RATELESS)) != 0;
   if (!ordered)
     return write_payload(app, &event->track_id, event->object.data,
                          event->object.size);

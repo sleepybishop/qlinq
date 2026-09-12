@@ -30,6 +30,22 @@ int main(void) {
   object.size = 33;
   assert(transport_publish_ex(fixture.server.transport, &object) ==
          TRANSPORT_PUBLISH_INVALID);
+  const uint8_t flags[] = {0, MOQ_TRACK_FLAG_FEC_ENABLED,
+                           MOQ_TRACK_FLAG_FEC_RATELESS};
+  for (size_t i = 0; i < sizeof(flags); i++) {
+    track.flags = flags[i];
+    snprintf(track.name, sizeof(track.name), "mode-%zu", i);
+    fixture_subscribe(&fixture, &fixture.client, track);
+    object.track_id = track;
+    object.size = 17;
+    size_t expected = fixture.client.objects + 1;
+    assert(transport_publish(fixture.server.transport, &object));
+    fixture_receive(&fixture, &fixture.client, expected);
+    assert(fixture.client.last_track.flags == track.flags);
+    assert(strcmp(fixture.client.last_track.name, track.name) == 0);
+    assert(fixture.client.payload_size == 17 &&
+           memcmp(fixture.client.payload, payload, 17) == 0);
+  }
   fixture_destroy(&fixture);
   puts("===PUBLICATION LIMITS OK===");
   return 0;
