@@ -117,6 +117,62 @@ cleanup:
   return result;
 }
 
+static int test_raptorq_extra_equations(void) {
+  enum { K = 32, P = 8, T = 100 };
+  uint8_t original[K + P][T], received[K + P][T];
+  uint8_t *data[K + P], *blocks[K + P];
+  bool missing[K + P] = {false};
+  fec_t *f = fec_create_ex(FEC_RAPTORQ, K, P, T);
+  if (!f)
+    return 1;
+  for (size_t i = 0; i < K + P; ++i) {
+    data[i] = original[i];
+    blocks[i] = received[i];
+    for (size_t j = 0; j < T; ++j)
+      original[i][j] = (uint8_t)(i * 17 + j * 3);
+  }
+  int result = 1;
+  if (!fec_encode(f, (const uint8_t *const *)data, data + K))
+    goto cleanup;
+  memcpy(received, original, sizeof(received));
+  missing[0] = missing[5] = missing[22] = true;
+  memset(received[0], 0, T);
+  memset(received[5], 0, T);
+  memset(received[22], 0, T);
+  for (size_t i = K + 3; i < K + P; ++i)
+    missing[i] = true;
+  /* These three repair equations are rank deficient for this erasure pattern.
+   * New equations must participate in subsequent attempts, including the
+   * extra rows beyond RaptorQ's padded K-prime source block. */
+  if (fec_decode(f, blocks, missing)) {
+    fprintf(stderr, "rank-deficient RaptorQ subset unexpectedly decoded\n");
+    goto cleanup;
+  }
+  for (size_t i = K + 3; i < K + P; ++i)
+    missing[i] = false;
+  if (!fec_decode(f, blocks, missing) ||
+      memcmp(received, original, K * T) != 0) {
+    fprintf(stderr, "additional RaptorQ repairs did not recover all data\n");
+    goto cleanup;
+  }
+  /* Reuse the expanded workspace for encoding and a smaller decode. */
+  if (!fec_encode(f, (const uint8_t *const *)blocks, blocks + K) ||
+      memcmp(received + K, original + K, P * T) != 0)
+    goto cleanup;
+  memset(missing, 0, sizeof(missing));
+  missing[1] = true;
+  for (size_t i = K + 1; i < K + P; ++i)
+    missing[i] = true;
+  memset(received[1], 0, T);
+  if (!fec_decode(f, blocks, missing) || memcmp(received, original, K * T) != 0)
+    goto cleanup;
+  result = 0;
+  printf("RaptorQ additional equations and workspace reuse OK\n");
+cleanup:
+  fec_destroy(f);
+  return result;
+}
+
 int main(void) {
   printf("running FEC test suite...\n");
   if (fec_create_ex((fec_type_t)99, 4, 2, 1024) != NULL ||
@@ -128,6 +184,8 @@ int main(void) {
   if (run_test(FEC_REED_SOLOMON, "Reed-Solomon") != 0)
     return 1;
   if (run_test(FEC_RAPTORQ, "RaptorQ") != 0)
+    return 1;
+  if (test_raptorq_extra_equations() != 0)
     return 1;
   printf("===FEC OK===\n");
   return 0;

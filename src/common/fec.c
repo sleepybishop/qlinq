@@ -19,21 +19,61 @@ struct fec_t {
   uint8_t **shards;
   uint8_t *marks;
 
-  /* raptorq preallocated buffers for thread-safety and zero-allocation hot path
-   */
+  /* RaptorQ workspace is retained between calls and grows when decoding needs
+   * additional repair equations beyond the first K received symbols. */
   uint8_t *rq_prep_mem;
   uint8_t *rq_work_mem;
   sched_op *rq_ops;
   uint8_t *rq_D;
   uint32_t *rq_dropped_esi;
   uint32_t *rq_repair_esi;
+  struct nanorq_core_mem_reqs rq_capacity;
 };
+
+static bool reserve_raptorq_workspace(fec_t *f, uint32_t overhead,
+                                      struct nanorq_core_mem_reqs *reqs) {
+  nanorq_core_get_memory_reqs(f->data_symbols, overhead, f->symbol_size, reqs);
+  /* The core estimate uses K only; extra equations also generate operations. */
+  reqs->schedule_bytes =
+      ops_estimate_schedule_bytes(f->data_symbols + overhead);
+  if (!reqs->prepare_bytes || !reqs->work_bytes || !reqs->matrix_bytes ||
+      !reqs->schedule_bytes)
+    return false;
+  if (reqs->prepare_bytes <= f->rq_capacity.prepare_bytes &&
+      reqs->work_bytes <= f->rq_capacity.work_bytes &&
+      reqs->matrix_bytes <= f->rq_capacity.matrix_bytes &&
+      reqs->schedule_bytes <= f->rq_capacity.schedule_bytes)
+    return true;
+
+  uint8_t *prep = malloc(reqs->prepare_bytes);
+  uint8_t *work = malloc(reqs->work_bytes);
+  sched_op *ops = malloc(reqs->schedule_bytes);
+  uint8_t *matrix = malloc(reqs->matrix_bytes);
+  if (!prep || !work || !ops || !matrix) {
+    free(prep);
+    free(work);
+    free(ops);
+    free(matrix);
+    return false;
+  }
+  free(f->rq_prep_mem);
+  free(f->rq_work_mem);
+  free(f->rq_ops);
+  free(f->rq_D);
+  f->rq_prep_mem = prep;
+  f->rq_work_mem = work;
+  f->rq_ops = ops;
+  f->rq_D = matrix;
+  f->rq_capacity = *reqs;
+  return true;
+}
 
 fec_t *fec_create_ex(fec_type_t type, size_t data_symbols,
                      size_t parity_symbols, size_t symbol_size) {
   if ((type != FEC_REED_SOLOMON && type != FEC_RAPTORQ) || data_symbols == 0 ||
       parity_symbols == 0 || symbol_size == 0 ||
       data_symbols > SIZE_MAX - parity_symbols ||
+      data_symbols + parity_symbols > UINT32_MAX ||
       data_symbols > SIZE_MAX / symbol_size ||
       parity_symbols > SIZE_MAX / symbol_size || data_symbols > UINT32_MAX ||
       parity_symbols > UINT32_MAX || symbol_size > UINT32_MAX ||
@@ -75,12 +115,10 @@ fec_t *fec_create_ex(fec_type_t type, size_t data_symbols,
     }
   } else if (type == FEC_RAPTORQ) {
     struct nanorq_core_mem_reqs reqs;
-    nanorq_core_get_memory_reqs(data_symbols, 0, symbol_size, &reqs);
-
-    f->rq_prep_mem = malloc(reqs.prepare_bytes);
-    f->rq_work_mem = malloc(reqs.work_bytes);
-    f->rq_ops = malloc(reqs.schedule_bytes);
-    f->rq_D = malloc(reqs.matrix_bytes);
+    if (!reserve_raptorq_workspace(f, 0, &reqs)) {
+      fec_destroy(f);
+      return NULL;
+    }
 
     f->rq_dropped_esi = malloc(data_symbols * sizeof(uint32_t));
     f->rq_repair_esi = malloc(parity_symbols * sizeof(uint32_t));
@@ -173,7 +211,8 @@ bool fec_encode(fec_t *f, const uint8_t *const *data_blocks,
 
     nanorq_core_set_op_callback(&enc, &S_enc, ops_push);
 
-    if (!nanorq_core_precalculate(&enc, f->rq_work_mem, reqs.work_bytes)) {
+    if (!nanorq_core_precalculate(&enc, f->rq_work_mem, reqs.work_bytes) ||
+        S_enc.overflowed || S_enc.cpidx != 2) {
       return false;
     }
 
@@ -233,13 +272,15 @@ bool fec_decode(fec_t *f, uint8_t *const *blocks, const bool *missing_mask) {
       return true;
     }
 
+    uint32_t overhead = available_repairs - drops;
     nanorq_core dec;
-    if (!nanorq_core_encoder_new(f->data_symbols, 0, &dec)) {
+    if (!nanorq_core_encoder_new(f->data_symbols, overhead, &dec)) {
       return false;
     }
 
     struct nanorq_core_mem_reqs reqs;
-    nanorq_core_get_memory_reqs(f->data_symbols, 0, f->symbol_size, &reqs);
+    if (!reserve_raptorq_workspace(f, overhead, &reqs))
+      return false;
 
     if (!nanorq_core_prepare(&dec, f->rq_prep_mem, reqs.prepare_bytes)) {
       return false;
@@ -248,7 +289,10 @@ bool fec_decode(fec_t *f, uint8_t *const *blocks, const bool *missing_mask) {
     for (size_t i = 0; i < drops; i++) {
       nanorq_core_replace_symbol(&dec, dropped_esi[i], repair_esi[i]);
     }
-    nanorq_core_patch_matrix(&dec);
+    for (size_t i = 0; i < overhead; ++i)
+      nanorq_core_replace_symbol(&dec, dec.P.Kprime + i, repair_esi[drops + i]);
+    if (!nanorq_core_patch_matrix(&dec))
+      return false;
 
     schedule S_dec = {0};
     S_dec.ops.a = f->rq_ops;
@@ -256,7 +300,8 @@ bool fec_decode(fec_t *f, uint8_t *const *blocks, const bool *missing_mask) {
 
     nanorq_core_set_op_callback(&dec, &S_dec, ops_push);
 
-    if (!nanorq_core_precalculate(&dec, f->rq_work_mem, reqs.work_bytes)) {
+    if (!nanorq_core_precalculate(&dec, f->rq_work_mem, reqs.work_bytes) ||
+        S_dec.overflowed || S_dec.cpidx != 2) {
       return false;
     }
 
@@ -276,6 +321,9 @@ bool fec_decode(fec_t *f, uint8_t *const *blocks, const bool *missing_mask) {
       memcpy(D + (SH + src_esi) * f->symbol_size, blocks[rep_esi],
              f->symbol_size);
     }
+    for (size_t i = 0; i < overhead; ++i)
+      memcpy(D + (SH + dec.P.Kprime + i) * f->symbol_size,
+             blocks[repair_esi[drops + i]], f->symbol_size);
 
     ops_run(&dec, D, f->symbol_size, &S_dec);
 
