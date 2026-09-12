@@ -2,6 +2,7 @@
 #define QLINQ_TRANSPORT_SUBSCRIPTIONS_H
 
 #include "transport.h"
+#include "transport_recovery_state.h"
 
 #include "quicly.h"
 
@@ -16,7 +17,14 @@ typedef struct {
 typedef struct {
   track_subscription_t *entries;
   size_t capacity;
+  transport_subscription_state_t *states[UINT8_MAX + 1U];
 } transport_subscription_table_t;
+
+static inline transport_subscription_state_t *
+transport_subscriptions_get_state(const transport_subscription_table_t *table,
+                                  uint8_t alias) {
+  return table ? table->states[alias] : NULL;
+}
 
 bool transport_subscriptions_init(transport_subscription_table_t *table,
                                   size_t capacity);

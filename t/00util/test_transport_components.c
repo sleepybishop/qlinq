@@ -185,7 +185,46 @@ static int test_assembler_growth_budget(void) {
   return 0;
 }
 
+static int test_subscription_state_lifetime(void) {
+  transport_subscription_table_t table = {0};
+  CHECK(transport_subscriptions_init(&table, 2), "sparse subscription fixture");
+  for (size_t alias = 0; alias <= UINT8_MAX; alias++)
+    CHECK(!transport_subscriptions_get_state(&table, alias),
+          "inactive aliases allocate no recovery state");
+  CHECK(transport_subscriptions_add(&table, MOQ_TRACK_DATA,
+                                    MOQ_TRACK_FLAG_FEC_RATELESS, "one", 8),
+        "allocate active state");
+  transport_subscription_state_t *state =
+      transport_subscriptions_get_state(&table, 8);
+  CHECK(state != NULL, "active state exists");
+  state->object_gap.pending_mask = 3;
+  CHECK(!transport_subscriptions_add(&table, MOQ_TRACK_DATA, 0, "other", 8) &&
+            transport_subscriptions_get_state(&table, 8) == state &&
+            state->object_gap.pending_mask == 3,
+        "alias collision preserves incumbent recovery state");
+  CHECK(transport_subscriptions_add(&table, MOQ_TRACK_DATA,
+                                    MOQ_TRACK_FLAG_FEC_RATELESS, "one", 9) &&
+            !transport_subscriptions_get_state(&table, 8) &&
+            transport_subscriptions_get_state(&table, 9)
+                    ->object_gap.pending_mask == 0,
+        "alias remap retires obsolete recovery state");
+  transport_subscriptions_remove(&table, MOQ_TRACK_DATA, "one");
+  CHECK(!transport_subscriptions_get_state(&table, 9),
+        "unsubscribe releases recovery state");
+  CHECK(transport_subscriptions_add(&table, MOQ_TRACK_DATA, 0, "two", 9) &&
+            transport_subscriptions_get_state(&table, 9)
+                    ->object_gap.pending_mask == 0,
+        "reused alias starts without obsolete gaps");
+  CHECK(transport_subscriptions_init(&table, 1) &&
+            !transport_subscriptions_get_state(&table, 9),
+        "reinitialization releases prior active state");
+  transport_subscriptions_destroy(&table);
+  return 0;
+}
+
 int main(void) {
+  CHECK(test_subscription_state_lifetime() == 0,
+        "sparse recovery state lifetime");
   CHECK(test_assembler_growth_budget() == 0,
         "assembler transient allocation budget");
   CHECK(test_udp_batch_boundaries() == 0, "UDP batch boundaries");

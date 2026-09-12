@@ -213,7 +213,7 @@ find_recovery_window(transport_object_gap_state_t *state, uint64_t group_id,
 
 static bool acknowledge_completed_recovery_windows(transport_conn_t *conn,
                                                    uint8_t alias) {
-  transport_object_gap_state_t *state = &conn->object_gaps[alias];
+  transport_object_gap_state_t *state = transport_object_gap(conn, alias);
   while (true) {
     transport_recovery_window_t *first = NULL;
     for (size_t i = 0; i < QLINQ_RECOVERY_MAX_WINDOWS; i++) {
@@ -240,7 +240,7 @@ static bool receive_recovery_checkpoint(transport_conn_t *conn, uint8_t alias,
   if (!conn || first_object_id > final_object_id ||
       final_object_id - first_object_id >= QLINQ_RECOVERY_WINDOW_OBJECTS)
     return false;
-  transport_object_gap_state_t *state = &conn->object_gaps[alias];
+  transport_object_gap_state_t *state = transport_object_gap(conn, alias);
   if (find_recovery_window(state, group_id, first_object_id, final_object_id))
     return true;
 
@@ -286,7 +286,7 @@ static bool receive_recovery_checkpoint(transport_conn_t *conn, uint8_t alias,
 
 static void recovery_mark_delivered(transport_conn_t *conn, uint8_t alias,
                                     uint64_t group_id, uint64_t object_id) {
-  transport_object_gap_state_t *state = &conn->object_gaps[alias];
+  transport_object_gap_state_t *state = transport_object_gap(conn, alias);
   for (size_t i = 0; i < QLINQ_RECOVERY_MAX_WINDOWS; i++) {
     transport_recovery_window_t *window = &state->recovery_windows[i];
     if (!window->active || window->group_id != group_id ||
@@ -669,7 +669,7 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       }
       if ((checkpoint.flags & QLINQ_WIRE_CHECKPOINT_BASELINE) != 0) {
         transport_object_gap_state_t *gap =
-            &conn->object_gaps[checkpoint.alias];
+            transport_object_gap(conn, checkpoint.alias);
         if (checkpoint.first_object_id != checkpoint.final_object_id ||
             (gap->checkpoint_initialized &&
              checkpoint.final_object_id < gap->last_checkpoint_object_id) ||
@@ -723,7 +723,7 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
         break;
       }
 
-      transport_object_gap_state_t *gap = &conn->object_gaps[end.alias];
+      transport_object_gap_state_t *gap = transport_object_gap(conn, end.alias);
       bool acknowledge =
           (conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) != 0;
       uint64_t first_object_id = 0;
@@ -1097,7 +1097,8 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   bool rateless_data =
       resolved_track.type == MOQ_TRACK_DATA &&
       (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0;
-  transport_object_gap_state_t *object_state = &tconn->object_gaps[track_id];
+  transport_object_gap_state_t *object_state =
+      transport_object_gap(tconn, track_id);
   if (rateless_data && object_was_delivered(object_state, object_id)) {
     t->stats.fec_duplicate_objects_suppressed++;
     return;

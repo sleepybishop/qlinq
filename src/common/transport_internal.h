@@ -22,36 +22,7 @@
 #define QLINQ_FEC_NACK_DELAY_MS 25
 #define QLINQ_FEC_REPAIR_DEDUP_MS 25
 #define QLINQ_FEC_COMPLETION_RETRY_MS 500
-#define QLINQ_RECOVERY_WINDOW_OBJECTS TRANSPORT_RECOVERY_WINDOW_OBJECTS
-#define QLINQ_RECOVERY_MAX_WINDOWS 8U
 #define QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY 256U
-#define QLINQ_RECOVERY_HISTORY_OBJECTS                                         \
-  (QLINQ_RECOVERY_WINDOW_OBJECTS * QLINQ_RECOVERY_MAX_WINDOWS)
-
-typedef struct {
-  bool active;
-  uint64_t group_id;
-  uint64_t first_object_id;
-  uint64_t final_object_id;
-  uint32_t missing_mask;
-  uint8_t cursor;
-  int64_t last_request_ms;
-} transport_recovery_window_t;
-
-typedef struct {
-  uint64_t last_seen;
-  bool seen_initialized;
-  uint64_t pending_base;
-  uint32_t pending_mask;
-  uint64_t group_id;
-  int64_t detected_at_ms;
-  uint64_t largest_delivered;
-  uint64_t delivered_mask[QLINQ_RECOVERY_HISTORY_OBJECTS / 64U];
-  bool delivered_initialized;
-  bool checkpoint_initialized;
-  uint64_t last_checkpoint_object_id;
-  transport_recovery_window_t recovery_windows[QLINQ_RECOVERY_MAX_WINDOWS];
-} transport_object_gap_state_t;
 
 typedef struct {
   moq_track_id_t track_id;
@@ -62,17 +33,6 @@ typedef struct {
   uint64_t checkpoint_group_id;
   uint64_t last_checkpoint_object_id;
 } transport_fec_track_state_t;
-
-typedef struct {
-  bool participating;
-  bool sent_initialized;
-  uint64_t sent_group_id;
-  uint64_t sent_object_id;
-  int64_t oldest_unacked_sent_at_ms;
-  bool acked_initialized;
-  uint64_t acked_group_id;
-  uint64_t acked_object_id;
-} transport_checkpoint_ack_state_t;
 
 struct transport_t {
   transport_callback_t callback;
@@ -170,7 +130,6 @@ struct transport_conn_t {
   quicly_stream_t *stream;
   frame_assembler_t assemblers[TRANSPORT_HARD_MAX_ASSEMBLERS];
   size_t assembler_index;
-  transport_object_gap_state_t object_gaps[UINT8_MAX + 1U];
   uint16_t queued_datagrams[TRANSPORT_MAX_QUIC_PATHS];
   path_state_t path_states[TRANSPORT_MAX_PATHS];
   int64_t min_owd_ns[TRANSPORT_MAX_PATHS];
@@ -182,13 +141,29 @@ struct transport_conn_t {
   size_t round_robin_path;
   transport_repair_limiter_t repair_request_limiter;
   transport_repair_limiter_t nack_request_limiter;
-  transport_checkpoint_ack_state_t checkpoint_acks[UINT8_MAX + 1U];
   int64_t last_repair_ms;
   uint64_t last_repair_group_id;
   uint64_t last_repair_object_id;
   uint8_t last_repair_alias;
   uint8_t last_repair_flags;
 };
+
+/* State exists only while its alias has a negotiated subscription. Callers
+ * must resolve the alias before accessing it; unknown wire aliases are rejected
+ * by the protocol parser and never cause an allocation. */
+static inline transport_object_gap_state_t *
+transport_object_gap(transport_conn_t *conn, uint8_t alias) {
+  transport_subscription_state_t *state =
+      transport_subscriptions_get_state(&conn->receive_subscriptions, alias);
+  return state ? &state->object_gap : NULL;
+}
+
+static inline transport_checkpoint_ack_state_t *
+transport_checkpoint_ack(transport_conn_t *conn, uint8_t alias) {
+  transport_subscription_state_t *state =
+      transport_subscriptions_get_state(&conn->send_subscriptions, alias);
+  return state ? &state->checkpoint_ack : NULL;
+}
 
 uint64_t transport_get_time_ns(void);
 bool transport_owner_ok(transport_t *t);

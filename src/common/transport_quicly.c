@@ -1114,9 +1114,17 @@ void transport_tick(transport_t *t) {
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
       continue;
 
-    for (size_t alias = 0; alias <= UINT8_MAX && object_nack_budget > 0;
-         alias++) {
-      transport_object_gap_state_t *gap = &conn->object_gaps[alias];
+    for (size_t slot = 0;
+         slot < conn->receive_subscriptions.capacity && object_nack_budget > 0;
+         slot++) {
+      const track_subscription_t *sub =
+          &conn->receive_subscriptions.entries[slot];
+      if (!sub->active)
+        continue;
+      uint8_t alias = sub->alias;
+      transport_object_gap_state_t *gap = transport_object_gap(conn, alias);
+      if (!gap)
+        continue;
       if (gap->pending_mask != 0 &&
           now_nack_ms - gap->detected_at_ms >= QLINQ_FEC_NACK_DELAY_MS) {
         for (uint32_t bit = 0; bit < 32 && object_nack_budget > 0; bit++) {
@@ -1752,7 +1760,8 @@ static bool subscribe_connection(transport_conn_t *conn,
                                      track_id->name, alias))
       return false;
     newly_added = true;
-    memset(&conn->object_gaps[alias], 0, sizeof(conn->object_gaps[alias]));
+    memset(transport_object_gap(conn, alias), 0,
+           sizeof((*transport_object_gap(conn, alias))));
   }
 
   if (!transport_stream_write_track_frame(conn->stream, QLINQ_WIRE_SUBSCRIBE,
@@ -1809,7 +1818,8 @@ static bool unsubscribe_connection(transport_t *t, transport_conn_t *conn,
                                           alias, &subscribed_track))
     return false;
 
-  memset(&conn->object_gaps[alias], 0, sizeof(conn->object_gaps[alias]));
+  memset(transport_object_gap(conn, alias), 0,
+         sizeof((*transport_object_gap(conn, alias))));
   for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++)
     if (conn->assemblers[i].total_symbols &&
         conn->assemblers[i].track_id == alias)
@@ -2021,10 +2031,14 @@ bool transport_get_stats(transport_t *t, transport_stats_t *stats) {
     const transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
     if (!conn)
       continue;
-    for (size_t alias = 0; alias <= UINT8_MAX; alias++) {
+    for (size_t slot = 0; slot < conn->send_subscriptions.capacity; slot++) {
+      const track_subscription_t *sub = &conn->send_subscriptions.entries[slot];
+      if (!sub->active)
+        continue;
+      uint8_t alias = sub->alias;
       const transport_checkpoint_ack_state_t *ack =
-          &conn->checkpoint_acks[alias];
-      if (!ack->participating || !ack->sent_initialized ||
+          transport_checkpoint_ack(conn, alias);
+      if (!ack || !ack->participating || !ack->sent_initialized ||
           (ack->acked_initialized &&
            ack->acked_group_id == ack->sent_group_id &&
            ack->acked_object_id >= ack->sent_object_id))

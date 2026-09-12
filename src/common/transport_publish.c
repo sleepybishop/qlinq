@@ -250,7 +250,8 @@ static void release_acked_checkpoints(transport_t *t,
       found_legacy_member = true;
       continue;
     }
-    transport_checkpoint_ack_state_t *state = &conn->checkpoint_acks[alias];
+    transport_checkpoint_ack_state_t *state =
+        transport_checkpoint_ack(conn, alias);
     if (!state->participating)
       continue;
     found_capable_member = true;
@@ -284,7 +285,9 @@ void transport_publish_checkpoint_member_added(transport_t *t,
       track_id->type != MOQ_TRACK_DATA ||
       (track_id->flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0)
     return;
-  transport_checkpoint_ack_state_t *ack = &conn->checkpoint_acks[alias];
+  transport_checkpoint_ack_state_t *ack = transport_checkpoint_ack(conn, alias);
+  if (!ack)
+    return;
   memset(ack, 0, sizeof(*ack));
   ack->participating = true;
 
@@ -311,8 +314,10 @@ void transport_publish_checkpoint_member_removed(transport_t *t,
                                                  uint8_t alias) {
   if (!t || !conn || !track_id)
     return;
-  memset(&conn->checkpoint_acks[alias], 0,
-         sizeof(conn->checkpoint_acks[alias]));
+  if (!transport_checkpoint_ack(conn, alias))
+    return;
+  memset(transport_checkpoint_ack(conn, alias), 0,
+         sizeof((*transport_checkpoint_ack(conn, alias))));
   release_acked_checkpoints(t, track_id);
 }
 
@@ -325,11 +330,11 @@ void transport_publish_checkpoint_connection_removed(transport_t *t,
     if (!subscription->active)
       continue;
     uint8_t alias = subscription->alias;
-    if (!conn->checkpoint_acks[alias].participating)
+    if (!(*transport_checkpoint_ack(conn, alias)).participating)
       continue;
     moq_track_id_t track_id = subscription->track_id;
-    memset(&conn->checkpoint_acks[alias], 0,
-           sizeof(conn->checkpoint_acks[alias]));
+    memset(transport_checkpoint_ack(conn, alias), 0,
+           sizeof((*transport_checkpoint_ack(conn, alias))));
     release_acked_checkpoints(t, &track_id);
   }
 }
@@ -341,7 +346,8 @@ bool transport_publish_checkpoint_acked(
   if (!t || !conn || !ack || !track_id ||
       (conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) == 0)
     return false;
-  transport_checkpoint_ack_state_t *state = &conn->checkpoint_acks[ack->alias];
+  transport_checkpoint_ack_state_t *state =
+      transport_checkpoint_ack(conn, ack->alias);
   if (!state->participating || !state->sent_initialized ||
       ack->group_id != state->sent_group_id ||
       ack->final_object_id > state->sent_object_id)
@@ -373,7 +379,7 @@ static bool checkpoint_cache_is_protected(transport_t *t,
       continue;
     if ((conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) == 0)
       return false;
-    if (conn->checkpoint_acks[alias].participating)
+    if ((*transport_checkpoint_ack(conn, alias)).participating)
       found = true;
   }
   return found;
@@ -429,7 +435,7 @@ static bool emit_rolling_checkpoint(transport_t *t,
         transport_subscriptions_find_alias(&conn->send_subscriptions,
                                            &track->track_id, &alias) != 0)
       continue;
-    if (!conn->checkpoint_acks[alias].participating)
+    if (!(*transport_checkpoint_ack(conn, alias)).participating)
       transport_publish_checkpoint_member_added(t, conn, &track->track_id,
                                                 alias);
     if (!transport_stream_write_track_checkpoint_frame(
@@ -438,7 +444,7 @@ static bool emit_rolling_checkpoint(transport_t *t,
       succeeded = false;
       continue;
     }
-    checkpoint_mark_sent(&conn->checkpoint_acks[alias], group_id,
+    checkpoint_mark_sent(transport_checkpoint_ack(conn, alias), group_id,
                          final_object_id);
     t->stats.recovery_checkpoints_sent++;
   }
@@ -833,9 +839,10 @@ bool transport_finish_track(transport_t *t, moq_track_id_t track_id) {
       t->stats.track_ends_sent++;
       if ((conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) !=
           0) {
-        if (!conn->checkpoint_acks[alias].participating)
+        if (!(*transport_checkpoint_ack(conn, alias)).participating)
           transport_publish_checkpoint_member_added(t, conn, &track_id, alias);
-        checkpoint_mark_sent(&conn->checkpoint_acks[alias], 0, final_object_id);
+        checkpoint_mark_sent(transport_checkpoint_ack(conn, alias), 0,
+                             final_object_id);
       }
     } else {
       succeeded = false;

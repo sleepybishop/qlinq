@@ -12,7 +12,7 @@ bool transport_subscriptions_init(transport_subscription_table_t *table,
   track_subscription_t *entries = calloc(capacity, sizeof(*entries));
   if (!entries)
     return false;
-  free(table->entries);
+  transport_subscriptions_destroy(table);
   table->entries = entries;
   table->capacity = capacity;
   return true;
@@ -21,6 +21,8 @@ bool transport_subscriptions_init(transport_subscription_table_t *table,
 void transport_subscriptions_destroy(transport_subscription_table_t *table) {
   if (!table)
     return;
+  for (size_t alias = 0; alias <= UINT8_MAX; alias++)
+    free(table->states[alias]);
   free(table->entries);
   memset(table, 0, sizeof(*table));
 }
@@ -114,7 +116,9 @@ bool transport_subscriptions_contains(
 bool transport_subscriptions_add(transport_subscription_table_t *table,
                                  moq_track_type_t type, uint8_t flags,
                                  const char *name, uint8_t alias) {
-  if (!ensure_initialized(table) || !name)
+  if (!ensure_initialized(table) || !name ||
+      strnlen(name, sizeof(table->entries[0].track_id.name)) >=
+          sizeof(table->entries[0].track_id.name))
     return false;
   for (size_t i = 0; i < table->capacity; i++) {
     const track_subscription_t *entry = &table->entries[i];
@@ -125,6 +129,11 @@ bool transport_subscriptions_add(transport_subscription_table_t *table,
   for (size_t i = 0; i < table->capacity; i++) {
     track_subscription_t *entry = &table->entries[i];
     if (entry->active && track_matches(&entry->track_id, type, name)) {
+      if (entry->alias != alias) {
+        table->states[alias] = table->states[entry->alias];
+        table->states[entry->alias] = NULL;
+        memset(table->states[alias], 0, sizeof(*table->states[alias]));
+      }
       entry->alias = alias;
       entry->track_id.flags = flags;
       return true;
@@ -133,6 +142,10 @@ bool transport_subscriptions_add(transport_subscription_table_t *table,
   for (size_t i = 0; i < table->capacity; i++) {
     track_subscription_t *entry = &table->entries[i];
     if (!entry->active) {
+      transport_subscription_state_t *state = calloc(1, sizeof(*state));
+      if (!state)
+        return false;
+      table->states[alias] = state;
       memset(entry, 0, sizeof(*entry));
       entry->track_id.type = type;
       entry->track_id.flags = flags;
@@ -156,6 +169,8 @@ void transport_subscriptions_remove(transport_subscription_table_t *table,
     track_subscription_t *entry = &table->entries[i];
     if (entry->active && track_matches(&entry->track_id, type, name)) {
       entry->active = false;
+      free(table->states[entry->alias]);
+      table->states[entry->alias] = NULL;
       if (entry->stream)
         quicly_streambuf_egress_shutdown(entry->stream);
       entry->stream = NULL;
