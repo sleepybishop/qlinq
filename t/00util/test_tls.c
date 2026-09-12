@@ -99,6 +99,9 @@ int main(void) {
   if (!create_endpoint(&trusted_server, 10002, "127.0.0.1",
                        "t/assets/verified.crt", "t/assets/verified.key",
                        "t/assets/verified.crt") ||
+      transport_reload_credentials(trusted_server.transport,
+                                   "t/assets/verified.crt",
+                                   "t/assets/untrusted.key") ||
       !create_endpoint(&trusted_client, 10002, "127.0.0.1",
                        "t/assets/verified.crt", "t/assets/verified.key",
                        "t/assets/verified.crt") ||

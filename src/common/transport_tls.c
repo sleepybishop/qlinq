@@ -1,6 +1,7 @@
 #include "transport_tls.h"
 
 #include <openssl/pem.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #ifndef _WIN32
@@ -60,6 +61,16 @@ int transport_tls_load_certificate_and_key(
   fclose(file);
   if (!key) {
     fprintf(stderr, "failed to load private key\n");
+    return -1;
+  }
+  const unsigned char *der =
+      tls->certificates.count != 0 ? tls->certificates.list[0].base : NULL;
+  X509 *leaf = der ? d2i_X509(NULL, &der, tls->certificates.list[0].len) : NULL;
+  bool matches = leaf && X509_check_private_key(leaf, key) == 1;
+  X509_free(leaf);
+  if (!matches) {
+    EVP_PKEY_free(key);
+    fprintf(stderr, "certificate and private key do not match\n");
     return -1;
   }
   if (ptls_openssl_init_sign_certificate(signer, key) != 0) {
