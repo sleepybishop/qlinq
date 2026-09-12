@@ -150,6 +150,9 @@ t/00util/test_egress_errors: t/00util/test_egress_errors.o src/common/transport_
 t/00util/test_transport_bind: t/00util/test_transport_bind.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
+t/00util/test_interleaved_receive: t/00util/test_interleaved_receive.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
 t/00util/test_transport: t/00util/test_transport.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_transport.o $(COMMON_OBJS) $(LDFLAGS)
 
@@ -234,7 +237,7 @@ benchmark-rateless: t/00util/test_rateless_benchmark
 	./t/00util/test_rateless_benchmark
 
 clean: 
-	rm -f t/00util/test_transport_bind t/00util/test_egress_errors qlinqd qlinq-app qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_reliable_bidirectional t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/fuzz_transport_wire t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
+	rm -f t/00util/test_interleaved_receive t/00util/test_transport_bind t/00util/test_egress_errors qlinqd qlinq-app qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_reliable_bidirectional t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/fuzz_transport_wire t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete
 	rm -f $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \
@@ -242,7 +245,7 @@ clean:
 		deps/nanors/deps/obl/oblas_common.d \
 		deps/nanors/deps/obl/oblas_lite.d
 
-check: t/00util/test_transport_bind t/00util/test_egress_errors qlinqd qlinq-app qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_reliable_bidirectional t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls gencerts
+check: t/00util/test_interleaved_receive t/00util/test_transport_bind t/00util/test_egress_errors qlinqd qlinq-app qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_reliable_bidirectional t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls gencerts
 	prove -I. -v t/*.t
 
 t/assets/server.crt t/assets/server.key &:

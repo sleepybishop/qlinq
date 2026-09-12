@@ -1135,6 +1135,19 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   }
 
   if (!asm_slot) {
+    /* Completed small records leave reusable slots behind. Do not evict a
+     * still-assembling image merely because the round-robin cursor wrapped
+     * after several chat/PLI records. Preserve bounded eviction only when
+     * every slot is actually occupied. */
+    for (size_t offset = 0; offset < t->limits.max_assemblers_per_connection;
+         offset++) {
+      size_t index = (tconn->assembler_index + offset) %
+                     t->limits.max_assemblers_per_connection;
+      if (tconn->assemblers[index].total_symbols == 0) {
+        tconn->assembler_index = index;
+        break;
+      }
+    }
     asm_slot = &tconn->assemblers[tconn->assembler_index];
     tconn->assembler_index =
         (tconn->assembler_index + 1) % t->limits.max_assemblers_per_connection;
