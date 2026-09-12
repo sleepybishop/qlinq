@@ -36,7 +36,7 @@ static void handle_signal(int sig) {
 #define MAX_TRANSPORTS 16
 #define MAX_DATA_POLL_FDS 17
 #define MAX_DAEMON_POLL_FDS                                                    \
-  (MAX_DATA_POLL_FDS + MAX_TRANSPORTS * TRANSPORT_MAX_PATHS)
+  (MAX_DATA_POLL_FDS + MAX_TRANSPORTS * TRANSPORT_MAX_POLL_FDS)
 
 static void show_help(FILE *out, const char *program) {
   fprintf(
@@ -98,7 +98,6 @@ typedef struct daemon_ctx_s {
   size_t num_transports;
   data_uds_t *data_pipe;
   bool running;
-  uint32_t data_object_id;
   char subscribe_tracks[16][64];
   size_t num_subscribe_tracks;
   bool use_reliable;
@@ -228,28 +227,42 @@ static void on_transport_event(void *user_data,
   }
 }
 
-static void on_data_packet(void *user_data, const moq_track_id_t *track_id,
-                           const uint8_t *buf, size_t size, uint8_t priority) {
+static data_uds_result_t on_data_packet(void *user_data,
+                                        data_uds_record_t *record) {
   daemon_ctx_t *ctx = user_data;
   if (!ctx)
-    return;
-
-  moq_object_t obj = {.track_id = *track_id,
+    return DATA_UDS_FATAL;
+  moq_object_t obj = {.track_id = *record->track_id,
                       .group_id = 0,
-                      .object_id = ctx->data_object_id++,
-                      .data = buf,
-                      .size = size,
-                      .is_keyframe = false,
-                      .priority = priority};
-
-  /* Broadcast to all peers */
+                      .object_id = record->id,
+                      .data = record->data,
+                      .size = record->size,
+                      .priority = record->priority};
+  bool blocked = false;
   for (size_t i = 0; i < ctx->num_transports; i++) {
-    if (ctx->transports[i].transport) {
-      if (!transport_publish(ctx->transports[i].transport, &obj) &&
-          ctx->verbose)
-        fprintf(stderr, "daemon: transport backpressure rejected object\n");
+    uint64_t bit = UINT64_C(1) << i;
+    if ((record->progress & bit) != 0 || !ctx->transports[i].transport)
+      continue;
+    transport_publish_result_t result =
+        transport_publish_ex(ctx->transports[i].transport, &obj);
+    switch (result) {
+    case TRANSPORT_PUBLISH_DELIVERED:
+    case TRANSPORT_PUBLISH_BUFFERED:
+    case TRANSPORT_PUBLISH_NO_RECIPIENTS:
+      record->progress |= bit;
+      break;
+    case TRANSPORT_PUBLISH_BACKPRESSURE:
+      blocked = true;
+      break;
+    default:
+      /* A partial publication cannot be retried as a broadcast without
+       * duplicating accepted recipients. Signal a failed local channel. */
+      fprintf(stderr, "daemon: publication failed (%d); disconnecting helper\n",
+              result);
+      return DATA_UDS_FATAL;
     }
   }
+  return blocked ? DATA_UDS_RETRY : DATA_UDS_ACCEPTED;
 }
 
 static bool on_is_track_ready(void *user_data, const moq_track_id_t *track_id) {
@@ -609,7 +622,7 @@ int main(int argc, char **argv) {
   }
 
   ctx.data_pipe =
-      data_uds_create(socket_name, on_data_packet, on_is_track_ready, &ctx);
+      data_uds_create_ex(socket_name, on_data_packet, on_is_track_ready, &ctx);
   if (!ctx.data_pipe) {
     fprintf(stderr, "failed to create UDS data pipe\n");
     return 1;

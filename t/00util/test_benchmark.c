@@ -184,10 +184,12 @@ static void run_benchmark(uint8_t loss_rate, moq_track_type_t track_type,
     transport_tick(server_state.transport);
     transport_tick(client_state.transport);
 
-    struct pollfd fds[8];
+    struct pollfd fds[2 * TRANSPORT_MAX_POLL_FDS];
     size_t nfds = 0;
-    nfds += transport_get_poll_fds(server_state.transport, fds + nfds, 4);
-    nfds += transport_get_poll_fds(client_state.transport, fds + nfds, 4);
+    nfds += transport_get_poll_fds(server_state.transport, fds + nfds,
+                                   TRANSPORT_MAX_POLL_FDS);
+    nfds += transport_get_poll_fds(client_state.transport, fds + nfds,
+                                   TRANSPORT_MAX_POLL_FDS);
 
     int64_t now_ms = transport_get_time_ms();
     int64_t to_s = transport_get_first_timeout(server_state.transport);

@@ -126,6 +126,7 @@ typedef struct {
  *   call query functions. It must not call transport_tick() recursively or
  *   destroy the transport. Rejected contract violations are counted in
  *   transport_stats_t.
+ * - Log callbacks are observational: they must not call transport operations.
  * - qlinq performs no application callbacks from its interface-monitor thread.
  */
 
@@ -134,6 +135,7 @@ typedef void (*transport_callback_t)(void *user_data,
                                      const transport_event_t *event);
 
 #define TRANSPORT_MAX_PATHS 4
+#define TRANSPORT_MAX_POLL_FDS (TRANSPORT_MAX_PATHS + 1U)
 
 /* Zero-valued limit fields select these defaults. Limits are deliberately
  * transport-level bounds, not application schemas or track hierarchies. */
@@ -475,6 +477,9 @@ int64_t transport_get_first_timeout(transport_t *t);
 struct pollfd;
 
 /* collect socket file descriptors for polling */
+/* Includes the interface monitor; reserve TRANSPORT_MAX_POLL_FDS entries. */
+/* Capacity TRANSPORT_MAX_POLL_FDS includes UDP sockets and interface wakeups.
+ */
 size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
                               size_t max_fds);
 

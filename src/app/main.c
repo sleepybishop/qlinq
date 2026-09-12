@@ -793,7 +793,7 @@ int main(int argc, char **argv) {
     if ((app.one_shot || app.receive_limit != 0) && send_done && receive_done)
       break;
 
-    struct pollfd fds[TRANSPORT_MAX_PATHS + 1];
+    struct pollfd fds[TRANSPORT_MAX_POLL_FDS + 1];
     size_t num_fds = transport_get_poll_fds(app.transport, fds,
                                             sizeof(fds) / sizeof(fds[0]));
     size_t input_index = SIZE_MAX;

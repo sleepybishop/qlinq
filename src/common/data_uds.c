@@ -13,6 +13,7 @@
 #include <string.h>
 #ifndef _WIN32
 #include <stddef.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #endif
 
@@ -35,6 +36,8 @@ typedef struct {
   uint8_t *payload;
   size_t payload_capacity;
   size_t payload_len;
+  bool pending_record;
+  uint64_t record_id, progress;
   uint8_t *output;
   size_t output_capacity;
   size_t output_offset;
@@ -44,6 +47,13 @@ typedef struct {
 struct data_uds_t {
   int listen_fd;
   data_uds_callback_t callback;
+  data_uds_record_callback_t record_callback;
+  uint64_t next_record_id;
+#ifndef _WIN32
+  int lock_fd;
+  struct stat socket_identity;
+#endif
+  bool socket_bound;
   data_uds_is_ready_callback_t is_ready_cb;
   void *user_data;
   char socket_name[128];
@@ -168,103 +178,145 @@ static bool queue_client_frame(uds_client_t *client, const uint8_t *buf,
   return flush_client_output(client);
 }
 
-/* create UDS data socket listener */
+/* A persistent lock inode serializes cooperating instances. Do not unlink the
+ * lock file: a waiter could still hold that inode while a third process opens
+ * a newly created one. The socket itself is removed only by its current owner.
+ */
+static void remove_owned_socket(data_uds_t *d) {
+  if (!d->socket_bound)
+    return;
+  struct sockaddr_un addr;
+  socklen_t len;
+  if (!setup_uds_addr(&addr, &len, d->socket_name))
+    return;
+#ifndef _WIN32
+  struct stat current;
+  if (lstat(addr.sun_path, &current) == 0 &&
+      current.st_dev == d->socket_identity.st_dev &&
+      current.st_ino == d->socket_identity.st_ino && S_ISSOCK(current.st_mode))
+    unlink(addr.sun_path);
+#else
+  _unlink(addr.sun_path);
+#endif
+}
+
+static data_uds_t *
+data_uds_create_impl(const char *socket_name, data_uds_callback_t callback,
+                     data_uds_record_callback_t record_callback,
+                     data_uds_is_ready_callback_t is_ready_cb,
+                     void *user_data) {
+  if (!valid_socket_name(socket_name) || (!callback && !record_callback))
+    return NULL;
+  data_uds_t *d = calloc(1, sizeof(*d));
+  if (!d)
+    return NULL;
+  d->callback = callback;
+  d->record_callback = record_callback;
+  d->is_ready_cb = is_ready_cb;
+  d->user_data = user_data;
+  strcpy(d->socket_name, socket_name);
+  d->listen_fd = -1;
+#ifndef _WIN32
+  d->lock_fd = -1;
+#endif
+  for (int i = 0; i < MAX_UDS_CLIENTS; i++)
+    d->clients[i].fd = -1;
+  struct sockaddr_un addr;
+  socklen_t addr_len;
+  if (!setup_uds_addr(&addr, &addr_len, socket_name))
+    goto Fail;
+#ifndef _WIN32
+  char lock_path[sizeof(addr.sun_path) + 6];
+  snprintf(lock_path, sizeof(lock_path), "%s.lock", addr.sun_path);
+  d->lock_fd = open(lock_path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+  struct stat lock_stat;
+  if (d->lock_fd < 0 || fstat(d->lock_fd, &lock_stat) != 0 ||
+      !S_ISREG(lock_stat.st_mode) || lock_stat.st_uid != geteuid() ||
+      lock_stat.st_nlink != 1 || flock(d->lock_fd, LOCK_EX | LOCK_NB) != 0)
+    goto Fail;
+  struct stat existing;
+  if (lstat(addr.sun_path, &existing) == 0) {
+    if (!S_ISSOCK(existing.st_mode) || existing.st_uid != geteuid())
+      goto Fail;
+    /* Also protect a live listener from versions predating the lock file. */
+    int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (probe < 0)
+      goto Fail;
+    if (!set_nonblocking(probe)) {
+      CLOSE_SOCKET(probe);
+      goto Fail;
+    }
+    int result = connect(probe, (struct sockaddr *)&addr, addr_len);
+    int error = errno;
+    CLOSE_SOCKET(probe);
+    if (result == 0 || (error != ECONNREFUSED && error != ENOENT))
+      goto Fail;
+    struct stat current;
+    if (lstat(addr.sun_path, &current) == 0) {
+      if (current.st_dev != existing.st_dev ||
+          current.st_ino != existing.st_ino || unlink(addr.sun_path) != 0)
+        goto Fail;
+    } else if (errno != ENOENT) {
+      goto Fail;
+    }
+  } else if (errno != ENOENT) {
+    goto Fail;
+  }
+#endif
+  d->listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (IS_INVALID_SOCKET(d->listen_fd) || !set_nonblocking(d->listen_fd) ||
+      bind(d->listen_fd, (struct sockaddr *)&addr, addr_len) != 0)
+    goto Fail;
+#ifndef _WIN32
+  if (lstat(addr.sun_path, &d->socket_identity) != 0)
+    goto Fail;
+#endif
+  d->socket_bound = true;
+#ifndef _WIN32
+  if (chmod(addr.sun_path, S_IRUSR | S_IWUSR) != 0)
+    goto Fail;
+#endif
+  if (listen(d->listen_fd, 5) != 0)
+    goto Fail;
+  fprintf(stderr, "generic data UDS listener initialized on /tmp/%s.sock\n",
+          socket_name);
+  return d;
+Fail:
+  data_uds_destroy(d);
+  return NULL;
+}
+
 data_uds_t *data_uds_create(const char *socket_name,
                             data_uds_callback_t callback,
                             data_uds_is_ready_callback_t is_ready_cb,
                             void *user_data) {
-  if (!valid_socket_name(socket_name) || !callback)
-    return NULL;
-
-  data_uds_t *d = calloc(1, sizeof(data_uds_t));
-  if (!d)
-    return NULL;
-
-  d->callback = callback;
-  d->is_ready_cb = is_ready_cb;
-  d->user_data = user_data;
-  strncpy(d->socket_name, socket_name, sizeof(d->socket_name) - 1);
-  d->listen_fd = -1;
-  for (int i = 0; i < MAX_UDS_CLIENTS; i++)
-    d->clients[i].fd = -1;
-
-  d->listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (IS_INVALID_SOCKET(d->listen_fd)) {
-    free(d);
-    return NULL;
-  }
-
-  if (!set_nonblocking(d->listen_fd)) {
-    CLOSE_SOCKET(d->listen_fd);
-    free(d);
-    return NULL;
-  }
-
-  struct sockaddr_un addr;
-  socklen_t addr_len;
-  if (!setup_uds_addr(&addr, &addr_len, socket_name)) {
-    CLOSE_SOCKET(d->listen_fd);
-    free(d);
-    return NULL;
-  }
-#ifndef _WIN32
-  unlink(addr.sun_path);
-#else
-  _unlink(addr.sun_path);
-#endif
-
-  if (bind(d->listen_fd, (struct sockaddr *)&addr, addr_len) != 0) {
-    CLOSE_SOCKET(d->listen_fd);
-    free(d);
-    return NULL;
-  }
-
-#ifndef _WIN32
-  if (chmod(addr.sun_path, S_IRUSR | S_IWUSR) != 0) {
-    CLOSE_SOCKET(d->listen_fd);
-    unlink(addr.sun_path);
-    free(d);
-    return NULL;
-  }
-#endif
-
-  if (listen(d->listen_fd, 5) != 0) {
-    CLOSE_SOCKET(d->listen_fd);
-#ifndef _WIN32
-    unlink(addr.sun_path);
-#else
-    _unlink(addr.sun_path);
-#endif
-    free(d);
-    return NULL;
-  }
-
-  fprintf(stderr, "generic data UDS listener initialized on /tmp/%s.sock\n",
-          socket_name);
-  return d;
+  return data_uds_create_impl(socket_name, callback, NULL, is_ready_cb,
+                              user_data);
 }
 
-/* destroy UDS data socket listener */
-void data_uds_destroy(data_uds_t *d) {
-  if (d) {
-    for (int i = 0; i < MAX_UDS_CLIENTS; i++) {
-      close_client(&d->clients[i]);
-    }
+data_uds_t *data_uds_create_ex(const char *socket_name,
+                               data_uds_record_callback_t callback,
+                               data_uds_is_ready_callback_t is_ready_cb,
+                               void *user_data) {
+  return data_uds_create_impl(socket_name, NULL, callback, is_ready_cb,
+                              user_data);
+}
 
+void data_uds_destroy(data_uds_t *d) {
+  if (!d)
+    return;
+  for (int i = 0; i < MAX_UDS_CLIENTS; i++)
+    close_client(&d->clients[i]);
+  if (d->listen_fd >= 0) {
     shutdown(d->listen_fd, SHUT_RDWR);
     CLOSE_SOCKET(d->listen_fd);
-
-    struct sockaddr_un addr;
-    socklen_t addr_len;
-    (void)setup_uds_addr(&addr, &addr_len, d->socket_name);
-#ifndef _WIN32
-    unlink(addr.sun_path);
-#else
-    _unlink(addr.sun_path);
-#endif
-
-    free(d);
   }
+  remove_owned_socket(d);
+#ifndef _WIN32
+  if (d->lock_fd >= 0)
+    close(d->lock_fd);
+#endif
+  free(d);
 }
 
 /* send length-prefixed packet to UDS client matching track_id */
@@ -373,6 +425,9 @@ static int process_client_input(data_uds_t *d, uds_client_t *client) {
       continue;
     }
 
+    if (d->is_ready_cb && !d->is_ready_cb(d->user_data, &client->track_id))
+      return 0;
+
     int ret =
         read_nonblocking(client->fd, client->frame_header,
                          &client->frame_header_len, UDS_FRAME_HEADER_SIZE);
@@ -401,8 +456,29 @@ static int process_client_input(data_uds_t *d, uds_client_t *client) {
     if (ret <= 0)
       return ret;
 
-    d->callback(d->user_data, &client->track_id, client->payload,
-                client->payload_size, client->priority);
+    if (!client->pending_record) {
+      client->pending_record = true;
+      client->record_id = d->next_record_id++;
+      client->progress = 0;
+    }
+    if (d->record_callback) {
+      data_uds_record_t record = {.track_id = &client->track_id,
+                                  .data = client->payload,
+                                  .size = client->payload_size,
+                                  .priority = client->priority,
+                                  .id = client->record_id,
+                                  .progress = client->progress};
+      data_uds_result_t result = d->record_callback(d->user_data, &record);
+      client->progress = record.progress;
+      if (result == DATA_UDS_RETRY)
+        return 0;
+      if (result != DATA_UDS_ACCEPTED)
+        return -1;
+    } else {
+      d->callback(d->user_data, &client->track_id, client->payload,
+                  client->payload_size, client->priority);
+    }
+    client->pending_record = false;
     client->frame_header_len = 0;
     client->payload_size = 0;
     client->payload_len = 0;
@@ -424,11 +500,18 @@ void data_uds_tick(data_uds_t *d) {
     uds_client_t *client = &d->clients[i];
     if (!client->active)
       continue;
-    bool is_ready = !client->registered || !d->is_ready_cb ||
-                    d->is_ready_cb(d->user_data, &client->track_id);
+    if (client->pending_record && process_client_input(d, client) < 0) {
+      close_client(client);
+      continue;
+    }
+    bool is_ready = !client->pending_record &&
+                    (!client->registered || !d->is_ready_cb ||
+                     d->is_ready_cb(d->user_data, &client->track_id));
     short events = is_ready ? POLLIN : 0;
     if (client->output_offset < client->output_len)
       events |= POLLOUT;
+    if (!events)
+      continue;
     fds[nfds] = (struct pollfd){.fd = client->fd, .events = events};
     client_indices[nfds - 1] = i;
     nfds++;
@@ -472,7 +555,8 @@ void data_uds_tick(data_uds_t *d) {
     if (!close_now && (fds[i].revents & POLLIN) &&
         process_client_input(d, client) < 0)
       close_now = true;
-    if (fds[i].revents & POLLHUP)
+    if ((fds[i].revents & POLLHUP) && !client->pending_record &&
+        !(fds[i].revents & POLLIN))
       close_now = true;
     if (close_now) {
       fprintf(stderr, "generic data UDS helper disconnected\n");
@@ -497,11 +581,14 @@ size_t data_uds_get_poll_fds(data_uds_t *d, struct pollfd *fds,
   for (size_t i = 0; i < MAX_UDS_CLIENTS && count < max_fds; i++) {
     if (d->clients[i].active && d->clients[i].fd >= 0 && count < max_fds) {
       fds[count].fd = d->clients[i].fd;
-      bool is_ready = !d->clients[i].registered || !d->is_ready_cb ||
-                      d->is_ready_cb(d->user_data, &d->clients[i].track_id);
+      bool is_ready = !d->clients[i].pending_record &&
+                      (!d->clients[i].registered || !d->is_ready_cb ||
+                       d->is_ready_cb(d->user_data, &d->clients[i].track_id));
       fds[count].events = is_ready ? POLLIN : 0;
       if (d->clients[i].output_offset < d->clients[i].output_len)
         fds[count].events |= POLLOUT;
+      if (!fds[count].events)
+        continue;
       fds[count].revents = 0;
       count++;
     }

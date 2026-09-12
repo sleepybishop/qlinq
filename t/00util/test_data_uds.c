@@ -1,12 +1,16 @@
 #include "data_uds.h"
+#include "portable_sockets.h"
+#include <assert.h>
 #include <errno.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 typedef struct {
@@ -51,7 +55,105 @@ static int read_exact(int fd, void *buf, size_t size) {
   return 0;
 }
 
+typedef struct {
+  bool ready, retry;
+  unsigned calls, accepted[2];
+  uint64_t first_id;
+} retry_state_t;
+
+static bool ready(void *arg, const moq_track_id_t *track) {
+  (void)track;
+  return ((retry_state_t *)arg)->ready;
+}
+
+static data_uds_result_t retry_packet(void *arg, data_uds_record_t *record) {
+  retry_state_t *state = arg;
+  assert(record->size == 1 && record->data[0] == 42);
+  if (state->calls++ == 0)
+    state->first_id = record->id;
+  if (state->retry || record->progress)
+    assert(record->id == state->first_id);
+  if (!(record->progress & 1)) {
+    state->accepted[0]++;
+    record->progress |= 1;
+  }
+  if (state->retry)
+    return DATA_UDS_RETRY;
+  state->accepted[1]++;
+  state->ready = false; /* The next complete frame must stay unread. */
+  return DATA_UDS_ACCEPTED;
+}
+
+static void retry_and_ownership(void) {
+  const char *name = "qlinq-data-uds-retry-test";
+  struct sockaddr_un addr = {.sun_family = AF_UNIX};
+  snprintf(addr.sun_path, sizeof(addr.sun_path), "/tmp/%s.sock", name);
+  retry_state_t state = {.ready = true, .retry = true};
+  data_uds_t *uds = data_uds_create_ex(name, retry_packet, ready, &state);
+  assert(uds);
+  assert(data_uds_create_ex(name, retry_packet, ready, &state) == NULL);
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  assert(fd >= 0 && connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+  data_uds_tick(uds);
+  uint8_t registration[] = {MOQ_TRACK_DATA, MOQ_TRACK_FLAG_RELIABLE, 1, 'r'};
+  assert(write(fd, registration, sizeof(registration)) == sizeof(registration));
+  uint8_t frames[12] = {0};
+  uint32_t size = 1;
+  memcpy(frames, &size, 4);
+  frames[5] = 42;
+  memcpy(frames + 6, frames, 6);
+  assert(write(fd, frames, sizeof(frames)) == sizeof(frames));
+  data_uds_tick(uds);
+  assert(state.accepted[0] == 1 && state.accepted[1] == 0);
+  data_uds_tick(uds); /* Retry without another socket write. */
+  assert(state.calls == 2 && state.accepted[0] == 1);
+  state.retry = false;
+  data_uds_tick(uds);
+  assert(state.accepted[0] == 1 && state.accepted[1] == 1);
+  data_uds_tick(uds);
+  assert(state.calls == 3); /* Readiness is checked between records. */
+  state.ready = true;
+  data_uds_tick(uds);
+  assert(state.accepted[0] == 2 && state.accepted[1] == 2);
+  close(fd);
+
+  /* A replaced pathname belongs to its new inode, even before old teardown. */
+  assert(unlink(addr.sun_path) == 0);
+  int replacement = socket(AF_UNIX, SOCK_STREAM, 0);
+  assert(replacement >= 0 &&
+         bind(replacement, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+  struct stat before, after;
+  assert(lstat(addr.sun_path, &before) == 0);
+  data_uds_destroy(uds);
+  assert(lstat(addr.sun_path, &after) == 0 && before.st_ino == after.st_ino);
+  close(
+      replacement); /* Leave a stale socket for the next instance to recover. */
+  uds = data_uds_create_ex(name, retry_packet, ready, &state);
+  assert(uds);
+  data_uds_destroy(uds);
+  assert(lstat(addr.sun_path, &after) != 0 && errno == ENOENT);
+}
+
+static void broken_pipe(void) {
+  int pair[2];
+  assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+  close(pair[1]);
+  pid_t child = fork();
+  assert(child >= 0);
+  if (!child) {
+    signal(SIGPIPE, SIG_DFL);
+    ssize_t sent = socket_write(pair[0], "x", 1);
+    _exit(sent == -1 && errno == EPIPE ? 0 : 1);
+  }
+  int status;
+  assert(waitpid(child, &status, 0) == child);
+  assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  close(pair[0]);
+}
+
 int main(void) {
+  retry_and_ownership();
+  broken_pipe();
   if (data_uds_create("../invalid", on_packet, NULL, NULL) != NULL) {
     fprintf(stderr, "unsafe socket name was accepted\n");
     return 1;

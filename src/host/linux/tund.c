@@ -21,6 +21,7 @@
 #else
 #include <net/if.h>
 #endif
+#include "portable_sockets.h"
 #include "transport.h"
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -271,7 +272,8 @@ static bool read_exact(int fd, void *buf, size_t size) {
 static bool write_exact(int fd, const void *buf, size_t size) {
   size_t written = 0;
   while (written < size) {
-    ssize_t ret = write(fd, (const uint8_t *)buf + written, size - written);
+    ssize_t ret =
+        socket_write(fd, (const uint8_t *)buf + written, size - written);
     if (ret < 0) {
       if (errno == EINTR)
         continue;
