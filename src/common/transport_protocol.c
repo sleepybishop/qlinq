@@ -393,8 +393,8 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
 
       if (type == QLINQ_WIRE_SUBSCRIBE) {
         moq_track_id_t aliased_track;
-        if (transport_subscriptions_find_by_alias(&conn->subscriptions, alias,
-                                                  &aliased_track) == 0 &&
+        if (transport_subscriptions_find_by_alias(&conn->send_subscriptions,
+                                                  alias, &aliased_track) == 0 &&
             (aliased_track.type != parsed_track.type ||
              strcmp(aliased_track.name, parsed_track.name) != 0)) {
           t->stats.protocol_errors++;
@@ -406,7 +406,7 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
             conn->quic,
             "Subscription mapping: track '%s' (type %d) mapped to alias %d",
             wire_track.name, track_type, alias);
-        if (!transport_subscriptions_add(&conn->subscriptions,
+        if (!transport_subscriptions_add(&conn->send_subscriptions,
                                          (moq_track_type_t)track_type, flags,
                                          wire_track.name, alias)) {
           t->stats.resource_limit_errors++;
@@ -419,7 +419,7 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       } else if (type == QLINQ_WIRE_UNSUBSCRIBE) {
         transport_publish_checkpoint_member_removed(t, conn, &parsed_track,
                                                     alias);
-        transport_subscriptions_remove(&conn->subscriptions,
+        transport_subscriptions_remove(&conn->send_subscriptions,
                                        (moq_track_type_t)track_type,
                                        wire_track.name);
       }
@@ -528,7 +528,7 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       if (repair_request_allowed(conn)) {
         moq_track_id_t resolved_track;
         if (transport_subscriptions_find_by_alias(
-                &conn->subscriptions, nack.alias, &resolved_track) == 0) {
+                &conn->send_subscriptions, nack.alias, &resolved_track) == 0) {
           bool wire_rateless = (nack.flags & QLINQ_WIRE_NACK_RATELESS) != 0;
           if (wire_rateless &&
               ((resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0 ||
@@ -658,8 +658,9 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
               0 ||
           qlinq_wire_decode_track_checkpoint(input.base, input.len,
                                              &checkpoint) != QLINQ_WIRE_OK ||
-          transport_subscriptions_find_by_alias(
-              &conn->subscriptions, checkpoint.alias, &resolved_track) != 0 ||
+          transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
+                                                checkpoint.alias,
+                                                &resolved_track) != 0 ||
           resolved_track.type != MOQ_TRACK_DATA ||
           (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0) {
         quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
@@ -696,8 +697,8 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       if (!conn->authenticated ||
           qlinq_wire_decode_track_checkpoint_ack(input.base, input.len, &ack) !=
               QLINQ_WIRE_OK ||
-          transport_subscriptions_find_by_alias(&conn->subscriptions, ack.alias,
-                                                &resolved_track) != 0 ||
+          transport_subscriptions_find_by_alias(
+              &conn->send_subscriptions, ack.alias, &resolved_track) != 0 ||
           resolved_track.type != MOQ_TRACK_DATA ||
           (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0 ||
           !transport_publish_checkpoint_acked(t, conn, &ack, &resolved_track)) {
@@ -713,8 +714,8 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       if (!conn->authenticated ||
           qlinq_wire_decode_track_end(input.base, input.len, &end) !=
               QLINQ_WIRE_OK ||
-          transport_subscriptions_find_by_alias(&conn->subscriptions, end.alias,
-                                                &resolved_track) != 0 ||
+          transport_subscriptions_find_by_alias(
+              &conn->receive_subscriptions, end.alias, &resolved_track) != 0 ||
           resolved_track.type != MOQ_TRACK_DATA ||
           (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0) {
         quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
@@ -773,8 +774,10 @@ typedef struct {
 
 static void on_stream_destroy(quicly_stream_t *stream, quicly_error_t err) {
   transport_conn_t *conn = *quicly_get_data(stream->conn);
-  if (conn)
-    transport_subscriptions_clear_stream(&conn->subscriptions, stream);
+  if (conn) {
+    transport_subscriptions_clear_stream(&conn->receive_subscriptions, stream);
+    transport_subscriptions_clear_stream(&conn->send_subscriptions, stream);
+  }
   quicly_streambuf_destroy(stream, err);
 }
 
@@ -835,8 +838,8 @@ static void parse_track_stream_messages(transport_t *t, transport_conn_t *conn,
     if (!ctx->alias_bound) {
       ctx->alias = alias;
       ctx->alias_bound = true;
-      if (transport_subscriptions_bind_stream(&conn->subscriptions, alias,
-                                              stream))
+      if (transport_subscriptions_bind_stream(&conn->receive_subscriptions,
+                                              alias, stream))
         quicly_debug_printf(conn->quic,
                             "Mapped incoming QUIC Stream %" PRIu64
                             " to MoQ track alias %d",
@@ -844,8 +847,8 @@ static void parse_track_stream_messages(transport_t *t, transport_conn_t *conn,
     }
 
     moq_track_id_t resolved_track = {0};
-    if (transport_subscriptions_find_by_alias(&conn->subscriptions, alias,
-                                              &resolved_track) == 0) {
+    if (transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
+                                              alias, &resolved_track) == 0) {
       transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT,
                               .conn = conn,
                               .track_id = resolved_track,
@@ -939,7 +942,7 @@ bool transport_protocol_send_nack(transport_conn_t *conn, uint8_t alias,
   if (count > QLINQ_WIRE_MAX_NACK_SYMBOLS)
     return false;
   moq_track_id_t track_id;
-  if (transport_subscriptions_find_by_alias(&conn->subscriptions, alias,
+  if (transport_subscriptions_find_by_alias(&conn->receive_subscriptions, alias,
                                             &track_id) != 0)
     return false;
   bool rateless =
@@ -1052,8 +1055,8 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
 
   uint8_t track_id = hdr.alias;
   moq_track_id_t resolved_track;
-  if (transport_subscriptions_find_by_alias(&tconn->subscriptions, track_id,
-                                            &resolved_track) != 0) {
+  if (transport_subscriptions_find_by_alias(&tconn->receive_subscriptions,
+                                            track_id, &resolved_track) != 0) {
     return;
   }
 
@@ -1154,7 +1157,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
 
     if (asm_slot->total_symbols > 0 && !asm_slot->decoded) {
       moq_track_id_t resolved_track;
-      if (transport_subscriptions_find_by_alias(&tconn->subscriptions,
+      if (transport_subscriptions_find_by_alias(&tconn->receive_subscriptions,
                                                 asm_slot->track_id,
                                                 &resolved_track) == 0) {
         transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT_LOST,

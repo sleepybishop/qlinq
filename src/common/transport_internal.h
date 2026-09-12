@@ -153,7 +153,8 @@ struct transport_conn_t {
   transport_t *transport;
   quicly_conn_t *quic;
   uint32_t id;
-  transport_subscription_table_t subscriptions;
+  transport_subscription_table_t send_subscriptions;
+  transport_subscription_table_t receive_subscriptions;
   bool quic_ready;
   bool hello_sent;
   bool hello_received;

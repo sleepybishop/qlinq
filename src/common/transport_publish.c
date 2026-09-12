@@ -25,7 +25,7 @@ static bool transport_publish_recipient_eligible(const transport_t *t,
          conn->authenticated &&
          quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
          (!t->is_server ||
-          transport_subscriptions_contains(&conn->subscriptions, track));
+          transport_subscriptions_contains(&conn->send_subscriptions, track));
 }
 
 static size_t publication_fec_limit(const transport_t *t,
@@ -140,8 +140,8 @@ static transport_publish_result_t publish_datagram_to_conn(
   }
 
   uint8_t alias;
-  if (transport_subscriptions_find_alias(&conn->subscriptions, &obj->track_id,
-                                         &alias) != 0) {
+  if (transport_subscriptions_find_alias(&conn->send_subscriptions,
+                                         &obj->track_id, &alias) != 0) {
     transport_arena_reset(&t->arena);
     return TRANSPORT_PUBLISH_NO_RECIPIENTS;
   }
@@ -243,7 +243,7 @@ static void release_acked_checkpoints(transport_t *t,
   for (size_t i = 0; i < active_count; i++) {
     transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
     uint8_t alias = 0;
-    if (!conn || transport_subscriptions_find_alias(&conn->subscriptions,
+    if (!conn || transport_subscriptions_find_alias(&conn->send_subscriptions,
                                                     track_id, &alias) != 0)
       continue;
     if ((conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) == 0) {
@@ -320,8 +320,8 @@ void transport_publish_checkpoint_connection_removed(transport_t *t,
                                                      transport_conn_t *conn) {
   if (!t || !conn)
     return;
-  for (size_t i = 0; i < conn->subscriptions.capacity; i++) {
-    track_subscription_t *subscription = &conn->subscriptions.entries[i];
+  for (size_t i = 0; i < conn->send_subscriptions.capacity; i++) {
+    track_subscription_t *subscription = &conn->send_subscriptions.entries[i];
     if (!subscription->active)
       continue;
     uint8_t alias = subscription->alias;
@@ -368,7 +368,7 @@ static bool checkpoint_cache_is_protected(transport_t *t,
   for (size_t i = 0; i < active_count; i++) {
     transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
     uint8_t alias = 0;
-    if (!conn || transport_subscriptions_find_alias(&conn->subscriptions,
+    if (!conn || transport_subscriptions_find_alias(&conn->send_subscriptions,
                                                     track_id, &alias) != 0)
       continue;
     if ((conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) == 0)
@@ -426,7 +426,7 @@ static bool emit_rolling_checkpoint(transport_t *t,
         !conn->stream || !quicly_sendstate_is_open(&conn->stream->sendstate) ||
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING ||
         (conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) == 0 ||
-        transport_subscriptions_find_alias(&conn->subscriptions,
+        transport_subscriptions_find_alias(&conn->send_subscriptions,
                                            &track->track_id, &alias) != 0)
       continue;
     if (!conn->checkpoint_acks[alias].participating)
@@ -524,7 +524,7 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
         if (conn && conn->quic && conn->protocol_ready && conn->authenticated &&
             quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING) {
           const track_subscription_t *subscription =
-              transport_subscriptions_find_const(&conn->subscriptions,
+              transport_subscriptions_find_const(&conn->send_subscriptions,
                                                  &obj->track_id);
           if (subscription) {
             transport_track_profile_t sub_profile =
@@ -539,7 +539,7 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
                t->client_conn->authenticated) {
       transport_conn_t *conn = t->client_conn;
       const track_subscription_t *subscription =
-          transport_subscriptions_find_const(&conn->subscriptions,
+          transport_subscriptions_find_const(&conn->send_subscriptions,
                                              &obj->track_id);
       if (subscription) {
         transport_track_profile_t sub_profile =
@@ -640,7 +640,7 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
           quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
         continue;
       if (t->is_server && !transport_subscriptions_contains(
-                              &conn->subscriptions, &obj->track_id))
+                              &conn->send_subscriptions, &obj->track_id))
         continue;
       eligible++;
       if (obj->size > conn->negotiated_limits.max_reliable_object_size) {
@@ -648,8 +648,8 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
         continue;
       }
 
-      track_subscription_t *sub =
-          transport_subscriptions_find(&conn->subscriptions, &obj->track_id);
+      track_subscription_t *sub = transport_subscriptions_find(
+          &conn->send_subscriptions, &obj->track_id);
       if (sub) {
         if (!sub->stream ||
             !quicly_sendstate_is_open(&sub->stream->sendstate)) {
@@ -723,8 +723,8 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
     transport_conn_t *conn = t->is_server ? t->conns[c] : t->client_conn;
     if (!conn || !conn->quic || !conn->protocol_ready || !conn->authenticated ||
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING ||
-        (t->is_server && !transport_subscriptions_contains(&conn->subscriptions,
-                                                           &obj->track_id)))
+        (t->is_server && !transport_subscriptions_contains(
+                             &conn->send_subscriptions, &obj->track_id)))
       continue;
     eligible++;
     if (obj->size > conn->negotiated_limits.max_fec_object_size) {
@@ -824,7 +824,7 @@ bool transport_finish_track(transport_t *t, moq_track_id_t track_id) {
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
       continue;
     uint8_t alias = 0;
-    if (transport_subscriptions_find_alias(&conn->subscriptions, &track_id,
+    if (transport_subscriptions_find_alias(&conn->send_subscriptions, &track_id,
                                            &alias) != 0)
       continue;
     found = true;

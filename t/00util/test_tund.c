@@ -23,7 +23,16 @@ typedef struct {
   transport_conn_t *conn;
   data_uds_t *data_pipe;
   bool is_server;
+  bool subscription_failed;
 } pipe_ctx_t;
+
+static void subscribe_data(pipe_ctx_t *ctx, transport_conn_t *conn) {
+  moq_track_id_t track = {.type = MOQ_TRACK_DATA,
+                          .flags = MOQ_TRACK_FLAG_FEC_ENABLED};
+  strcpy(track.name, "test-track");
+  if (!transport_subscribe_conn(ctx->transport, conn, track))
+    ctx->subscription_failed = true;
+}
 
 static void on_uds_packet(void *user_data, const moq_track_id_t *track_id,
                           const uint8_t *buf, size_t size, uint8_t priority) {
@@ -57,15 +66,16 @@ static void on_quic_event(void *user_data, const transport_event_t *event) {
     break;
   case TRANSPORT_EVENT_AUTH:
     if (ctx->is_server) {
-      transport_respond_auth(ctx->transport, event->conn, true);
+      if (!transport_respond_auth(ctx->transport, event->conn, true))
+        ctx->subscription_failed = true;
+      /* The daemon subscribes in both receiving directions after auth. The
+       * mock must do the same; a remote subscription only authorizes sends. */
+      subscribe_data(ctx, event->conn);
     }
     break;
   case TRANSPORT_EVENT_AUTH_COMPLETE:
     if (!ctx->is_server && event->auth.success) {
-      moq_track_id_t t_data = {.type = MOQ_TRACK_DATA,
-                               .flags = MOQ_TRACK_FLAG_FEC_ENABLED};
-      strcpy(t_data.name, "test-track");
-      transport_subscribe(ctx->transport, t_data);
+      subscribe_data(ctx, event->conn);
     }
     break;
   case TRANSPORT_EVENT_OBJECT:
@@ -242,7 +252,8 @@ int main(void) {
   fclose(h_log);
   fclose(c_log);
 
-  if (!host_got_packet || !client_got_packet) {
+  if (!host_got_packet || !client_got_packet ||
+      server_ctx.subscription_failed || client_ctx.subscription_failed) {
     fprintf(stderr,
             "verification failed: host_got_packet=%d client_got_packet=%d\n",
             host_got_packet, client_got_packet);

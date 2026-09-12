@@ -156,6 +156,9 @@ t/00util/test_interleaved_receive: t/00util/test_interleaved_receive.o $(COMMON_
 t/00util/test_publication_limits: t/00util/test_publication_limits.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
+t/00util/test_directional_subscriptions: t/00util/test_directional_subscriptions.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
 t/00util/test_transport: t/00util/test_transport.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_transport.o $(COMMON_OBJS) $(LDFLAGS)
 
@@ -202,7 +205,7 @@ soak: t/00util/test_operational t/00util/test_transport \
 	t/00util/test_multipath_nack gencerts
 	./scripts/operational_soak.sh
 
-release-check: t/00util/test_publication_limits check-submodules
+release-check: t/00util/test_directional_subscriptions t/00util/test_publication_limits check-submodules
 	$(MAKE) clean
 	$(MAKE) check
 	$(MAKE) fuzz-wire
@@ -240,7 +243,7 @@ benchmark-rateless: t/00util/test_rateless_benchmark
 	./t/00util/test_rateless_benchmark
 
 clean: 
-	rm -f t/00util/test_publication_limits t/00util/test_interleaved_receive t/00util/test_transport_bind t/00util/test_egress_errors qlinqd qlinq-app qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_reliable_bidirectional t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/fuzz_transport_wire t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
+	rm -f t/00util/test_directional_subscriptions t/00util/test_publication_limits t/00util/test_interleaved_receive t/00util/test_transport_bind t/00util/test_egress_errors qlinqd qlinq-app qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_reliable_bidirectional t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/fuzz_transport_wire t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete
 	rm -f $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \

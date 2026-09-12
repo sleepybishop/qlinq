@@ -572,6 +572,20 @@ static void try_open_pending_paths(transport_t *t, transport_conn_t *conn,
   }
 }
 
+static void destroy_connection_subscriptions(transport_conn_t *conn) {
+  transport_subscriptions_destroy(&conn->send_subscriptions);
+  transport_subscriptions_destroy(&conn->receive_subscriptions);
+}
+
+static bool init_connection_subscriptions(transport_conn_t *conn,
+                                          size_t capacity) {
+  if (transport_subscriptions_init(&conn->send_subscriptions, capacity) &&
+      transport_subscriptions_init(&conn->receive_subscriptions, capacity))
+    return true;
+  destroy_connection_subscriptions(conn);
+  return false;
+}
+
 static bool start_client_connection(transport_t *t) {
   if (!t || t->is_server || t->num_remote_addrs == 0 || t->num_fds == 0 ||
       t->client_conn)
@@ -582,8 +596,8 @@ static bool start_client_connection(transport_t *t) {
     return false;
   conn->transport = t;
   conn->id = t->next_conn_id++;
-  if (!transport_subscriptions_init(
-          &conn->subscriptions, t->limits.max_subscriptions_per_connection)) {
+  if (!init_connection_subscriptions(
+          conn, t->limits.max_subscriptions_per_connection)) {
     free(conn);
     return false;
   }
@@ -593,7 +607,7 @@ static bool start_client_connection(transport_t *t) {
                            (struct sockaddr *)&t->local_addrs[0], &t->next_cid,
                            ptls_iovec_init(NULL, 0), NULL, NULL, NULL);
   if (ret != 0 || !conn->quic) {
-    transport_subscriptions_destroy(&conn->subscriptions);
+    destroy_connection_subscriptions(conn);
     free(conn);
     return false;
   }
@@ -604,7 +618,7 @@ static bool start_client_connection(transport_t *t) {
   *quicly_get_data(conn->quic) = conn;
   if (quicly_open_stream(conn->quic, &conn->stream, 0) != 0 || !conn->stream) {
     quicly_free(conn->quic);
-    transport_subscriptions_destroy(&conn->subscriptions);
+    destroy_connection_subscriptions(conn);
     free(conn);
     return false;
   }
@@ -1025,7 +1039,7 @@ void transport_destroy(transport_t *t) {
       quicly_free(conn->quic);
       for (size_t a = 0; a < t->limits.max_assemblers_per_connection; a++)
         transport_release_assembler(t, &conn->assemblers[a]);
-      transport_subscriptions_destroy(&conn->subscriptions);
+      destroy_connection_subscriptions(conn);
       free(conn);
     }
   } else if (t->client_conn) {
@@ -1033,7 +1047,7 @@ void transport_destroy(transport_t *t) {
     quicly_free(conn->quic);
     for (size_t a = 0; a < t->limits.max_assemblers_per_connection; a++)
       transport_release_assembler(t, &conn->assemblers[a]);
-    transport_subscriptions_destroy(&conn->subscriptions);
+    destroy_connection_subscriptions(conn);
     free(conn);
   }
 
@@ -1170,7 +1184,7 @@ void transport_tick(transport_t *t) {
       if (now_nack_ms - asm_slot->last_activity_time_ms >=
           QLINQ_FEC_ASSEMBLER_TIMEOUT_MS) {
         moq_track_id_t resolved_track;
-        if (transport_subscriptions_find_by_alias(&conn->subscriptions,
+        if (transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
                                                   asm_slot->track_id,
                                                   &resolved_track) == 0) {
           transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT_LOST,
@@ -1192,7 +1206,7 @@ void transport_tick(transport_t *t) {
           (!asm_slot->nack_sent || now_nack_ms - asm_slot->last_nack_time_ms >=
                                        QLINQ_FEC_NACK_DELAY_MS)) {
         moq_track_id_t resolved_track;
-        if (transport_subscriptions_find_by_alias(&conn->subscriptions,
+        if (transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
                                                   asm_slot->track_id,
                                                   &resolved_track) != 0 ||
             !(resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS))
@@ -1466,9 +1480,8 @@ void transport_tick(transport_t *t) {
               target->transport = t;
               target->quic = new_quic;
               target->id = t->next_conn_id++;
-              if (!transport_subscriptions_init(
-                      &target->subscriptions,
-                      t->limits.max_subscriptions_per_connection)) {
+              if (!init_connection_subscriptions(
+                      target, t->limits.max_subscriptions_per_connection)) {
                 quicly_free(new_quic);
                 free(target);
                 target = NULL;
@@ -1688,7 +1701,7 @@ void transport_tick(transport_t *t) {
         quicly_free(conn->quic);
         for (size_t a = 0; a < t->limits.max_assemblers_per_connection; a++)
           transport_release_assembler(t, &conn->assemblers[a]);
-        transport_subscriptions_destroy(&conn->subscriptions);
+        destroy_connection_subscriptions(conn);
         free(conn);
 
         if (t->is_server) {
@@ -1719,30 +1732,37 @@ static bool subscribe_connection(transport_conn_t *conn,
     return false;
 
   uint8_t alias;
-  if (transport_subscriptions_find_alias(&conn->subscriptions, track_id,
+  bool newly_added = false;
+  if (transport_subscriptions_find_alias(&conn->receive_subscriptions, track_id,
                                          &alias) != 0) {
-    if (transport_subscriptions_count(&conn->subscriptions) >=
+    if (transport_subscriptions_count(&conn->receive_subscriptions) >=
         conn->negotiated_limits.max_subscriptions_per_connection)
       return false;
     if (track_id->name[0] == '\0') {
       alias = (uint8_t)track_id->type;
     } else {
       int next_alias =
-          transport_subscriptions_next_alias(&conn->subscriptions, 8);
+          transport_subscriptions_next_alias(&conn->receive_subscriptions, 8);
       if (next_alias < 0)
         return false;
       alias = (uint8_t)next_alias;
     }
-    if (!transport_subscriptions_add(&conn->subscriptions, track_id->type,
-                                     track_id->flags, track_id->name, alias))
+    if (!transport_subscriptions_add(&conn->receive_subscriptions,
+                                     track_id->type, track_id->flags,
+                                     track_id->name, alias))
       return false;
+    newly_added = true;
+    memset(&conn->object_gaps[alias], 0, sizeof(conn->object_gaps[alias]));
   }
 
   if (!transport_stream_write_track_frame(conn->stream, QLINQ_WIRE_SUBSCRIBE,
-                                          alias, track_id))
+                                          alias, track_id)) {
+    if (newly_added)
+      transport_subscriptions_remove(&conn->receive_subscriptions,
+                                     track_id->type, track_id->name);
     return false;
-  transport_publish_checkpoint_member_added(conn->transport, conn, track_id,
-                                            alias);
+  }
+
   return true;
 }
 
@@ -1779,8 +1799,8 @@ static bool unsubscribe_connection(transport_t *t, transport_conn_t *conn,
       !quicly_sendstate_is_open(&conn->stream->sendstate))
     return false;
 
-  const track_subscription_t *subscription =
-      transport_subscriptions_find_const(&conn->subscriptions, track_id);
+  const track_subscription_t *subscription = transport_subscriptions_find_const(
+      &conn->receive_subscriptions, track_id);
   if (!subscription)
     return false;
   moq_track_id_t subscribed_track = subscription->track_id;
@@ -1789,10 +1809,13 @@ static bool unsubscribe_connection(transport_t *t, transport_conn_t *conn,
                                           alias, &subscribed_track))
     return false;
 
-  transport_publish_checkpoint_member_removed(t, conn, &subscribed_track,
-                                              alias);
-  transport_subscriptions_remove(&conn->subscriptions, subscribed_track.type,
-                                 subscribed_track.name);
+  memset(&conn->object_gaps[alias], 0, sizeof(conn->object_gaps[alias]));
+  for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++)
+    if (conn->assemblers[i].total_symbols &&
+        conn->assemblers[i].track_id == alias)
+      transport_release_assembler(t, &conn->assemblers[i]);
+  transport_subscriptions_remove(&conn->receive_subscriptions,
+                                 subscribed_track.type, subscribed_track.name);
   return true;
 }
 
@@ -1807,8 +1830,8 @@ bool transport_unsubscribe(transport_t *t, moq_track_id_t track_id) {
   bool succeeded = true;
   for (size_t i = 0; i < t->conn_count; i++) {
     transport_conn_t *conn = t->conns[i];
-    if (!conn ||
-        !transport_subscriptions_contains(&conn->subscriptions, &track_id))
+    if (!conn || !transport_subscriptions_contains(&conn->receive_subscriptions,
+                                                   &track_id))
       continue;
     found = true;
     if (!unsubscribe_connection(t, conn, &track_id))
@@ -2043,7 +2066,9 @@ bool transport_get_conn_stats(transport_t *t, transport_conn_t *conn,
   stats->quic_ready = conn->quic_ready;
   stats->protocol_ready = conn->protocol_ready;
   stats->authenticated = conn->authenticated;
-  stats->subscriptions = transport_subscriptions_count(&conn->subscriptions);
+  stats->subscriptions =
+      transport_subscriptions_count(&conn->receive_subscriptions) +
+      transport_subscriptions_count(&conn->send_subscriptions);
   stats->peer_capabilities = conn->peer_capabilities;
   stats->negotiated_limits = conn->negotiated_limits;
   stats->stream_frames_received = conn->stream_frames_received;
@@ -2268,12 +2293,13 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
       return false;
 
     if (t->is_server &&
-        !transport_subscriptions_contains(&conn->subscriptions, track_id))
+        !transport_subscriptions_contains(&conn->send_subscriptions, track_id))
       continue;
 
     if (profile.reliable) {
       const track_subscription_t *subscription =
-          transport_subscriptions_find_const(&conn->subscriptions, track_id);
+          transport_subscriptions_find_const(&conn->send_subscriptions,
+                                             track_id);
       quicly_stream_t *stream = subscription ? subscription->stream : NULL;
 
       if (stream) {

@@ -54,3 +54,4 @@ t/00util/test_transport_bind
 t/00util/test_interleaved_receive
 
 t/00util/test_publication_limits
+t/00util/test_directional_subscriptions

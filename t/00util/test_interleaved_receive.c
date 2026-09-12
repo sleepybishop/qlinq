@@ -52,10 +52,10 @@ static int check_interleaved_records(void) {
   conn->authenticated = true;
   conn->negotiated_limits.max_fec_object_size = 1024;
   int failed =
-      !transport_subscriptions_init(&conn->subscriptions, 2) ||
-      !transport_subscriptions_add(&conn->subscriptions, MOQ_TRACK_DATA,
+      !transport_subscriptions_init(&conn->receive_subscriptions, 2) ||
+      !transport_subscriptions_add(&conn->receive_subscriptions, MOQ_TRACK_DATA,
                                    MOQ_TRACK_FLAG_FEC_RATELESS, "image", 8) ||
-      !transport_subscriptions_add(&conn->subscriptions, MOQ_TRACK_DATA,
+      !transport_subscriptions_add(&conn->receive_subscriptions, MOQ_TRACK_DATA,
                                    MOQ_TRACK_FLAG_FEC_RATELESS, "chat", 9);
   if (!failed) {
     receive_symbol(conn, 8, 0, 0, 2);
