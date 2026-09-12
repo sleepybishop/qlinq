@@ -14,7 +14,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev
+          sudo apt-get install -y libssl-dev clang
 
       - name: Configure loopback aliases
         run: |
@@ -29,3 +29,9 @@ jobs:
 
       - name: Run tests
         run: make check
+
+      - name: Sanitizers
+        run: make check-sanitize
+
+      - name: Stateful Flexicast fuzz smoke test
+        run: make fuzz-flexicast-state LDFLAGS="-fsanitize=address,undefined -lpthread -lrt -ldl -lm -lcrypto -lssl"

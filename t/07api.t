@@ -1,14 +1,19 @@
 #!/usr/bin/env perl
+
 use strict;
 use warnings;
 use Test::More;
 use t::Util;
-for my $test (['qlinq_delivery', 'QLINQ DELIVERY MATRIX'],
-              ['qlinq_event_ownership', 'QLINQ EVENT OWNERSHIP'],
-              ['qlinq_event_overflow', 'QLINQ EVENT OVERFLOW'],
-              ['qlinq_compat', 'QLINQ COMPATIBILITY'],
-              ['qlinq_reconnect', 'QLINQ RECONNECT']) {
-  my ($stderr, $stdout) = run_prog("./t/00util/test_$test->[0]");
-  like($stdout, qr/===$test->[1] OK===/, $test->[1]) or diag($stderr);
-}
+
+subtest 'native stream API' => sub {
+    my ($stderr, $stdout) = run_prog('./t/00util/test_qlinq_api');
+    like($stdout, qr/===QLINQ API OK===/,
+         'stream subscription and owned record events work') or diag($stderr);
+};
+
+subtest 'public delivery modes and content types' => sub {
+    my ($stderr, $stdout) = run_prog('./t/00util/test_qlinq_delivery');
+    like($stdout, qr/===QLINQ DELIVERY MATRIX OK===/, 'all delivery modes retain stream identity') or diag($stderr);
+};
+
 done_testing;

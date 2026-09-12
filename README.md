@@ -10,6 +10,29 @@
 - **Multipath Link Aggregation**: Dynamic path discovery, performance scheduling, and failover across multiple interfaces (Wi-Fi, Ethernet, Satcom, Cellular).
 - **Forward Error Correction**: Recover lost packets on high-loss links without retransmission latency.
 - **mTLS Authentication**: Full mutual TLS authentication support using custom or system trusted root authorities.
+- **Finite Fanout**: `qlinq-cast` streams files or pipelines to a confirmed
+  receiver cohort with ordered recovery and explicit completion.
+- **Experimental Flexicast Fanout**: One encrypted unreliable-track packet can
+  reach many authenticated subscribers with shared replay protection and
+  aggregate acknowledgements. Enable it on every participating daemon with
+  `--flexicast`; without a multicast policy qlinq replicates the protected
+  packet over unicast. A source sends one native IPv4 or IPv6 SSM datagram by
+  also setting `--flexicast-group 232.1.2.3 --flexicast-port 9000
+  --flexicast-interface 192.0.2.10`, or an IPv6 `ff3x::/32` group with its
+  numeric local IPv6 interface address. Receivers learn the group dynamically
+  and may select their membership interface with `--flexicast-interface`.
+  IPv6 peer endpoints use bracket notation such as `--peer [2001:db8::2]:8888`.
+  Shared keys rotate as membership changes, and receivers with sustained missing
+  PATH_ACK feedback fall back to their authenticated unicast path. The default
+  `multicast` congestion controller follows the limiting receiver. Select the
+  radio-oriented controller with `--flexicast-cc adaptive`; optional
+  `--flexicast-cc-startup-rate`, `--flexicast-cc-min-rate`,
+  `--flexicast-cc-max-rate`, `--flexicast-cc-aggregate-rate`, and
+  `--flexicast-cc-feedback-timeout` values tune it in bytes per second and
+  milliseconds. Multicast bursts remain bounded, and queue pressure is exposed
+  through the publication API. Member state is dynamically sized and tested
+  with 1,000-member cohorts; use `--max-connections N` on a listener to raise
+  its default 32-connection/Flexicast-member capacity (hard limit 16,384).
 
 ## Building
 
@@ -20,32 +43,33 @@ git submodule update --init --recursive
 make
 ```
 
-This produces four binaries and an embeddable transport library:
+This produces four main binaries and an embeddable transport library:
 
 - `qlinqd`: The background peer-to-peer network daemon.
-- `qlinq-app`: A direct `transport.h` file/stream sender and receiver that does
+- `qlinq-app`: A direct `transport.h` send/receive and mesh test tool; it does
   not use the daemon's Unix data socket.
+- `qlinq-cast`: A finite file/stdin fan-out tool built on the native streams api.
 - `qlinq-tund`: The lightweight virtual TUN/TAP interface controller.
-- `qlinq-tun`: An opt-in direct unicast TUN helper using the native `qlinq.h`
-  API, without `qlinqd` or a Unix data socket.
-- `libqlinq.a`: The in-process `transport.h` API used by `qlinq-app`, plus the
-  [native application API](docs/application-api.md) in `qlinq.h` for named
-  streams, owned events and endpoint management.
+- `libqlinq.a`: The in-process library.
 
-For example, send one 512-byte rateless-protected record:
+For example, start a rateless Flexicast sender using the adaptive controller:
 
 ```bash
-./qlinq-app --listen 8888 --bind 127.0.0.1 \
-  --cert t/assets/server.crt --key t/assets/server.key \
-  --auth-token test --insecure-no-verify --input payload.bin \
-  --message-size 512 --count 1 --wait-subscribers 1 --one-shot
+./qlinq-app --listen 8888 --bind 192.0.2.10 \
+  --auth-token "$QLINQ_AUTH_TOKEN" --cert peer.crt --key peer.key \
+  --input payload.bin --one-shot --mode rateless --flexicast \
+  --flexicast-group 232.1.2.3 --flexicast-port 9000 \
+  --flexicast-interface 192.0.2.10 --flexicast-cc adaptive \
+  --max-repair-requests 16 --max-aggregate-repairs 256
 ```
 
-Receive it with:
+A receiver connects directly to the transport API and writes recovered records:
 
 ```bash
-./qlinq-app --peer 127.0.0.1:8888 --auth-token test \
-  --insecure-no-verify --output received.bin --receive-count 1
+./qlinq-app --peer 192.0.2.10:8888 --auth-token "$QLINQ_AUTH_TOKEN" \
+  --ca mesh-ca.crt --cert peer.crt --key peer.key \
+  --output received.bin --mode rateless --flexicast \
+  --flexicast-interface 192.0.2.20 --flexicast-cc adaptive
 ```
 
 The app also supports reliable, plain datagram, fixed-FEC, and rateless modes,
@@ -54,34 +78,11 @@ idle timeout, machine-readable counter snapshots, and `--pv` for pv-style wire
 throughput per physical interface. Run `qlinq-app --help` for the complete
 interface.
 
-## Direct packet tunnel (prototype)
-
-`qlinq-tun` maps each IP packet to one `QLINQ_CONTENT_DATA` record and
-publishes/subscribes to the same named stream in opposite directions. Both
-peers must choose the same `--track` and `--mode` (default `fixed-fec`). The
-listener is limited to one peer; the connecting side reconnects automatically.
-For a real interface, configure the TUN as root and use `--run-as USER` to drop
-privileges before the network endpoint starts. Create a dedicated unprivileged
-`qlinq` account that can read its certificate and private key. For example,
-with identities issued by a shared CA:
-
-```bash
-sudo ./qlinq-tun --listen 8888 --bind 0.0.0.0 --interface tun0 \
-  --ip 10.8.0.1/24 --track vpn/demo --mode fixed-fec \
-  --cert server.crt --key server.key --ca mesh-ca.crt \
-  --auth-token 'replace-with-a-secret' --run-as qlinq
-
-sudo ./qlinq-tun --peer SERVER_IP:8888 --interface tun0 \
-  --ip 10.8.0.2/24 --track vpn/demo --mode fixed-fec \
-  --cert client.crt --key client.key --ca mesh-ca.crt \
-  --auth-token 'replace-with-a-secret' --run-as qlinq
-```
-
-The helper sets MTU 1400, bounds its receive queue, and never retries a
-partially accepted record as a new packet. It does not yet integrate the TUN
-file descriptor into `qlinq_service`'s poller or support multipath/mesh
-configuration; retain `qlinqd` plus `qlinq-tund` for those deployments.
-`--mock --run-ms N` exercises the direct stream without a privileged TUN.
+Rateless-coded tracks use negotiated degree-of-freedom repair by default and
+fall back to indexed missing-symbol requests with legacy peers. Use
+`--repair-mode indexed` to force exact missing-ESI repair for comparison, or
+`--repair-mode rateless` to express the rateless preference explicitly (it
+still falls back safely when the peer lacks support).
 
 ## Security
 
@@ -103,6 +104,7 @@ To run the test suite:
 ```bash
 make check
 ```
+
 
 The private peer protocol is documented in
 [docs/wire-protocol.md](docs/wire-protocol.md). Protocol version 1 is required

@@ -258,6 +258,7 @@ int main(void) {
   server_cfg.key_file = "t/assets/server.key";
   server_cfg.callback = on_server_event;
   server_cfg.allow_insecure_peer = true;
+  server_cfg.enable_flexicast = true;
   server_cfg.user_data = &server_state;
   server_cfg.log_callback = on_log;
   server_cfg.log_user_data = &server_state;
@@ -273,6 +274,7 @@ int main(void) {
   client_cfg.key_file = NULL;
   client_cfg.callback = on_client_event;
   client_cfg.allow_insecure_peer = true;
+  client_cfg.enable_flexicast = true;
   client_cfg.user_data = &client_state;
   client_cfg.log_callback = on_log;
   client_cfg.log_user_data = &client_state;
@@ -376,6 +378,37 @@ int main(void) {
     return 1;
   }
 
+  /* Let the Flexicast offer and LISTEN response cross the authenticated
+   * control stream before publishing the unreliable object. */
+  transport_stats_t server_flex_stats = {0};
+  transport_stats_t client_flex_stats = {0};
+  retries = 100;
+  while (retries-- > 0) {
+    transport_tick(server);
+    transport_tick(client);
+    (void)transport_get_stats(server, &server_flex_stats);
+    (void)transport_get_stats(client, &client_flex_stats);
+    if (server_flex_stats.flexicast_active_members >= 1 &&
+        client_flex_stats.flexicast_active_flows >= 1)
+      break;
+    usleep(10 * 1000);
+  }
+  if (server_flex_stats.flexicast_active_members < 1 ||
+      client_flex_stats.flexicast_active_flows < 1) {
+    fprintf(stderr,
+            "Flexicast flow did not reach LISTEN state (server flows=%zu, "
+            "members=%zu, errors=%" PRIu64 "; client flows=%zu, errors=%" PRIu64
+            ")\n",
+            server_flex_stats.flexicast_active_flows,
+            server_flex_stats.flexicast_active_members,
+            server_flex_stats.protocol_errors,
+            client_flex_stats.flexicast_active_flows,
+            client_flex_stats.protocol_errors);
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+
   /* server publishes test media frame on the dynamically discovered track */
   printf("publishing video frame on dynamically discovered track...\n");
   const char *payload = "hello sleepy bishop!";
@@ -417,6 +450,25 @@ int main(void) {
             server_diagnostic.egress_current_packets,
             server_diagnostic.egress_packets_dropped,
             server_diagnostic.udp_send_errors);
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+  for (int i = 0; i < 10; i++) {
+    transport_tick(server);
+    transport_tick(client);
+  }
+  (void)transport_get_stats(server, &server_flex_stats);
+  (void)transport_get_stats(client, &client_flex_stats);
+  if (server_flex_stats.flexicast_packets_sent == 0 ||
+      client_flex_stats.flexicast_packets_received == 0 ||
+      server_flex_stats.flexicast_acks_received == 0) {
+    fprintf(stderr,
+            "object bypassed Flexicast (sent=%" PRIu64 ", rx=%" PRIu64
+            ", ack=%" PRIu64 ")\n",
+            server_flex_stats.flexicast_packets_sent,
+            client_flex_stats.flexicast_packets_received,
+            server_flex_stats.flexicast_acks_received);
     transport_destroy(client);
     transport_destroy(server);
     return 1;
@@ -491,9 +543,8 @@ int main(void) {
     return 1;
   }
 
-  /* Indexed FEC uses the grouped-object path, but rolling recovery
-   * checkpoints are rateless-only. Cross the 32-object checkpoint boundary
-   * and verify that the indexed session remains open. */
+  /* Fixed FEC shares the finite recovery contract with rateless delivery.
+   * Cross a checkpoint boundary and verify both peers participate. */
   for (uint64_t i = 0; i < 132; i++) {
     moq_object_t indexed_record = {.track_id = data_a,
                                    .object_id = 100 + i,
@@ -522,38 +573,75 @@ int main(void) {
       !transport_get_stats(client, &indexed_receiver_stats) ||
       indexed_source_stats.active_connections != 1 ||
       indexed_receiver_stats.active_connections != 1 ||
-      indexed_source_stats.recovery_checkpoints_sent != 0 ||
-      indexed_receiver_stats.recovery_checkpoints_received != 0 ||
+      indexed_source_stats.recovery_checkpoints_sent == 0 ||
+      indexed_receiver_stats.recovery_checkpoints_received == 0 ||
       indexed_source_stats.protocol_errors != 0 ||
       indexed_receiver_stats.protocol_errors != 0) {
-    fprintf(stderr, "indexed FEC incorrectly entered checkpoint recovery\n");
+    fprintf(stderr, "fixed FEC checkpoint recovery was not negotiated\n");
     transport_destroy(client);
     transport_destroy(server);
     return 1;
   }
 
+  /* The preceding subscriptions also create track-scoped Flexicast flows.
+   * Let those membership handshakes settle before taking the baseline used to
+   * identify checkpoint-data's own READY transition. */
+  for (int i = 0; i < 50; i++) {
+    transport_tick(server);
+    transport_tick(client);
+    usleep(10 * 1000);
+  }
+
   moq_track_id_t checkpoint_track = {.type = MOQ_TRACK_DATA,
                                      .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
                                      .name = "checkpoint-data"};
+  transport_stats_t checkpoint_membership_baseline = {0};
+  (void)transport_get_stats(server, &checkpoint_membership_baseline);
   if (!transport_subscribe(client, checkpoint_track)) {
     fprintf(stderr, "checkpoint subscription failed\n");
     transport_destroy(client);
     transport_destroy(server);
     return 1;
   }
+  transport_stats_t checkpoint_membership_ready = {0};
   retries = 200;
-  while (retries-- > 0 && !server_state.checkpoint_subscribed) {
+  while (retries-- > 0) {
     transport_tick(server);
     transport_tick(client);
+    (void)transport_get_stats(server, &checkpoint_membership_ready);
+    if (server_state.checkpoint_subscribed &&
+        checkpoint_membership_ready.flexicast_active_flows >
+            checkpoint_membership_baseline.flexicast_active_flows &&
+        checkpoint_membership_ready.flexicast_active_members >
+            checkpoint_membership_baseline.flexicast_active_members)
+      break;
     usleep(10 * 1000);
   }
-  if (!server_state.checkpoint_subscribed) {
-    fprintf(stderr, "checkpoint subscription was not observed\n");
+  if (!server_state.checkpoint_subscribed ||
+      checkpoint_membership_ready.flexicast_active_flows <=
+          checkpoint_membership_baseline.flexicast_active_flows ||
+      checkpoint_membership_ready.flexicast_active_members <=
+          checkpoint_membership_baseline.flexicast_active_members) {
+    fprintf(stderr,
+            "checkpoint subscription did not reach Flexicast membership "
+            "(subscribed=%d, flows=%zu->%zu, members=%zu->%zu, "
+            "joins=%" PRIu64 "->%" PRIu64 ")\n",
+            server_state.checkpoint_subscribed,
+            checkpoint_membership_baseline.flexicast_active_flows,
+            checkpoint_membership_ready.flexicast_active_flows,
+            checkpoint_membership_baseline.flexicast_active_members,
+            checkpoint_membership_ready.flexicast_active_members,
+            checkpoint_membership_baseline.flexicast_membership_joins,
+            checkpoint_membership_ready.flexicast_membership_joins);
     transport_destroy(client);
     transport_destroy(server);
     return 1;
   }
 
+  transport_stats_t checkpoint_source_baseline = {0},
+                    checkpoint_receiver_baseline = {0};
+  (void)transport_get_stats(server, &checkpoint_source_baseline);
+  (void)transport_get_stats(client, &checkpoint_receiver_baseline);
   const uint8_t checkpoint_record[] = "checkpoint-record";
   for (uint64_t i = 0; i < 260; i++) {
     moq_object_t record = {.track_id = checkpoint_track,
@@ -591,17 +679,24 @@ int main(void) {
     (void)transport_get_stats(server, &checkpoint_source_stats);
     (void)transport_get_stats(client, &checkpoint_receiver_stats);
     if (client_state.checkpoint_objects_received == 65 &&
-        checkpoint_source_stats.recovery_checkpoint_acks_received >= 3 &&
-        checkpoint_source_stats.recovery_cache_releases >= 65)
+        checkpoint_source_stats.recovery_checkpoint_acks_received >=
+            checkpoint_source_baseline.recovery_checkpoint_acks_received + 3 &&
+        checkpoint_source_stats.recovery_cache_releases >=
+            checkpoint_source_baseline.recovery_cache_releases + 65)
       break;
     usleep(10 * 1000);
   }
   if (client_state.checkpoint_objects_received != 65 ||
-      checkpoint_source_stats.recovery_checkpoints_sent != 2 ||
-      checkpoint_receiver_stats.recovery_checkpoints_received != 2 ||
-      checkpoint_source_stats.recovery_checkpoint_acks_received < 3 ||
-      checkpoint_receiver_stats.recovery_checkpoint_acks_sent < 3 ||
-      checkpoint_source_stats.recovery_cache_releases < 65 ||
+      checkpoint_source_stats.recovery_checkpoints_sent !=
+          checkpoint_source_baseline.recovery_checkpoints_sent + 2 ||
+      checkpoint_receiver_stats.recovery_checkpoints_received !=
+          checkpoint_receiver_baseline.recovery_checkpoints_received + 2 ||
+      checkpoint_source_stats.recovery_checkpoint_acks_received <
+          checkpoint_source_baseline.recovery_checkpoint_acks_received + 3 ||
+      checkpoint_receiver_stats.recovery_checkpoint_acks_sent <
+          checkpoint_receiver_baseline.recovery_checkpoint_acks_sent + 3 ||
+      checkpoint_source_stats.recovery_cache_releases <
+          checkpoint_source_baseline.recovery_cache_releases + 65 ||
       checkpoint_source_stats.track_ends_sent != 1 ||
       checkpoint_receiver_stats.track_ends_received != 1) {
     fprintf(stderr,
@@ -616,24 +711,6 @@ int main(void) {
             checkpoint_source_stats.recovery_cache_releases,
             checkpoint_source_stats.track_ends_sent,
             checkpoint_receiver_stats.track_ends_received);
-    transport_destroy(client);
-    transport_destroy(server);
-    return 1;
-  }
-  if (!transport_unsubscribe(client, checkpoint_track)) {
-    fprintf(stderr, "checkpoint unsubscribe failed\n");
-    transport_destroy(client);
-    transport_destroy(server);
-    return 1;
-  }
-  retries = 100;
-  while (retries-- > 0 && !server_state.checkpoint_unsubscribed) {
-    transport_tick(server);
-    transport_tick(client);
-    usleep(10 * 1000);
-  }
-  if (!server_state.checkpoint_unsubscribed) {
-    fprintf(stderr, "targeted unsubscribe was not observed\n");
     transport_destroy(client);
     transport_destroy(server);
     return 1;

@@ -63,15 +63,14 @@ int main(void) {
                                 &frame) == QLINQ_WIRE_INVALID,
         "magic rejection");
   memcpy(corrupted, frame_buf, frame_len);
-  corrupted[3] = 10;
-  CHECK(qlinq_wire_decode_frame(corrupted, frame_len, sizeof(payload),
-                                &frame) == QLINQ_WIRE_INVALID,
-        "reserved Flexicast type rejection");
-  memcpy(corrupted, frame_buf, frame_len);
   corrupted[3] = 0xff;
   CHECK(qlinq_wire_decode_frame(corrupted, frame_len, sizeof(payload),
                                 &frame) == QLINQ_WIRE_INVALID,
         "unknown type rejection");
+  corrupted[3] = 15;
+  CHECK(qlinq_wire_decode_frame(corrupted, frame_len, sizeof(payload),
+                                &frame) == QLINQ_WIRE_INVALID,
+        "removed private Flexicast controls rejected");
   CHECK(qlinq_wire_decode_frame(frame_buf, frame_len, payload_len - 1,
                                 &frame) == QLINQ_WIRE_TOO_LARGE,
         "configured size limit");
@@ -300,14 +299,46 @@ int main(void) {
                                 &decoded_hello) == QLINQ_WIRE_INVALID,
         "hello role validation");
 
+  qlinq_wire_flexicast_bind_t bind = {
+      .alias = 17, .flow_id = UINT64_C(0x8877665544332211), .key_epoch = 3};
+  CHECK(qlinq_wire_encode_flexicast_bind(payload, sizeof(payload), &bind) ==
+            QLINQ_WIRE_OK,
+        "flexicast binding encode");
+  CHECK(qlinq_wire_encode_flexicast_bind(payload,
+                                         QLINQ_WIRE_FLEXICAST_BIND_SIZE - 1,
+                                         &bind) == QLINQ_WIRE_TOO_LARGE,
+        "flexicast binding capacity");
+  qlinq_wire_flexicast_bind_t decoded_bind;
+  CHECK(qlinq_wire_decode_flexicast_bind(payload,
+                                         QLINQ_WIRE_FLEXICAST_BIND_SIZE,
+                                         &decoded_bind) == QLINQ_WIRE_OK &&
+            decoded_bind.alias == bind.alias &&
+            decoded_bind.flow_id == bind.flow_id &&
+            decoded_bind.key_epoch == bind.key_epoch,
+        "flexicast binding roundtrip");
+  payload[1] = 1;
+  CHECK(qlinq_wire_decode_flexicast_bind(payload,
+                                         QLINQ_WIRE_FLEXICAST_BIND_SIZE,
+                                         &decoded_bind) == QLINQ_WIRE_INVALID,
+        "flexicast binding reserved byte");
+
+  CHECK(qlinq_wire_encode_frame(frame_buf, sizeof(frame_buf),
+                                QLINQ_WIRE_FLEXICAST_BIND, payload,
+                                QLINQ_WIRE_FLEXICAST_BIND_SIZE, sizeof(payload),
+                                &frame_len) == QLINQ_WIRE_OK,
+        "flexicast control frame recognized");
+
   qlinq_wire_track_end_t track_end = {
-      .alias = 22,
+      .alias = 21,
       .group_id = large_group_id,
       .final_object_id = large_object_id,
   };
   CHECK(qlinq_wire_encode_track_end(payload, sizeof(payload), &track_end) ==
             QLINQ_WIRE_OK,
         "track completion encode");
+  CHECK(qlinq_wire_encode_track_end(payload, QLINQ_WIRE_TRACK_END_SIZE - 1,
+                                    &track_end) == QLINQ_WIRE_TOO_LARGE,
+        "track completion capacity");
   qlinq_wire_track_end_t decoded_end;
   CHECK(qlinq_wire_decode_track_end(payload, QLINQ_WIRE_TRACK_END_SIZE,
                                     &decoded_end) == QLINQ_WIRE_OK &&
@@ -315,6 +346,34 @@ int main(void) {
             decoded_end.group_id == track_end.group_id &&
             decoded_end.final_object_id == track_end.final_object_id,
         "track completion roundtrip");
+  CHECK(qlinq_wire_decode_track_end(payload, QLINQ_WIRE_TRACK_END_SIZE - 1,
+                                    &decoded_end) == QLINQ_WIRE_INVALID,
+        "track completion length");
+  CHECK(qlinq_wire_encode_frame(frame_buf, sizeof(frame_buf),
+                                QLINQ_WIRE_TRACK_END, payload,
+                                QLINQ_WIRE_TRACK_END_SIZE, sizeof(payload),
+                                &frame_len) == QLINQ_WIRE_OK,
+        "track completion control frame recognized");
+
+  qlinq_wire_track_abort_t track_abort = {.alias = 23};
+  CHECK(qlinq_wire_encode_track_abort(payload, sizeof(payload), &track_abort) ==
+            QLINQ_WIRE_OK,
+        "track abort encode");
+  qlinq_wire_track_abort_t decoded_abort;
+  CHECK(qlinq_wire_decode_track_abort(payload, QLINQ_WIRE_TRACK_ABORT_SIZE,
+                                      &decoded_abort) == QLINQ_WIRE_OK &&
+            decoded_abort.alias == track_abort.alias,
+        "track abort roundtrip");
+  payload[1] = 1;
+  CHECK(qlinq_wire_decode_track_abort(payload, QLINQ_WIRE_TRACK_ABORT_SIZE,
+                                      &decoded_abort) == QLINQ_WIRE_INVALID,
+        "track abort reserved bytes");
+  payload[1] = 0;
+  CHECK(qlinq_wire_encode_frame(frame_buf, sizeof(frame_buf),
+                                QLINQ_WIRE_TRACK_ABORT, payload,
+                                QLINQ_WIRE_TRACK_ABORT_SIZE, sizeof(payload),
+                                &frame_len) == QLINQ_WIRE_OK,
+        "track abort control frame recognized");
 
   qlinq_wire_track_checkpoint_t checkpoint = {
       .alias = 22,
@@ -326,6 +385,10 @@ int main(void) {
   CHECK(qlinq_wire_encode_track_checkpoint(payload, sizeof(payload),
                                            &checkpoint) == QLINQ_WIRE_OK,
         "recovery checkpoint encode");
+  CHECK(qlinq_wire_encode_track_checkpoint(payload,
+                                           QLINQ_WIRE_TRACK_CHECKPOINT_SIZE - 1,
+                                           &checkpoint) == QLINQ_WIRE_TOO_LARGE,
+        "recovery checkpoint capacity");
   qlinq_wire_track_checkpoint_t decoded_checkpoint;
   CHECK(qlinq_wire_decode_track_checkpoint(
             payload, QLINQ_WIRE_TRACK_CHECKPOINT_SIZE, &decoded_checkpoint) ==
@@ -363,6 +426,11 @@ int main(void) {
             decoded_checkpoint_ack.final_object_id ==
                 checkpoint_ack.final_object_id,
         "recovery checkpoint ACK roundtrip");
+  CHECK(qlinq_wire_encode_frame(frame_buf, sizeof(frame_buf),
+                                QLINQ_WIRE_TRACK_CHECKPOINT_ACK, payload,
+                                QLINQ_WIRE_TRACK_CHECKPOINT_ACK_SIZE,
+                                sizeof(payload), &frame_len) == QLINQ_WIRE_OK,
+        "recovery checkpoint ACK frame recognized");
 
   printf("===TRANSPORT WIRE OK===\n");
   return 0;

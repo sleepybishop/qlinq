@@ -30,6 +30,24 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   qlinq_wire_telemetry_t telemetry;
   (void)qlinq_wire_decode_telemetry(data, size, &telemetry);
 
+  qlinq_wire_hello_t hello;
+  (void)qlinq_wire_decode_hello(data, size, &hello);
+
+  qlinq_wire_flexicast_bind_t bind;
+  (void)qlinq_wire_decode_flexicast_bind(data, size, &bind);
+
+  qlinq_wire_track_end_t end;
+  (void)qlinq_wire_decode_track_end(data, size, &end);
+
+  qlinq_wire_track_checkpoint_t checkpoint;
+  (void)qlinq_wire_decode_track_checkpoint(data, size, &checkpoint);
+
+  qlinq_wire_track_checkpoint_ack_t checkpoint_ack;
+  (void)qlinq_wire_decode_track_checkpoint_ack(data, size, &checkpoint_ack);
+
+  qlinq_wire_track_abort_t abort_frame;
+  (void)qlinq_wire_decode_track_abort(data, size, &abort_frame);
+
   uint8_t datagram_type;
   (void)qlinq_wire_decode_datagram_type(data, size, &datagram_type);
   return 0;

@@ -2,6 +2,11 @@
 #define QLINQ_TRANSPORT_PUBLISH_H
 
 #include "transport_internal.h"
+
+/* Shared recipient policy for publication preflight and delayed dispatch. */
+bool transport_publish_recipient_eligible(const transport_t *t,
+                                          const transport_conn_t *conn,
+                                          const moq_track_id_t *track);
 #include "transport_wire.h"
 
 bool transport_publish_recipient_eligible(const transport_t *t,
@@ -30,5 +35,8 @@ bool transport_publish_checkpoint_acked(
     transport_t *t, transport_conn_t *conn,
     const qlinq_wire_track_checkpoint_ack_t *ack,
     const moq_track_id_t *track_id);
+bool transport_publish_track_terminal(transport_t *t,
+                                      const moq_track_id_t *track_id);
+void transport_publish_poll_lifecycle(transport_t *t);
 
 #endif

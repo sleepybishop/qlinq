@@ -30,7 +30,8 @@ int main(void) {
                    .shared_secret_size = sizeof(secret) - 1U,
                    .certificate_file = "t/assets/server.crt",
                    .private_key_file = "t/assets/server.key",
-                   .allow_insecure_peer = true}};
+                   .allow_insecure_peer = true},
+      .group_delivery = {.enabled = true}};
   qlinq_endpoint_config_t client_config = {
       .bind_addresses = {"127.0.0.1"},
       .bind_address_count = 1,
@@ -43,7 +44,8 @@ int main(void) {
       .reconnect_max_delay_ms = 50,
       .security = {.shared_secret = secret,
                    .shared_secret_size = sizeof(secret) - 1U,
-                   .allow_insecure_peer = true}};
+                   .allow_insecure_peer = true},
+      .group_delivery = {.enabled = true}};
   listener = qlinq_listen(context, &listener_config);
   client = qlinq_connect(context, &client_config);
   CHECK(listener && client, "create initial endpoints");
@@ -55,9 +57,9 @@ int main(void) {
   subscription = qlinq_subscribe(client, &stream_config);
   CHECK(publisher && subscription, "create initial streams");
 
-  bool joined = false, peer_ready = false;
+  bool joined = false, group_ready = false;
   qlinq_endpoint_stats_t endpoint_stats = {0};
-  for (size_t attempt = 0; attempt < 500 && !(joined && peer_ready);
+  for (size_t attempt = 0; attempt < 500 && !(joined && group_ready);
        attempt++) {
     CHECK(qlinq_service(context, 10) >= QLINQ_STATUS_OK,
           "service initial connection");
@@ -69,9 +71,15 @@ int main(void) {
       qlinq_event_release(&event);
     }
     if (qlinq_endpoint_get_stats(listener, &endpoint_stats))
-      peer_ready = endpoint_stats.active_connections == 1;
+      group_ready = endpoint_stats.active_group_members == 1;
   }
-  CHECK(joined && peer_ready, "initial peer is ready");
+  if (!joined || !group_ready)
+    fprintf(stderr,
+            "initial cohort diagnostic: joined=%d members=%zu flows=%zu "
+            "fallbacks=%" PRIu64 "\n",
+            joined, endpoint_stats.active_group_members,
+            endpoint_stats.active_group_flows, endpoint_stats.group_fallbacks);
+  CHECK(joined && group_ready, "initial Flexicast cohort is ready");
 
   qlinq_endpoint_close(listener);
   listener = NULL;
@@ -81,8 +89,8 @@ int main(void) {
   CHECK(replacement_publisher, "recreate publishing stream");
 
   bool disconnected_with_reason = false, rejoined = false;
-  peer_ready = false;
-  for (size_t attempt = 0; attempt < 1000 && !(rejoined && peer_ready);
+  group_ready = false;
+  for (size_t attempt = 0; attempt < 1000 && !(rejoined && group_ready);
        attempt++) {
     CHECK(qlinq_service(context, 10) >= QLINQ_STATUS_OK, "service reconnect");
     qlinq_event_t event;
@@ -97,7 +105,7 @@ int main(void) {
       qlinq_event_release(&event);
     }
     if (qlinq_endpoint_get_stats(replacement, &endpoint_stats))
-      peer_ready = endpoint_stats.active_connections == 1;
+      group_ready = endpoint_stats.active_group_members == 1;
   }
   CHECK(rejoined && disconnected_with_reason,
         "client reconnects and exposes the disconnect cause");
@@ -105,7 +113,7 @@ int main(void) {
             endpoint_stats.reconnect_attempts != 0 &&
             endpoint_stats.reconnect_succeeded != 0,
         "reconnect counters are observable");
-  CHECK(peer_ready, "subscription reactivates on the new peer");
+  CHECK(group_ready, "subscription rebuilds the Flexicast cohort");
 
   static const char payload[] = "record after reconnect";
   qlinq_record_t record = {.group_id = 7,
@@ -122,13 +130,14 @@ int main(void) {
     qlinq_event_t event;
     while (qlinq_next_event(context, &event)) {
       if (event.type == QLINQ_EVENT_RECORD && event.stream == subscription &&
+          event.record.sequence == record.sequence &&
           event.record.size == record.size &&
           memcmp(event.record.data, payload, record.size) == 0)
         received = true;
       qlinq_event_release(&event);
     }
   }
-  CHECK(received, "exact delivery continues after reconnect");
+  CHECK(received, "exact delivery continues after Flexicast rejoin");
 
   printf("===QLINQ RECONNECT OK===\n");
   result = 0;

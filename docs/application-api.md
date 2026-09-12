@@ -1,116 +1,201 @@
 # Native application API
 
-Include `qlinq.h` from `src/common` and link `libqlinq.a` with the same system
-libraries as `qlinq-app`. The header exposes no Quicly or internal transport
-types and is usable from C and C++. The existing `transport.h` API remains
-available, and the two APIs exchange the same wire records.
+`qlinq.h` is the recommended interface for applications. It presents qlinq as
+a collection of named streams carried by authenticated endpoints. The lower
+level `transport.h` interface remains available for the daemon and specialized
+integrations.
 
-## Contexts, endpoints and streams
+## Model
 
-Create a context with `qlinq_context_create`, then create listening endpoints
-with `qlinq_listen` or connecting endpoints with `qlinq_connect`. A listener
-has no remote addresses; a connecting endpoint has at least one. Both require
-a port and one or more local bind addresses. A listener accepts multiple
-peers; a connecting endpoint represents one peer, optionally over multiple
-paths. Configure certificate verification and an application shared secret
-through `qlinq_security_config_t`. Secrets are copied; address and file-name
-strings need only remain valid during endpoint creation.
+- A **context** owns endpoints and a bounded event queue.
+- An **endpoint** listens for peers or connects to a peer over one or more
+  paths.
+- A **publishing stream** accepts application records.
+- A **subscribed stream** produces owned record events.
 
-`qlinq_publish` and `qlinq_subscribe` return named stream handles. Each stream
-selects content type and datagram, reliable, fixed-FEC or rateless delivery.
-Subscriptions created before authentication activate when peers become ready,
-and reactivate after a configured client reconnect. Send and receive streams
-with the same name are independent. Stream names are nonempty and at most
-63 bytes. `qlinq_stream_close` stops use of the handle and unsubscribes receive
-streams; it does not define a finite-transfer completion protocol.
+An endpoint does not determine application data lifetime or delivery mode.
+Each stream independently selects reliable, datagram, fixed-FEC, or rateless
+delivery.
 
-Drive progress with `qlinq_service(context, timeout_ms)` and drain events with
-`qlinq_next_event`. Zero timeout polls; -1 waits for network or timer activity.
-Pending events return immediately. Internal deadlines also service FEC group
-flushes and periodic recovery/path measurements. `QLINQ_EVENT_PEER_READY` means
-application authentication completed. Subscriber join/leave events and
-`QLINQ_EVENT_STREAM_WRITABLE` let publishers discover recipients and resume
-sending. The writable event describes a transition to writable, not a promise
-that every future record will fit; always check `qlinq_stream_send`'s result.
+## Minimal publisher
 
 ```c
-qlinq_stream_config_t stream_config = {
-    .content_type = QLINQ_CONTENT_DATA,
-    .delivery = QLINQ_DELIVERY_RELIABLE,
-    .name = "telemetry"
-};
-qlinq_stream_t *publisher = qlinq_publish(endpoint, &stream_config);
-/* Check publisher for NULL and service authentication/subscription events. */
-qlinq_record_t record = {
-    .sequence = 42, .data = "sample", .size = 6
-};
-qlinq_send_result_t result = qlinq_stream_send(publisher, &record);
-/* WOULD_BLOCK is retryable; SENT/BUFFERED/PARTIAL must not be blindly resent. */
+#include "qlinq.h"
 
-qlinq_status_t status = qlinq_service(context, 10);
-/* Handle negative status even when the event queue is full. */
-qlinq_event_t event;
-while (qlinq_next_event(context, &event)) {
-    if (event.type == QLINQ_EVENT_RECORD) {
-        /* Consume event.record.data and event.record.size. */
+static const char secret[] = "replace-this-secret";
+
+qlinq_context_t *context = qlinq_context_create(NULL);
+
+qlinq_endpoint_config_t endpoint_config = {
+    .bind_addresses = {"192.0.2.10"},
+    .bind_address_count = 1,
+    .port = 8888,
+    .security = {
+        .shared_secret = secret,
+        .shared_secret_size = sizeof(secret) - 1,
+        .certificate_file = "peer.crt",
+        .private_key_file = "peer.key",
+        .trust_store_file = "mesh-ca.crt",
+    },
+    .group_delivery = {
+        .enabled = true,
+        .group_address = "232.1.2.3",
+        .port = 9000,
+        .interface_address = "192.0.2.10",
+        .congestion_control = QLINQ_GROUP_CC_ADAPTIVE,
+    },
+};
+
+qlinq_endpoint_t *endpoint = qlinq_listen(context, &endpoint_config);
+qlinq_stream_t *stream = qlinq_publish(
+    endpoint,
+    &(qlinq_stream_config_t){.content_type = QLINQ_CONTENT_DATA,
+                             .delivery = QLINQ_DELIVERY_RATELESS,
+                             .name = "telemetry/position"});
+
+const char payload[] = "record bytes";
+qlinq_send_result_t sent = qlinq_stream_send(
+    stream, &(qlinq_record_t){.group_id = 7,
+                              .sequence = 42,
+                              .data = payload,
+                              .size = sizeof(payload) - 1,
+                              .priority = 1});
+```
+
+`QLINQ_SEND_SENT` means the record was accepted by the active transport path;
+it does not claim that every subscriber has received it. Finite fixed-FEC and
+rateless streams call `qlinq_stream_finish()` after their final record so a
+partial coding group is flushed and the completion watermark is sent.
+
+## Minimal subscriber
+
+```c
+qlinq_endpoint_config_t endpoint_config = {
+    .bind_addresses = {"0.0.0.0"},
+    .bind_address_count = 1,
+    .remote_addresses = {"192.0.2.10"},
+    .remote_address_count = 1,
+    .port = 8888,
+    .security = {
+        .shared_secret = secret,
+        .shared_secret_size = sizeof(secret) - 1,
+        .trust_store_file = "mesh-ca.crt",
+    },
+    .group_delivery = {
+        .enabled = true,
+        .interface_address = "192.0.2.20",
+        .congestion_control = QLINQ_GROUP_CC_ADAPTIVE,
+    },
+};
+
+qlinq_endpoint_t *endpoint = qlinq_connect(context, &endpoint_config);
+qlinq_stream_t *stream = qlinq_subscribe(
+    endpoint,
+    &(qlinq_stream_config_t){.content_type = QLINQ_CONTENT_DATA,
+                             .delivery = QLINQ_DELIVERY_RATELESS,
+                             .name = "telemetry/position"});
+
+for (;;) {
+  if (qlinq_service(context, -1) < 0)
+    break;
+
+  qlinq_event_t event;
+  while (qlinq_next_event(context, &event)) {
+    if (event.type == QLINQ_EVENT_RECORD && event.stream == stream) {
+      consume(event.record.data, event.record.size);
     }
     qlinq_event_release(&event);
+  }
 }
 ```
 
-`qlinq_endpoint_get_stats`, `qlinq_endpoint_get_peer`, and
-`qlinq_stream_get_stats` expose connection state, recovery/queue counters,
-subscriber counts and stream readiness. `qlinq_context_last_status` reports
-operation errors, including failures that could not be queued as events.
+A subscription may be created before the connection completes. It is retained
+and activated after peer authentication. Event record bytes are copied into
+the context's bounded queue and remain valid until `qlinq_event_release()`.
+For FEC-backed data streams, the façade preserves each record's group,
+sequence, keyframe, and priority metadata inside the grouped transport payload;
+receivers using the same API recover the original record boundaries and
+metadata.
 
-## Record compatibility and ownership
+## Progress and ownership
 
-Send payloads are borrowed during `qlinq_stream_send`; callers may reuse the
-buffer after it returns. Receive payloads and disconnect reasons are copied
-into owned events. Pop each event once and release it exactly once with
-`qlinq_event_release`. Do not release multiple copies of the same event.
+The thread that creates a context owns that context, its endpoints, and its
+streams. `qlinq_service()` drives socket and timer progress and never invokes
+application code from a background thread. A context defaults to 1,024 queued
+events and 64 MiB of queued event storage; both bounds are configurable.
 
-The queue defaults to 1024 events and 64 MiB, including event metadata and
-copied payload/string storage. Popping releases queue capacity; popped events
-are separately owned by the application and remain valid until release, even
-after context destruction. Endpoint and stream pointers in those events cease
-to be valid when the context is destroyed. The application must bound its own
-collection of retained, popped events.
+Closing a stream or endpoint is immediate from the application's perspective.
+Handles remain safe to compare with already queued events until the context is
+destroyed. Applications must release popped events before destroying their
+context.
 
-Event overflow returns a resource-limit status. If a reliable or FEC record
-cannot be retained, the affected connection closes with a resource-limit error;
-plain datagram delivery can drop under pressure. A full queue may have no room
-for an error event, so applications must inspect service status as well.
+## Operational lifecycle
 
-FEC DATA publication uses the transport's existing grouped-record format.
-The API splits recovered groups into individual payload events without adding
-or interpreting a private record envelope. Consequently, received group and
-sequence IDs for FEC DATA identify the transport's coding object, and several
-records can share them; per-record application IDs must be carried in the
-payload when needed. Other modes expose the transport's object metadata.
-Existing payload bytes, including bytes resembling an envelope marker, remain
-unchanged. Limits on FEC objects include the transport's grouped-record length
-prefixes; no extra wrapper-header allowance is needed.
+Clients can opt into bounded exponential reconnect with
+`reconnect_enabled`, `reconnect_initial_delay_ms`, and
+`reconnect_max_delay_ms`. Named subscriptions remain registered while the peer
+is unavailable and are activated again after the replacement connection is
+authenticated. Flexicast subscriptions also renegotiate their flow, group key,
+and kernel SSM membership; reconnect does not reuse the previous group key.
 
-## Timing, lifecycle and threading
+`qlinq_endpoint_shutdown()` begins an orderly endpoint close and disables
+automatic reconnect. Continue calling `qlinq_service()` until
+`qlinq_endpoint_is_drained()` is true, then call `qlinq_endpoint_close()`.
+`qlinq_endpoint_reload_credentials()` atomically replaces the certificate and
+private key used by future handshakes without changing established TLS
+sessions.
 
-Endpoint timing configuration includes `receive_object_timeout_ms`,
-`initial_rtt_ms`, and `handshake_timeout_rtt_multiplier`. The first defaults
-to 2000 ms; zero for the other fields keeps the underlying default.
+`QLINQ_EVENT_PEER_DISCONNECTED` includes the transport error, the raw library
+error, whether the error was an application or remote error, the offending
+frame type when known, and an owned reason string. The reason remains valid
+until `qlinq_event_release()`.
 
-`qlinq_endpoint_shutdown` begins an orderly connection shutdown and stops
-reconnect. Continue servicing until `qlinq_endpoint_is_drained`, subject to an
-application deadline. `qlinq_endpoint_close` releases the transport immediately.
-`qlinq_endpoint_reload_credentials` atomically replaces the identity for future
-handshakes. Closing an endpoint closes its stream handles. Closed handles remain
-allocated until `qlinq_context_destroy`, which releases endpoints, streams and
-unpopped events.
+Set `log_callback` and `log_user_data` on `qlinq_context_config_t` to receive
+structured component, severity, peer, path, and message fields. Log strings
+are borrowed for the duration of the callback. Endpoint statistics expose
+reconnect outcomes, group membership and interface fallback/rejoin counts,
+control-plane throttling, repair backlog and age, and multicast-versus-repair
+physical airtime.
 
-All context, endpoint and stream operations use the creating thread. Logging
-callbacks execute synchronously and must not call the API. Cross-thread access
-and API calls from logging callbacks are rejected. An independently owned,
-popped event can be transferred to another thread for consumption and release.
+## Stream lifecycle
 
-This interface covers unicast use. It does not expose multicast configuration,
-listener-initiated mesh connections, or finite-transfer finish/drain/abort
-stream states. The separate Quicly keepalive patches remain separate work.
+A publishing stream starts in `QLINQ_STREAM_OPEN`. `qlinq_stream_send()` may
+return `QLINQ_SEND_WOULD_BLOCK` when bounded recovery or egress state is full;
+`QLINQ_EVENT_STREAM_WRITABLE` is edge-triggered and reports when the stream can
+accept records again. `qlinq_stream_is_writable()` provides the current level.
+
+`qlinq_stream_finish()` starts asynchronous completion for a fixed-FEC or
+rateless data stream and changes the publisher to `QLINQ_STREAM_FINISHING`.
+It snapshots the currently subscribed receivers, flushes the final coding
+group, and rejects further sends. A receiver gets
+`QLINQ_EVENT_STREAM_FINISHED` only after every object through the terminal
+watermark has either arrived or been recovered. The publisher gets
+`QLINQ_EVENT_STREAM_DRAINED` after every receiver in the snapshot has
+confirmed completion or departed. Its `completion` fields distinguish the
+confirmed and failed/departed counts. A transfer with no current subscribers
+drains with all three counts equal to zero. A subscriber arriving after the
+snapshot receives `QLINQ_EVENT_STREAM_ABORTED`; applications should use a new
+stream name for a new finite transfer.
+
+`qlinq_stream_abort()` immediately makes a publishing stream terminal, drops
+its queued recovery state, and queues a reliable notification to its current
+subscribers.
+Both sides observe `QLINQ_EVENT_STREAM_ABORTED`. `qlinq_stream_get_stats()`
+reports the current state, accepted and received record counts, subscriber and
+group-member counts, completion confirmations, and writability.
+
+## Current boundary
+
+The API operates on bounded records. It does not itself provide a continuous
+byte stream, receiver-confirmed per-record delivery token, or automatic peer
+discovery. The `qlinq-cast` tool demonstrates how ordered file and pipeline
+transfer can be built above the context, endpoint, lifecycle, and named-stream
+model without changing existing callers.
+
+A connected receiver is not silent: QUIC still requires handshake, packet
+acknowledgement, path validation, and liveness traffic even when application
+recovery uses proactive rateless symbols. A genuinely one-way receiver mode
+would therefore use QUIC only for an optional authenticated bootstrap, then a
+separate protected datagram data plane. Receivers that must be silent from the
+first packet would need pre-provisioned keys and transfer metadata instead of a
+QUIC connection. That mode is intentionally outside this lifecycle API.
