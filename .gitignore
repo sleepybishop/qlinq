@@ -48,3 +48,5 @@ crash-*
 examples/data_multipath_benchmark
 tmp/
 .tmp.dprobes.h
+
+t/00util/test_egress_errors

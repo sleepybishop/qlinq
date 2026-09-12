@@ -129,11 +129,11 @@ bool transport_egress_submit(transport_egress_t *egress, int fd,
 bool transport_egress_flush(transport_egress_t *egress, int fd) {
   if (!egress || fd < 0)
     return false;
-  while (egress->count > 0) {
+  bool success = true;
+  size_t budget = TRANSPORT_EGRESS_BATCH;
+  while (egress->count > 0 && budget > 0) {
     struct iovec datagrams[TRANSPORT_EGRESS_BATCH];
-    size_t batch = egress->count < TRANSPORT_EGRESS_BATCH
-                       ? egress->count
-                       : TRANSPORT_EGRESS_BATCH;
+    size_t batch = egress->count < budget ? egress->count : budget;
     transport_egress_packet_t *first = &egress->packets[egress->head];
     size_t compatible = 0;
     while (compatible < batch) {
@@ -152,12 +152,29 @@ bool transport_egress_flush(transport_egress_t *egress, int fd) {
         fd, (const struct sockaddr *)&first->destination,
         first->destination_len, datagrams, compatible);
     if (sent < 0) {
+      int error = SOCKET_ERROR_CODE;
+      if (error == SOCKET_EAGAIN || error == SOCKET_EWOULDBLOCK ||
+          error == SOCKET_EINTR) {
+        egress->would_block++;
+        return success;
+      }
       egress->send_errors++;
-      return false;
+      /* A hard error applies to the first unsent datagram. Retaining it
+       * forever would block unrelated connections sharing this socket.
+       * QUIC/FEC recovery owns retransmission of the dropped datagram. */
+      egress->packets_dropped++;
+      egress->bytes -= first->size;
+      free(first->data);
+      memset(first, 0, sizeof(*first));
+      egress->head = (egress->head + 1U) % egress->capacity;
+      egress->count--;
+      budget--;
+      success = false;
+      continue;
     }
     if (sent == 0) {
       egress->would_block++;
-      return true;
+      return success;
     }
     for (size_t i = 0; i < (size_t)sent; i++) {
       transport_egress_packet_t *packet = &egress->packets[egress->head];
@@ -168,11 +185,12 @@ bool transport_egress_flush(transport_egress_t *egress, int fd) {
       memset(packet, 0, sizeof(*packet));
       egress->head = (egress->head + 1U) % egress->capacity;
       egress->count--;
+      budget--;
     }
     if ((size_t)sent < compatible) {
       egress->would_block++;
-      return true;
+      return success;
     }
   }
-  return true;
+  return success;
 }
