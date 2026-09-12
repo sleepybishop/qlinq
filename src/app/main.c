@@ -1,3 +1,4 @@
+#include "cli_parse.h"
 /* qlinq-app: direct transport API file and stream bridge. */
 
 #ifndef _DEFAULT_SOURCE
@@ -132,55 +133,6 @@ static void show_help(FILE *out, const char *program) {
           "Signals:\n"
           "  SIGHUP                      reload --cert and --key atomically\n",
           program);
-}
-
-static bool parse_u64(const char *text, uint64_t maximum, uint64_t *value) {
-  char *end = NULL;
-  if (!text || !text[0] || text[0] == '-' || !value)
-    return false;
-  errno = 0;
-  unsigned long long parsed = strtoull(text, &end, 10);
-  if (errno != 0 || !end || *end != '\0' || parsed > maximum)
-    return false;
-  *value = (uint64_t)parsed;
-  return true;
-}
-
-static bool parse_peer(const char *endpoint, char *host, size_t capacity,
-                       uint16_t *port) {
-  const char *start = endpoint;
-  const char *port_text = NULL;
-  size_t host_len;
-  uint64_t parsed_port;
-  if (!endpoint || !endpoint[0] || !host || capacity == 0 || !port)
-    return false;
-  host_len = strlen(endpoint);
-  if (endpoint[0] == '[') {
-    const char *closing = strchr(endpoint + 1, ']');
-    if (!closing || (closing[1] != '\0' && closing[1] != ':'))
-      return false;
-    start = endpoint + 1;
-    host_len = (size_t)(closing - start);
-    if (closing[1] == ':')
-      port_text = closing + 2;
-  } else {
-    const char *first = strchr(endpoint, ':');
-    const char *last = strrchr(endpoint, ':');
-    if (first && first == last) {
-      host_len = (size_t)(first - endpoint);
-      port_text = first + 1;
-    }
-  }
-  if (host_len == 0 || host_len >= capacity)
-    return false;
-  if (port_text &&
-      (!parse_u64(port_text, UINT16_MAX, &parsed_port) || parsed_port == 0))
-    return false;
-  if (port_text)
-    *port = (uint16_t)parsed_port;
-  memcpy(host, start, host_len);
-  host[host_len] = '\0';
-  return true;
 }
 
 static bool write_payload(app_t *app, const moq_track_id_t *track,
@@ -554,7 +506,7 @@ int main(int argc, char **argv) {
       return 0;
     } else if (strcmp(argv[i], "--listen") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT16_MAX, &parsed) || parsed == 0)
+      if (!cli_parse_u64(argv[i], UINT16_MAX, &parsed) || parsed == 0)
         goto invalid;
       listen_port = (uint16_t)parsed;
     } else if (strcmp(argv[i], "--peer") == 0) {
@@ -580,28 +532,28 @@ int main(int argc, char **argv) {
       allow_insecure = true;
     } else if (strcmp(argv[i], "--idle-timeout-ms") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT64_MAX, &idle_timeout_ms) ||
+      if (!cli_parse_u64(argv[i], UINT64_MAX, &idle_timeout_ms) ||
           idle_timeout_ms == 0)
         goto invalid;
     } else if (strcmp(argv[i], "--max-connections") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], TRANSPORT_HARD_MAX_CONNECTIONS, &parsed) ||
+      if (!cli_parse_u64(argv[i], TRANSPORT_HARD_MAX_CONNECTIONS, &parsed) ||
           parsed == 0)
         goto invalid;
       max_connections = (size_t)parsed;
     } else if (strcmp(argv[i], "--max-repair-requests") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT16_MAX, &parsed) || parsed == 0)
+      if (!cli_parse_u64(argv[i], UINT16_MAX, &parsed) || parsed == 0)
         goto invalid;
       max_repair_requests = (size_t)parsed;
     } else if (strcmp(argv[i], "--max-aggregate-repairs") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT16_MAX, &parsed) || parsed == 0)
+      if (!cli_parse_u64(argv[i], UINT16_MAX, &parsed) || parsed == 0)
         goto invalid;
       max_aggregate_repairs = (size_t)parsed;
     } else if (strcmp(argv[i], "--loss") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], 100, &parsed))
+      if (!cli_parse_u64(argv[i], 100, &parsed))
         goto invalid;
       simulated_loss = (uint8_t)parsed;
     } else if (strcmp(argv[i], "--track") == 0) {
@@ -639,39 +591,39 @@ int main(int argc, char **argv) {
       output_path = argv[i];
     } else if (strcmp(argv[i], "--message-size") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], TRANSPORT_MAX_FEC_OBJECT_SIZE, &parsed) ||
+      if (!cli_parse_u64(argv[i], TRANSPORT_MAX_FEC_OBJECT_SIZE, &parsed) ||
           parsed == 0)
         goto invalid;
       message_size = (size_t)parsed;
     } else if (strcmp(argv[i], "--count") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT64_MAX, &app.count_limit))
+      if (!cli_parse_u64(argv[i], UINT64_MAX, &app.count_limit))
         goto invalid;
     } else if (strcmp(argv[i], "--receive-count") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT64_MAX, &app.receive_limit) ||
+      if (!cli_parse_u64(argv[i], UINT64_MAX, &app.receive_limit) ||
           app.receive_limit == 0)
         goto invalid;
     } else if (strcmp(argv[i], "--wait-subscribers") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], SIZE_MAX, &parsed))
+      if (!cli_parse_u64(argv[i], SIZE_MAX, &parsed))
         goto invalid;
       app.required_subscriptions = (size_t)parsed;
     } else if (strcmp(argv[i], "--interval-ms") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT32_MAX, &parsed))
+      if (!cli_parse_u64(argv[i], UINT32_MAX, &parsed))
         goto invalid;
       app.interval_ms = (uint32_t)parsed;
     } else if (strcmp(argv[i], "--one-shot") == 0) {
       app.one_shot = true;
     } else if (strcmp(argv[i], "--drain-ms") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT32_MAX, &parsed))
+      if (!cli_parse_u64(argv[i], UINT32_MAX, &parsed))
         goto invalid;
       app.drain_ms = (uint32_t)parsed;
     } else if (strcmp(argv[i], "--stats-ms") == 0) {
       REQUIRE_VALUE();
-      if (!parse_u64(argv[i], UINT32_MAX, &parsed))
+      if (!cli_parse_u64(argv[i], UINT32_MAX, &parsed))
         goto invalid;
       app.stats_ms = (uint32_t)parsed;
     } else if (strcmp(argv[i], "--stats-file") == 0) {
@@ -770,7 +722,7 @@ int main(int argc, char **argv) {
   uint16_t port = listen_port;
   if (peer_arg) {
     port = 8888;
-    if (!parse_peer(peer_arg, peer_host, sizeof(peer_host), &port)) {
+    if (!cli_parse_endpoint(peer_arg, peer_host, sizeof(peer_host), &port, NULL)) {
       app.failed = true;
       goto cleanup_sockets;
     }

@@ -42,6 +42,10 @@ bool transport_repair_commit_systematic_fallback(
     size_t admitted);
 void transport_repair_batch_destroy(transport_repair_batch_t *batch);
 
+/* Inspect admission without spending a token; UINT64_MAX means disabled. */
+uint64_t transport_repair_limiter_wait_ms(transport_repair_limiter_t *limiter,
+                                          size_t requests_per_second,
+                                          int64_t now_ms);
 bool transport_repair_limiter_take(transport_repair_limiter_t *limiter,
                                    size_t requests_per_second, int64_t now_ms);
 size_t transport_repair_normalize_indices(uint16_t *indices, size_t count);

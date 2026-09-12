@@ -38,6 +38,9 @@ bool transport_limits_resolve(const transport_limits_t *configured,
   resolved->max_aggregate_repair_requests_per_second = value_or_default(
       configured->max_aggregate_repair_requests_per_second,
       TRANSPORT_DEFAULT_MAX_AGGREGATE_REPAIR_REQUESTS_PER_SECOND);
+  resolved->max_aggregate_nack_requests_per_second = value_or_default(
+      configured->max_aggregate_nack_requests_per_second,
+      TRANSPORT_DEFAULT_MAX_AGGREGATE_NACK_REQUESTS_PER_SECOND);
   resolved->max_egress_packets_per_socket =
       value_or_default(configured->max_egress_packets_per_socket,
                        TRANSPORT_DEFAULT_MAX_EGRESS_PACKETS);
@@ -80,6 +83,9 @@ bool transport_limits_resolve(const transport_limits_t *configured,
   if (resolved->max_aggregate_repair_requests_per_second > UINT16_MAX)
     return fail(error, error_capacity,
                 "max_aggregate_repair_requests_per_second exceeds hard limit");
+  if (resolved->max_aggregate_nack_requests_per_second > UINT16_MAX)
+    return fail(error, error_capacity,
+                "max_aggregate_nack_requests_per_second exceeds hard limit");
   if (resolved->max_egress_packets_per_socket < QLINQ_MIN_EGRESS_PACKETS ||
       resolved->max_egress_packets_per_socket >
           TRANSPORT_HARD_MAX_EGRESS_PACKETS)

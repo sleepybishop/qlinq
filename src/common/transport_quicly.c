@@ -755,6 +755,9 @@ transport_t *transport_create(const transport_config_t *config) {
                                   ? config->reconnect_max_delay_ms
                                   : TRANSPORT_DEFAULT_RECONNECT_MAX_DELAY_MS;
   t->reconnect_current_delay_ms = t->reconnect_initial_delay_ms;
+  t->fec_assembler_timeout_ms = config->fec_assembler_timeout_ms != 0
+                                    ? config->fec_assembler_timeout_ms
+                                    : QLINQ_FEC_ASSEMBLER_TIMEOUT_MS;
   t->simulated_loss_rate = config->simulated_loss_rate;
   t->num_path_interface_names = config->num_path_interface_names;
   for (size_t i = 0; i < t->num_path_interface_names; i++)
@@ -794,6 +797,11 @@ transport_t *transport_create(const transport_config_t *config) {
   t->verifier_initialized = false;
 
   t->quic_ctx = quicly_spec_context;
+  if (config->initial_rtt_ms != 0)
+    t->quic_ctx.loss.default_initial_rtt = config->initial_rtt_ms;
+  if (config->handshake_timeout_rtt_multiplier != 0)
+    t->quic_ctx.handshake_timeout_rtt_multiplier =
+        config->handshake_timeout_rtt_multiplier;
 
   /* Setup CID encryptor to support active connection migration */
   static char cid_key[16];
@@ -1105,10 +1113,52 @@ void transport_tick(transport_t *t) {
     }
   }
 
-  /* Sweep active assemblers for 10ms NACK retries */
-  size_t object_nack_budget = 32;
+  /* Expiration releases memory and reports loss even when the receiver-wide
+   * NACK budget is exhausted. It must not be gated by request admission. */
   size_t active_conns = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
   for (size_t c = 0; c < active_conns; c++) {
+    transport_conn_t *conn = t->is_server ? t->conns[c] : t->client_conn;
+    if (!conn || !conn->quic ||
+        quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
+      continue;
+    for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++) {
+      frame_assembler_t *asm_slot = &conn->assemblers[i];
+      if (asm_slot->total_symbols == 0)
+        continue;
+      if (now_nack_ms - asm_slot->last_activity_time_ms >=
+          t->fec_assembler_timeout_ms) {
+        moq_track_id_t resolved_track;
+        if (transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
+                                                  asm_slot->track_id,
+                                                  &resolved_track) == 0) {
+          transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT_LOST,
+                                  .conn = conn,
+                                  .track_id = resolved_track,
+                                  .object = {.track_id = resolved_track,
+                                             .group_id = asm_slot->group_id,
+                                             .object_id = asm_slot->object_id}};
+          t->stats.fec_objects_lost++;
+          transport_emit_event(t, &ev);
+        }
+        transport_release_assembler(t, asm_slot);
+        continue;
+      }
+    }
+  }
+
+  /* Bound aggregate feedback and rotate the starting peer after admission.
+   * Skip the more expensive alias/repair scans while no token is available. */
+  size_t object_nack_budget = 32;
+  uint64_t aggregate_wait = transport_repair_limiter_wait_ms(
+      &t->aggregate_nack_limiter,
+      t->limits.max_aggregate_nack_requests_per_second, now_nack_ms);
+  if (aggregate_wait != 0)
+    goto aggregate_nack_exhausted;
+  t->aggregate_nack_retry_at_ms = 0;
+  size_t recovery_start =
+      active_conns == 0 ? 0 : t->recovery_conn_cursor % active_conns;
+  for (size_t offset = 0; offset < active_conns; offset++) {
+    size_t c = (recovery_start + offset) % active_conns;
     transport_conn_t *conn = t->is_server ? t->conns[c] : t->client_conn;
     if (!conn || !conn->quic ||
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
@@ -1130,11 +1180,17 @@ void transport_tick(transport_t *t) {
         for (uint32_t bit = 0; bit < 32 && object_nack_budget > 0; bit++) {
           if ((gap->pending_mask & (1U << bit)) == 0)
             continue;
+          aggregate_wait = transport_repair_limiter_wait_ms(
+              &t->aggregate_nack_limiter,
+              t->limits.max_aggregate_nack_requests_per_second, now_nack_ms);
+          if (aggregate_wait != 0)
+            goto aggregate_nack_exhausted;
           if (transport_protocol_send_nack(conn, (uint8_t)alias, gap->group_id,
                                            gap->pending_base + bit, NULL, 0,
                                            true)) {
             gap->detected_at_ms = now_nack_ms;
             object_nack_budget--;
+            t->recovery_conn_cursor = (c + 1U) % active_conns;
           } else {
             break;
           }
@@ -1171,6 +1227,11 @@ void transport_tick(transport_t *t) {
           }
           if (assembling)
             continue;
+          aggregate_wait = transport_repair_limiter_wait_ms(
+              &t->aggregate_nack_limiter,
+              t->limits.max_aggregate_nack_requests_per_second, now_nack_ms);
+          if (aggregate_wait != 0)
+            goto aggregate_nack_exhausted;
           if (transport_protocol_send_nack(conn, (uint8_t)alias,
                                            window->group_id, object_id, NULL, 0,
                                            true)) {
@@ -1178,6 +1239,7 @@ void transport_tick(transport_t *t) {
                 (uint8_t)((bit + 1U) % QLINQ_RECOVERY_WINDOW_OBJECTS);
             window->last_request_ms = now_nack_ms;
             object_nack_budget--;
+            t->recovery_conn_cursor = (c + 1U) % active_conns;
           }
           break;
         }
@@ -1188,25 +1250,6 @@ void transport_tick(transport_t *t) {
       frame_assembler_t *asm_slot = &conn->assemblers[i];
       if (asm_slot->total_symbols == 0)
         continue;
-
-      if (now_nack_ms - asm_slot->last_activity_time_ms >=
-          QLINQ_FEC_ASSEMBLER_TIMEOUT_MS) {
-        moq_track_id_t resolved_track;
-        if (transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
-                                                  asm_slot->track_id,
-                                                  &resolved_track) == 0) {
-          transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT_LOST,
-                                  .conn = conn,
-                                  .track_id = resolved_track,
-                                  .object = {.track_id = resolved_track,
-                                             .group_id = asm_slot->group_id,
-                                             .object_id = asm_slot->object_id}};
-          t->stats.fec_objects_lost++;
-          transport_emit_event(t, &ev);
-        }
-        transport_release_assembler(t, asm_slot);
-        continue;
-      }
 
       if (!asm_slot->decoded &&
           now_nack_ms - asm_slot->first_symbol_time_ms >=
@@ -1240,17 +1283,33 @@ void transport_tick(transport_t *t) {
           missing = asm_slot->missing_indices;
         }
         if (missing_count > 0) {
+          aggregate_wait = transport_repair_limiter_wait_ms(
+              &t->aggregate_nack_limiter,
+              t->limits.max_aggregate_nack_requests_per_second, now_nack_ms);
+          if (aggregate_wait != 0)
+            goto aggregate_nack_exhausted;
           if (transport_protocol_send_nack(
                   conn, asm_slot->track_id, asm_slot->group_id,
                   asm_slot->object_id, missing, missing_count, false)) {
             asm_slot->nack_sent = true;
             asm_slot->last_nack_time_ms = now_nack_ms;
+            t->recovery_conn_cursor = (c + 1U) % active_conns;
           }
         }
       }
     }
   }
 
+  goto recovery_sweep_done;
+
+aggregate_nack_exhausted:
+  t->aggregate_nack_retry_at_ms =
+      aggregate_wait == UINT64_MAX ||
+              aggregate_wait > (uint64_t)(INT64_MAX - now_nack_ms)
+          ? INT64_MAX
+          : now_nack_ms + (int64_t)aggregate_wait;
+
+recovery_sweep_done:
   /* Check for FEC grouping buffer timeout (3 milliseconds) */
   if (t->fec_buf_len > 0) {
     uint64_t now = ptls_get_time.cb(&ptls_get_time);
@@ -1460,12 +1519,27 @@ void transport_tick(transport_t *t) {
 
         transport_conn_t *target = NULL;
         if (t->is_server) {
-          for (size_t i = 0; i < t->conn_count; ++i) {
+          /* Ordinary short-header traffic carries our stable master CID.
+           * Avoid testing every earlier peer's reset tokens for each packet.
+           * Initials, unknown CIDs and cache collisions retain the full path.
+           */
+          if (t->quic_ctx.cid_encryptor != NULL &&
+              !QUICLY_PACKET_IS_LONG_HEADER(decoded.octets.base[0])) {
+            transport_conn_t *hint =
+                transport_connection_cache_find(t, &decoded.cid.dest.plaintext);
+            if (hint &&
+                quicly_is_destination(
+                    hint->quic, (struct sockaddr *)&t->local_addrs[fd_idx], psa,
+                    &decoded))
+              target = hint;
+          }
+          for (size_t i = 0; !target && i < t->conn_count; ++i) {
             if (quicly_is_destination(
                     t->conns[i]->quic,
                     (struct sockaddr *)&t->local_addrs[fd_idx], psa,
                     &decoded)) {
               target = t->conns[i];
+              transport_connection_cache_remember(t, target);
               break;
             }
           }
@@ -1498,6 +1572,7 @@ void transport_tick(transport_t *t) {
               }
               *quicly_get_data(new_quic) = target;
               t->conns[t->conn_count++] = target;
+              transport_connection_cache_remember(t, target);
               t->stats.connections_accepted++;
             }
           } else if (!target && !t->shutting_down) {
@@ -1527,6 +1602,10 @@ void transport_tick(transport_t *t) {
 
   if (now - t->last_pathflow_update >= 25) {
     t->last_pathflow_update = now;
+    /* Peer limits are unchanged throughout this synchronous update. Resolve
+     * their common symbol size once, instead of scanning the cohort again
+     * for each connection. */
+    size_t symbol_size = transport_get_datagram_symbol_size(t);
 
     size_t update_count =
         t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
@@ -1534,56 +1613,74 @@ void transport_tick(transport_t *t) {
       transport_conn_t *target = t->is_server ? t->conns[c] : t->client_conn;
       if (!target || !target->quic)
         continue;
-      quicly_stats_t stats;
-      if (quicly_get_stats(target->quic, &stats) == 0) {
-        size_t symbol_size = transport_get_datagram_symbol_size(t);
+      /* Pathflow needs only the primary RTT and congestion window. Reading
+       * the complete connection counters for every peer every 25 ms copies
+       * unrelated telemetry and polls the delivery-rate estimator. */
+      quicly_path_stats_t primary;
+      uint32_t primary_rtt, primary_cwnd;
+      bool have_primary = quicly_get_path_stats(target->quic, 0, &primary) == 0;
+      if (have_primary) {
+        primary_rtt = primary.rtt_smoothed;
+        primary_cwnd = primary.cwnd;
+      } else {
+        /* A primary address may disappear while its path space survives. */
+        quicly_stats_t stats;
+        if (quicly_get_stats(target->quic, &stats) != 0)
+          continue;
+        primary_rtt = (uint32_t)stats.rtt.smoothed;
+        primary_cwnd = stats.cc.cwnd;
+      }
+      /* convert RTT to seconds */
+      fp_t l = FP_DIV(FP_FROM_INT(primary_rtt), FP_FROM_INT(1000));
 
-        /* convert RTT to seconds */
-        fp_t l = FP_DIV(FP_FROM_INT(stats.rtt.smoothed), FP_FROM_INT(1000));
+      /* convert bandwidth to packets/second */
+      size_t cwnd_packets = primary_cwnd / symbol_size;
+      if (cwnd_packets == 0)
+        cwnd_packets = 1;
+      uint32_t rtt_val = primary_rtt > 0 ? primary_rtt : 1;
+      fp_t b = FP_FROM_INT(cwnd_packets * 1000 / rtt_val);
+      if (b <= 0) {
+        b = FP_FROM_INT(100);
+      }
 
-        /* convert bandwidth to packets/second */
-        size_t cwnd_packets = stats.cc.cwnd / symbol_size;
-        if (cwnd_packets == 0)
-          cwnd_packets = 1;
-        uint32_t rtt_val = stats.rtt.smoothed > 0 ? stats.rtt.smoothed : 1;
-        fp_t b = FP_FROM_INT(cwnd_packets * 1000 / rtt_val);
-        if (b <= 0) {
-          b = FP_FROM_INT(100);
+      fp_t p = FP_FROM_FLOAT(0.01f); /* default mock loss rate */
+      size_t q = 0;                  /* bytes in flight or egress queue size */
+
+      for (size_t i = 0; i < t->num_fds; i++) {
+        if (target->path_state_overridden[i])
+          continue;
+        /* use path-specific stats if available, otherwise fallback to
+         * connection defaults */
+        fp_t path_l = l / 2;
+        fp_t path_p = p;
+        quicly_path_stats_t matched;
+        const quicly_path_stats_t *path_stats = &primary;
+        size_t path_idx = 0;
+        /* Link lookup starts at path zero. Its snapshot was already read
+         * above, and no QUIC state changes during this synchronous update. */
+        if (!have_primary ||
+            !transport_path_matches_local(&primary, &t->local_addrs[i])) {
+          path_idx = transport_path_get_stats_by_link(
+              target->quic, t->local_addrs, t->num_fds, i, &matched);
+          path_stats = &matched;
+        }
+        if (path_idx < TRANSPORT_MAX_QUIC_PATHS) {
+          if (path_stats->rtt_smoothed > 0) {
+            path_l = FP_DIV(FP_FROM_INT(path_stats->rtt_smoothed),
+                            FP_FROM_INT(2000));
+          }
+          if (path_stats->sent > 0) {
+            path_p = FP_DIV(FP_FROM_INT(path_stats->lost),
+                            FP_FROM_INT(path_stats->sent));
+          }
         }
 
-        fp_t p = FP_FROM_FLOAT(0.01f); /* default mock loss rate */
-        size_t q = 0; /* bytes in flight or egress queue size */
-
-        for (size_t i = 0; i < t->num_fds; i++) {
-          if (target->path_state_overridden[i])
-            continue;
-          /* use path-specific stats if available, otherwise fallback to
-           * connection defaults */
-          fp_t path_l = l / 2;
-          fp_t path_p = p;
-          quicly_path_stats_t path_stats;
-
-          size_t path_idx = transport_path_find_by_link(
-              target->quic, t->local_addrs, t->num_fds, i);
-          if (path_idx < TRANSPORT_MAX_QUIC_PATHS &&
-              quicly_get_path_stats(target->quic, path_idx, &path_stats) == 0) {
-            if (path_stats.rtt_smoothed > 0) {
-              path_l = FP_DIV(FP_FROM_INT(path_stats.rtt_smoothed),
-                              FP_FROM_INT(2000));
-            }
-            if (path_stats.sent > 0) {
-              path_p = FP_DIV(FP_FROM_INT(path_stats.lost),
-                              FP_FROM_INT(path_stats.sent));
-            }
-          }
-
-          if (target->latest_owd_fp[i] > 0) {
-            path_l += target->latest_owd_fp[i];
-          }
-
-          pathflow_update_state(&target->path_states[i], b, path_l, path_p, q,
-                                FP_FROM_FLOAT(0.1f));
+        if (target->latest_owd_fp[i] > 0) {
+          path_l += target->latest_owd_fp[i];
         }
+
+        pathflow_update_state(&target->path_states[i], b, path_l, path_p, q,
+                              FP_FROM_FLOAT(0.1f));
       }
     }
   }
@@ -1706,6 +1803,7 @@ void transport_tick(transport_t *t) {
         t->stats.connections_closed++;
 
         transport_publish_checkpoint_connection_removed(t, conn);
+        transport_connection_cache_forget(t, conn);
         quicly_free(conn->quic);
         for (size_t a = 0; a < t->limits.max_assemblers_per_connection; a++)
           transport_release_assembler(t, &conn->assemblers[a]);
@@ -1875,10 +1973,20 @@ bool transport_send_unicast(transport_t *t, transport_conn_t *conn,
 }
 
 void transport_close_conn(transport_t *t, transport_conn_t *conn) {
+  transport_close_conn_with_error(t, conn, 0, "application close");
+}
+
+void transport_close_conn_with_error(transport_t *t, transport_conn_t *conn,
+                                     int64_t error, const char *reason) {
   if (!transport_owner_ok(t))
     return;
-  if (transport_has_connection(t, conn) && conn->quic) {
-    quicly_close(conn->quic, 0, "application close");
+  if (error != 0 && !QUICLY_ERROR_IS_QUIC_APPLICATION(error))
+    return;
+  if (transport_has_connection(t, conn) && conn->quic &&
+      quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING) {
+    if (error == TRANSPORT_APP_ERROR_RESOURCE_LIMIT)
+      t->stats.resource_limit_errors++;
+    quicly_close(conn->quic, error, reason ? reason : "application close");
   }
 }
 
@@ -2177,8 +2285,8 @@ bool transport_get_path_stats(transport_t *t, size_t path_idx,
                                                    : TRANSPORT_PATH_FAILED));
   if (target && target->quic) {
     quicly_path_stats_t path_stats;
-    size_t mapped_path_idx = transport_path_find_by_link(
-        target->quic, t->local_addrs, t->num_fds, path_idx);
+    size_t mapped_path_idx = transport_path_get_stats_by_link(
+        target->quic, t->local_addrs, t->num_fds, path_idx, &path_stats);
     if (quicly_get_state(target->quic) >= QUICLY_STATE_CLOSING) {
       stats->lifecycle = TRANSPORT_PATH_DRAINING;
     } else if (mapped_path_idx >= TRANSPORT_MAX_QUIC_PATHS) {
@@ -2187,14 +2295,11 @@ bool transport_get_path_stats(transport_t *t, size_t path_idx,
                              : TRANSPORT_PATH_DISCOVERED;
     } else if (!quicly_is_path_available(target->quic, mapped_path_idx)) {
       stats->lifecycle = TRANSPORT_PATH_VALIDATING;
-    } else if (quicly_get_path_stats(target->quic, mapped_path_idx,
-                                     &path_stats) == 0) {
+    } else {
       stats->lifecycle = TRANSPORT_PATH_ACTIVE;
       stats->sent = path_stats.sent;
       stats->lost = path_stats.lost;
       stats->rtt = path_stats.rtt_smoothed;
-    } else {
-      stats->lifecycle = TRANSPORT_PATH_FAILED;
     }
   }
 
@@ -2357,7 +2462,28 @@ int64_t transport_get_first_timeout(transport_t *t) {
   if (!transport_owner_ok(t))
     return INT64_MAX;
 
-  int64_t first_timeout = INT64_MAX;
+  int64_t first_timeout = t->aggregate_nack_retry_at_ms > 0
+                              ? t->aggregate_nack_retry_at_ms
+                              : INT64_MAX;
+  size_t active_conns = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
+  for (size_t c = 0; c < active_conns; c++) {
+    transport_conn_t *conn = t->is_server ? t->conns[c] : t->client_conn;
+    if (!conn || !conn->quic ||
+        quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
+      continue;
+    for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++) {
+      const frame_assembler_t *assembler = &conn->assemblers[i];
+      if (assembler->total_symbols == 0)
+        continue;
+      int64_t expires =
+          assembler->last_activity_time_ms >
+                  INT64_MAX - t->fec_assembler_timeout_ms
+              ? INT64_MAX
+              : assembler->last_activity_time_ms + t->fec_assembler_timeout_ms;
+      if (expires < first_timeout)
+        first_timeout = expires;
+    }
+  }
 
   if (!t->is_server && !t->client_conn && t->reconnect_enabled &&
       !t->shutting_down && t->reconnect_at_ms < first_timeout)

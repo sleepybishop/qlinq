@@ -142,6 +142,7 @@ typedef void (*transport_callback_t)(void *user_data,
 #define TRANSPORT_DEFAULT_MAX_ASSEMBLERS 8U
 #define TRANSPORT_DEFAULT_MAX_REPAIR_REQUESTS_PER_SECOND 16U
 #define TRANSPORT_DEFAULT_MAX_AGGREGATE_REPAIR_REQUESTS_PER_SECOND 256U
+#define TRANSPORT_DEFAULT_MAX_AGGREGATE_NACK_REQUESTS_PER_SECOND 16U
 #define TRANSPORT_DEFAULT_MAX_EGRESS_PACKETS 1024U
 #define TRANSPORT_DEFAULT_MAX_EGRESS_BYTES (2U * 1024U * 1024U)
 #define TRANSPORT_RECOVERY_WINDOW_OBJECTS 32U
@@ -164,6 +165,8 @@ typedef struct {
   size_t max_assemblers_per_connection;
   size_t max_repair_requests_per_second;
   size_t max_aggregate_repair_requests_per_second;
+  /* Receiver-wide outbound NACK budget, shared by all peers. */
+  size_t max_aggregate_nack_requests_per_second;
   size_t max_egress_packets_per_socket;
   size_t max_egress_bytes_per_socket;
   size_t max_assembler_memory_bytes;
@@ -207,6 +210,11 @@ typedef struct {
   /* QUIC control-session idle timeout in milliseconds. Zero keeps Quicly's
    * default. */
   uint64_t quic_idle_timeout_ms;
+  /* FEC assembler inactivity timeout. Zero selects 2000 ms. */
+  uint32_t fec_assembler_timeout_ms;
+  /* Zero keeps the corresponding Quicly default. */
+  uint32_t initial_rtt_ms;
+  uint32_t handshake_timeout_rtt_multiplier;
   const char *cert_file; /* required for server */
   const char *key_file;  /* required for server */
   const char *ca_file;   /* CA bundle path for validating peer certificates */
@@ -291,6 +299,10 @@ int transport_enable_qlog(const char *socket_path);
 
 /* close an active connection */
 void transport_close_conn(transport_t *t, transport_conn_t *conn);
+/* error is zero or a QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE value.
+ * Unknown connections, invalid errors and already-closing peers are ignored. */
+void transport_close_conn_with_error(transport_t *t, transport_conn_t *conn,
+                                     int64_t error, const char *reason);
 
 /* Close every connection and suppress automatic reconnect. Call tick until
  * transport_is_drained() or the application's drain deadline expires. */

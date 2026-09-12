@@ -22,6 +22,7 @@
 #define QLINQ_FEC_NACK_DELAY_MS 25
 #define QLINQ_FEC_REPAIR_DEDUP_MS 25
 #define QLINQ_FEC_COMPLETION_RETRY_MS 500
+#define QLINQ_CONNECTION_CACHE_SLOTS 256U
 #define QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY 256U
 
 typedef struct {
@@ -81,6 +82,7 @@ struct transport_t {
   size_t conn_count;
   uint32_t next_conn_id;
   transport_conn_t *client_conn;
+  transport_conn_t *connection_cache[QLINQ_CONNECTION_CACHE_SLOTS];
 
   quicly_stream_open_t stream_open;
   ptls_openssl_verify_certificate_t verifier;
@@ -90,6 +92,10 @@ struct transport_t {
   transport_sent_cache_t sent_cache;
   transport_repair_mode_t repair_mode;
   transport_repair_limiter_t aggregate_repair_limiter;
+  transport_repair_limiter_t aggregate_nack_limiter;
+  int64_t aggregate_nack_retry_at_ms;
+  size_t recovery_conn_cursor;
+  uint32_t fec_assembler_timeout_ms;
   uint8_t simulated_loss_rate;
   arena_t arena;
 
@@ -147,6 +153,38 @@ struct transport_conn_t {
   uint8_t last_repair_alias;
   uint8_t last_repair_flags;
 };
+
+/* Master identity is stable across path changes and CID rotation. A cache hit
+ * is only a routing hint: the caller must still call quicly_is_destination and
+ * quicly_receive. Never use these unauthenticated fields as peer identity. */
+static inline transport_conn_t *
+transport_connection_cache_find(transport_t *t,
+                                const quicly_cid_plaintext_t *cid) {
+  transport_conn_t *conn =
+      t->connection_cache[cid->master_id % QLINQ_CONNECTION_CACHE_SLOTS];
+  if (!conn)
+    return NULL;
+  const quicly_cid_plaintext_t *master = quicly_get_master_id(conn->quic);
+  return master->master_id == cid->master_id &&
+                 master->thread_id == cid->thread_id &&
+                 master->node_id == cid->node_id
+             ? conn
+             : NULL;
+}
+
+static inline void transport_connection_cache_remember(transport_t *t,
+                                                       transport_conn_t *conn) {
+  const quicly_cid_plaintext_t *cid = quicly_get_master_id(conn->quic);
+  t->connection_cache[cid->master_id % QLINQ_CONNECTION_CACHE_SLOTS] = conn;
+}
+
+static inline void transport_connection_cache_forget(transport_t *t,
+                                                     transport_conn_t *conn) {
+  const quicly_cid_plaintext_t *cid = quicly_get_master_id(conn->quic);
+  size_t slot = cid->master_id % QLINQ_CONNECTION_CACHE_SLOTS;
+  if (t->connection_cache[slot] == conn)
+    t->connection_cache[slot] = NULL;
+}
 
 /* State exists only while its alias has a negotiated subscription. Callers
  * must resolve the alias before accessing it; unknown wire aliases are rejected

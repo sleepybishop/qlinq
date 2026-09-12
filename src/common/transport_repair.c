@@ -4,25 +4,49 @@
 #include <stdlib.h>
 #include <string.h>
 
-bool transport_repair_limiter_take(transport_repair_limiter_t *limiter,
-                                   size_t requests_per_second, int64_t now_ms) {
+static bool refill_limiter(transport_repair_limiter_t *limiter,
+                           size_t requests_per_second, int64_t now_ms) {
   if (!limiter || requests_per_second == 0 ||
       requests_per_second > UINT64_MAX / 1000U)
     return false;
+
   uint64_t capacity = (uint64_t)requests_per_second * 1000U;
   if (limiter->last_refill_ms == 0 || now_ms < limiter->last_refill_ms) {
     limiter->tokens_milli = capacity;
     limiter->last_refill_ms = now_ms;
   } else if (now_ms > limiter->last_refill_ms) {
     uint64_t elapsed = (uint64_t)(now_ms - limiter->last_refill_ms);
-    uint64_t added = elapsed > UINT64_MAX / requests_per_second
-                         ? capacity
-                         : elapsed * (uint64_t)requests_per_second;
+    uint64_t added = 0;
+    if (elapsed > UINT64_MAX / requests_per_second) {
+      added = capacity;
+    } else {
+      added = elapsed * (uint64_t)requests_per_second;
+    }
     limiter->tokens_milli = added >= capacity - limiter->tokens_milli
                                 ? capacity
                                 : limiter->tokens_milli + added;
     limiter->last_refill_ms = now_ms;
   }
+
+  return true;
+}
+
+uint64_t transport_repair_limiter_wait_ms(transport_repair_limiter_t *limiter,
+                                          size_t requests_per_second,
+                                          int64_t now_ms) {
+  if (!refill_limiter(limiter, requests_per_second, now_ms))
+    return UINT64_MAX;
+  if (limiter->tokens_milli >= 1000U)
+    return 0;
+  uint64_t missing = 1000U - limiter->tokens_milli;
+  return (missing + requests_per_second - 1U) / requests_per_second;
+}
+
+bool transport_repair_limiter_take(transport_repair_limiter_t *limiter,
+                                   size_t requests_per_second, int64_t now_ms) {
+  if (!refill_limiter(limiter, requests_per_second, now_ms))
+    return false;
+
   if (limiter->tokens_milli < 1000U)
     return false;
   limiter->tokens_milli -= 1000U;

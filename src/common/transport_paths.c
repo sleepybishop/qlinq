@@ -40,6 +40,13 @@ static bool sockaddr_address_equal(const struct sockaddr *a,
   return false;
 }
 
+bool transport_path_matches_local(const quicly_path_stats_t *stats,
+                                  const struct sockaddr_storage *local) {
+  return stats && local &&
+         sockaddr_address_equal(&stats->local.sa,
+                                (const struct sockaddr *)local);
+}
+
 size_t transport_path_find_by_addresses(quicly_conn_t *quic,
                                         const struct sockaddr *local,
                                         const struct sockaddr *remote) {
@@ -58,13 +65,19 @@ size_t transport_path_find_by_addresses(quicly_conn_t *quic,
 size_t transport_path_find_by_link(quicly_conn_t *quic,
                                    const struct sockaddr_storage *local_addrs,
                                    size_t num_local_addrs, size_t link_index) {
-  if (!quic || !local_addrs || link_index >= num_local_addrs)
+  quicly_path_stats_t stats;
+  return transport_path_get_stats_by_link(quic, local_addrs, num_local_addrs,
+                                          link_index, &stats);
+}
+
+size_t transport_path_get_stats_by_link(
+    quicly_conn_t *quic, const struct sockaddr_storage *local_addrs,
+    size_t num_local_addrs, size_t link_index, quicly_path_stats_t *stats) {
+  if (!quic || !local_addrs || !stats || link_index >= num_local_addrs)
     return SIZE_MAX;
   for (size_t p = 0; p < TRANSPORT_MAX_QUIC_PATHS; p++) {
-    quicly_path_stats_t stats;
-    if (quicly_get_path_stats(quic, p, &stats) == 0 &&
-        sockaddr_address_equal(
-            &stats.local.sa, (const struct sockaddr *)&local_addrs[link_index]))
+    if (quicly_get_path_stats(quic, p, stats) == 0 &&
+        transport_path_matches_local(stats, &local_addrs[link_index]))
       return p;
   }
   return SIZE_MAX;

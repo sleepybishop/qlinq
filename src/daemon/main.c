@@ -1,3 +1,4 @@
+#include "cli_parse.h"
 /* main.c (daemon) */
 
 #ifndef _DEFAULT_SOURCE
@@ -58,24 +59,16 @@ static void show_help(FILE *out, const char *program) {
 }
 
 static bool parse_port(const char *text, int *port) {
-  if (!text || !text[0] || text[0] == '-' || !port)
+  uint64_t parsed;
+  if (!port || !cli_parse_u64(text, UINT16_MAX, &parsed) || parsed == 0)
     return false;
-  char *end = NULL;
-  errno = 0;
-  long value = strtol(text, &end, 10);
-  if (errno != 0 || !end || *end != '\0' || value <= 0 || value > UINT16_MAX)
-    return false;
-  *port = (int)value;
+  *port = (int)parsed;
   return true;
 }
 
 static bool parse_u32(const char *text, uint32_t *value) {
-  if (!text || !text[0] || text[0] == '-' || !value)
-    return false;
-  char *end = NULL;
-  errno = 0;
-  unsigned long long parsed = strtoull(text, &end, 10);
-  if (errno != 0 || !end || *end != '\0' || parsed == 0 || parsed > UINT32_MAX)
+  uint64_t parsed;
+  if (!value || !cli_parse_u64(text, UINT32_MAX, &parsed) || parsed == 0)
     return false;
   *value = (uint32_t)parsed;
   return true;
@@ -83,40 +76,12 @@ static bool parse_u32(const char *text, uint32_t *value) {
 
 static bool parse_peer_endpoint(const char *endpoint, char *host,
                                 size_t host_capacity, int *port) {
-  if (!endpoint || !host || host_capacity == 0 || !port)
+  if (!port || *port < 0 || *port > UINT16_MAX)
     return false;
-  const char *host_start = endpoint;
-  size_t host_len = strlen(endpoint);
-  const char *port_start = NULL;
-  if (endpoint[0] == '[') {
-    const char *closing = strchr(endpoint + 1, ']');
-    if (!closing || (closing[1] != '\0' && closing[1] != ':'))
-      return false;
-    host_start = endpoint + 1;
-    host_len = (size_t)(closing - host_start);
-    if (closing[1] == ':')
-      port_start = closing + 2;
-  } else {
-    const char *first_colon = strchr(endpoint, ':');
-    const char *last_colon = strrchr(endpoint, ':');
-    if (first_colon && first_colon == last_colon) {
-      host_len = (size_t)(first_colon - endpoint);
-      port_start = first_colon + 1;
-    }
-  }
-  if (host_len == 0 || host_len >= host_capacity)
+  uint16_t parsed = (uint16_t)*port;
+  if (!cli_parse_endpoint(endpoint, host, host_capacity, &parsed, NULL))
     return false;
-  memcpy(host, host_start, host_len);
-  host[host_len] = '\0';
-  if (port_start) {
-    char *end = NULL;
-    errno = 0;
-    long parsed = strtol(port_start, &end, 10);
-    if (errno != 0 || !port_start[0] || !end || *end != '\0' || parsed <= 0 ||
-        parsed > UINT16_MAX)
-      return false;
-    *port = (int)parsed;
-  }
+  *port = parsed;
   return true;
 }
 

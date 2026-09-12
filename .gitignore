@@ -58,3 +58,5 @@ t/00util/test_directional_subscriptions
 t/00util/test_stream_budget
 
 /t/00util/test_reliable_bidirectional
+
+/t/00util/test_generic_ports

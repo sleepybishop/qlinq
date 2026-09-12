@@ -1008,13 +1008,27 @@ bool transport_protocol_send_nack(transport_conn_t *conn, uint8_t alias,
       /* Recovery timers retain the missing objects and retry after pressure
        * clears. Preserve essential control capacity without spending tokens. */
       conn->transport->stats.repair_requests_deferred++;
-    } else if (!transport_repair_limiter_take(
+    } else if (transport_repair_limiter_wait_ms(
                    &conn->nack_request_limiter,
                    conn->transport->limits.max_repair_requests_per_second,
-                   transport_get_time_ms())) {
+                   transport_get_time_ms()) != 0 ||
+               transport_repair_limiter_wait_ms(
+                   &conn->transport->aggregate_nack_limiter,
+                   conn->transport->limits
+                       .max_aggregate_nack_requests_per_second,
+                   transport_get_time_ms()) != 0) {
       conn->transport->stats.repair_requests_deferred++;
     } else if (transport_stream_write_frame(conn->stream, QLINQ_WIRE_NACK, buf,
                                             written)) {
+      int64_t admitted_at_ms = transport_get_time_ms();
+      (void)transport_repair_limiter_take(
+          &conn->nack_request_limiter,
+          conn->transport->limits.max_repair_requests_per_second,
+          admitted_at_ms);
+      (void)transport_repair_limiter_take(
+          &conn->transport->aggregate_nack_limiter,
+          conn->transport->limits.max_aggregate_nack_requests_per_second,
+          admitted_at_ms);
       conn->transport->stats.repair_requests_sent++;
       if (rateless)
         conn->transport->stats.repair_rateless_requests_sent++;

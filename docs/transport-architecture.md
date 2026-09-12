@@ -8,6 +8,7 @@ types and the wire codec.
 | --- | --- |
 | `transport_quicly.c` | Connection lifecycle, socket event loop, and public control/query API |
 | `transport_internal.h` | Private shared transport and connection state |
+| `cli_parse.c` | Shared bounded numeric and endpoint parsing for app and daemon |
 | `transport_config.c` | Default resolution and validation of resource limits |
 | `transport_protocol.c` | HELLO negotiation, stream dispatch, datagram receive, and FEC assembly |
 | `transport_publish.c` | Reliable/datagram publication, FEC generation, and grouped data flushes |
@@ -28,6 +29,33 @@ The protocol and publication engines operate on private state but do not own the
 socket event loop. `transport_quicly.c` coordinates lifecycle and polling while
 each module owns its invariants. The public header continues to expose opaque
 handles.
+
+## Timing and connection control
+
+`transport_config_t.fec_assembler_timeout_ms` sets the inactivity timeout for
+partial FEC objects; zero preserves the 2000 ms default. Expiration releases
+assembler memory and reports `TRANSPORT_EVENT_OBJECT_LOST`, including while
+outbound NACKs are rate limited. Poll deadlines include assembler expiration
+and deferred aggregate-budget retries.
+
+`initial_rtt_ms` sets Quicly's initial RTT estimate, and
+`handshake_timeout_rtt_multiplier` sets its handshake timeout in RTT multiples.
+Zero preserves each Quicly default. Neither changes the configured QUIC idle
+timeout. The fork's handshake PTO ceiling requires a separate Quicly change
+and is not exposed by this build.
+
+`transport_close_conn_with_error` accepts zero or a tagged
+`QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE` value and an optional reason.
+It preserves an existing close reason, ignores unknown connections and invalid
+error types, and counts a resource-limit close once. `transport_close_conn`
+continues to request an ordinary application close.
+
+Server packet routing uses a bounded 256-slot connection cache keyed by the
+stable master CID. Hits still pass Quicly's destination check; collisions and
+unknown CIDs fall back to the full scan. Entries are invalidated before their
+connections are freed. Path scheduling reuses path-stat snapshots and resolves
+the common datagram symbol size once per update. IPv6 link matching includes
+the scope ID.
 
 ## Ownership rules
 
@@ -58,7 +86,13 @@ handles.
   while its reliable frame remains retained, including partial ACKs and later
   ACKed ranges behind a missing prefix. Once released, a lost repair response
   can trigger another request. Queue pressure defers NACKs without spending
-  rate tokens or consuming essential-control reserves.
+  rate tokens or consuming essential-control reserves. Outbound requests also
+  share `max_aggregate_nack_requests_per_second` across all peers (default 16,
+  maximum 65535). This token bucket permits a one-second burst, then refills
+  continuously; zero configuration selects the default. Recovery rotates its
+  starting peer after an admitted or coalesced request, and pauses request
+  scans until the aggregate budget refills. Assembler expiration continues
+  during that pause. These limits are local policy, not wire negotiation.
 - Event payload pointers are borrowed and valid only during the callback.
 - The creating thread owns a transport. Callbacks run synchronously on that
   thread and may call non-driving APIs; recursive ticks, callback destruction,
