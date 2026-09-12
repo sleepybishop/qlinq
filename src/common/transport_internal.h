@@ -24,6 +24,7 @@
 #define QLINQ_FEC_COMPLETION_RETRY_MS 500
 #define QLINQ_CONNECTION_CACHE_SLOTS 256U
 #define QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY 256U
+#define QLINQ_COMPLETED_OBJECTS 256U
 
 typedef struct {
   moq_track_id_t track_id;
@@ -67,6 +68,8 @@ struct transport_t {
   atomic_uint_fast64_t cross_thread_violations;
   pthread_t owner_thread;
   bool tick_active;
+  bool log_callback_active;
+  size_t receive_cursor;
   size_t callback_depth;
 
   struct sockaddr_storage remote_addrs[TRANSPORT_MAX_PATHS];
@@ -136,9 +139,17 @@ struct transport_conn_t {
   quicly_stream_t *stream;
   frame_assembler_t assemblers[TRANSPORT_HARD_MAX_ASSEMBLERS];
   size_t assembler_index;
+  struct {
+    uint64_t generation, group_id, object_id;
+    uint8_t alias;
+    bool active;
+  } completed_objects[QLINQ_COMPLETED_OBJECTS];
+  size_t completed_cursor;
   uint16_t queued_datagrams[TRANSPORT_MAX_QUIC_PATHS];
   path_state_t path_states[TRANSPORT_MAX_PATHS];
   int64_t min_owd_ns[TRANSPORT_MAX_PATHS];
+  bool owd_initialized[TRANSPORT_MAX_PATHS];
+  size_t telemetry_path[TRANSPORT_MAX_PATHS];
   fp_t latest_owd_fp[TRANSPORT_MAX_PATHS];
   uint64_t last_telemetry_s_ns[TRANSPORT_MAX_PATHS];
   uint64_t last_telemetry_r_ns[TRANSPORT_MAX_PATHS];

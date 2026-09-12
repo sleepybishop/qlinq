@@ -1,6 +1,8 @@
 #include "qlinq.h"
 
+#include "transport.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Exercise the public event boundary: transport-only tests cannot detect a
@@ -38,6 +40,13 @@ static int run_delivery(qlinq_delivery_t delivery,
   qlinq_stream_t *publisher = qlinq_publish(listener, &config);
   qlinq_stream_t *subscriber = qlinq_subscribe(client, &config);
   if (!publisher || !subscriber)
+    goto Exit;
+  qlinq_stream_config_t conflicting = config;
+  conflicting.delivery = delivery == QLINQ_DELIVERY_RELIABLE
+                             ? QLINQ_DELIVERY_DATAGRAM
+                             : QLINQ_DELIVERY_RELIABLE;
+  if (qlinq_publish(listener, &conflicting) ||
+      qlinq_subscribe(client, &conflicting))
     goto Exit;
   bool joined = false, ready = false;
   for (size_t attempt = 0; attempt < 500; attempt++) {
@@ -101,7 +110,97 @@ Exit:
   return failed;
 }
 
+static int run_reliable_boundaries(void) {
+  qlinq_context_t *context = qlinq_context_create(NULL);
+  if (!context)
+    return 1;
+  qlinq_endpoint_config_t config = {
+      .bind_addresses = {"127.0.0.1"},
+      .bind_address_count = 1,
+      .port = 19763,
+      .security = {.certificate_file = "t/assets/server.crt",
+                   .private_key_file = "t/assets/server.key",
+                   .allow_insecure_peer = true}};
+  qlinq_endpoint_t *server = qlinq_listen(context, &config);
+  config.remote_addresses[0] = "127.0.0.1";
+  config.remote_address_count = 1;
+  qlinq_endpoint_t *client = qlinq_connect(context, &config);
+  qlinq_stream_config_t track = {.name = "maximum",
+                                 .content_type = QLINQ_CONTENT_DATA,
+                                 .delivery = QLINQ_DELIVERY_RELIABLE};
+  qlinq_stream_t *publishers[2] = {qlinq_publish(server, &track),
+                                   qlinq_publish(client, &track)};
+  qlinq_stream_t *subscribers[2] = {qlinq_subscribe(client, &track),
+                                    qlinq_subscribe(server, &track)};
+  int failed = 1;
+  uint8_t *payload = malloc(TRANSPORT_MAX_RELIABLE_OBJECT_SIZE + 1U);
+  if (!server || !client || !publishers[0] || !publishers[1] ||
+      !subscribers[0] || !subscribers[1] || !payload)
+    goto Exit;
+  for (size_t i = 0; i <= TRANSPORT_MAX_RELIABLE_OBJECT_SIZE; i++)
+    payload[i] = (uint8_t)(i * 37U);
+  unsigned joined = 0;
+  for (size_t attempt = 0; attempt < 2000 && joined < 2; attempt++) {
+    if (qlinq_service(context, 5) < QLINQ_STATUS_OK)
+      goto Exit;
+    qlinq_event_t event;
+    while (qlinq_next_event(context, &event)) {
+      joined += event.type == QLINQ_EVENT_SUBSCRIBER_JOINED;
+      qlinq_event_release(&event);
+    }
+  }
+  if (joined != 2)
+    goto Exit;
+  for (size_t direction = 0; direction < 2; direction++) {
+    qlinq_record_t record = {.data = payload,
+                             .size = TRANSPORT_MAX_RELIABLE_OBJECT_SIZE + 1U};
+    if (qlinq_stream_send(publishers[direction], &record) != QLINQ_SEND_INVALID)
+      goto Exit;
+    for (unsigned iteration = 0; iteration < 3; iteration++) {
+      record.sequence = iteration;
+      record.size = TRANSPORT_MAX_RELIABLE_OBJECT_SIZE - (iteration == 0);
+      bool sent = false, received = false;
+      for (size_t attempt = 0; attempt < 2000 && !received; attempt++) {
+        if (!sent) {
+          qlinq_send_result_t result =
+              qlinq_stream_send(publishers[direction], &record);
+          sent = result == QLINQ_SEND_SENT;
+          if (!sent && result != QLINQ_SEND_WOULD_BLOCK)
+            goto Exit;
+        }
+        if (qlinq_service(context, 5) < QLINQ_STATUS_OK)
+          goto Exit;
+        qlinq_event_t event;
+        while (qlinq_next_event(context, &event)) {
+          bool valid = true;
+          if (event.type == QLINQ_EVENT_RECORD) {
+            valid = event.stream == subscribers[direction] &&
+                    event.record.sequence == record.sequence &&
+                    event.record.size == record.size &&
+                    memcmp(event.record.data, payload, record.size) == 0;
+            received = valid;
+          }
+          qlinq_event_release(&event);
+          if (!valid)
+            goto Exit;
+        }
+      }
+      if (!received)
+        goto Exit;
+    }
+  }
+  failed = 0;
+Exit:
+  free(payload);
+  qlinq_context_destroy(context);
+  if (failed)
+    fputs("reliable maximum-record boundary failed\n", stderr);
+  return failed;
+}
+
 int main(void) {
+  if (run_reliable_boundaries())
+    return 1;
   const qlinq_delivery_t modes[] = {
       QLINQ_DELIVERY_DATAGRAM, QLINQ_DELIVERY_FIXED_FEC,
       QLINQ_DELIVERY_RATELESS, QLINQ_DELIVERY_RELIABLE};

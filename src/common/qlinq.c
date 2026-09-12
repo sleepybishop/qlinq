@@ -872,9 +872,14 @@ static qlinq_stream_t *open_stream(qlinq_endpoint_t *endpoint,
   moq_track_id_t track = {.type = (moq_track_type_t)config->content_type,
                           .flags = delivery_flags(config->delivery)};
   memcpy(track.name, config->name, strlen(config->name) + 1U);
-  if (find_stream(endpoint, &track, direction)) {
-    set_status(endpoint->context, QLINQ_STATUS_STATE);
-    return NULL;
+  for (qlinq_stream_t *existing = endpoint->streams; existing;
+       existing = existing->next) {
+    if (existing->active && existing->direction == direction &&
+        existing->track.type == track.type &&
+        strcmp(existing->track.name, track.name) == 0) {
+      set_status(endpoint->context, QLINQ_STATUS_STATE);
+      return NULL;
+    }
   }
 
   qlinq_stream_t *stream = calloc(1, sizeof(*stream));
@@ -1069,13 +1074,13 @@ qlinq_status_t qlinq_service(qlinq_context_t *context, int timeout_ms) {
   }
 
   if (endpoint_count > SIZE_MAX / sizeof(qlinq_endpoint_poll_t) ||
-      endpoint_count > SIZE_MAX / (TRANSPORT_MAX_PATHS + 1U) ||
-      endpoint_count * (TRANSPORT_MAX_PATHS + 1U) >
+      endpoint_count > SIZE_MAX / TRANSPORT_MAX_POLL_FDS ||
+      endpoint_count * TRANSPORT_MAX_POLL_FDS >
           SIZE_MAX / sizeof(struct pollfd)) {
     set_status(context, QLINQ_STATUS_RESOURCE_LIMIT);
     return QLINQ_STATUS_RESOURCE_LIMIT;
   }
-  size_t capacity = endpoint_count * (TRANSPORT_MAX_PATHS + 1U);
+  size_t capacity = endpoint_count * TRANSPORT_MAX_POLL_FDS;
   if (endpoint_count > context->poll_endpoint_capacity) {
     struct pollfd *fds = calloc(capacity, sizeof(*fds));
     qlinq_endpoint_poll_t *polls = calloc(endpoint_count, sizeof(*polls));

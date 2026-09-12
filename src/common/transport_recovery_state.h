@@ -44,6 +44,7 @@ typedef struct {
 } transport_checkpoint_ack_state_t;
 
 typedef struct {
+  uint64_t generation;
   transport_object_gap_state_t object_gap;
   transport_checkpoint_ack_state_t checkpoint_ack;
 } transport_subscription_state_t;

@@ -874,6 +874,12 @@ static void parse_track_stream_messages(transport_t *t, transport_conn_t *conn,
     moq_track_id_t resolved_track = {0};
     if (transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
                                               alias, &resolved_track) == 0) {
+      if ((resolved_track.flags & MOQ_TRACK_FLAG_RELIABLE) == 0) {
+        t->stats.protocol_errors++;
+        quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
+                     "protocol error: stream on datagram track");
+        break;
+      }
       transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT,
                               .conn = conn,
                               .track_id = resolved_track,
@@ -1077,24 +1083,54 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
       tconn->malformed_datagrams++;
       return;
     }
-    uint8_t pid = telemetry.path_id;
-    if (pid < TRANSPORT_MAX_PATHS) {
-      uint64_t s_ns = telemetry.send_time_ns;
-      uint64_t r_ns = telemetry.recv_time_ns;
-
-      /* relative owd (queuing delay estimation) */
-      int64_t current_owd = (int64_t)r_ns - (int64_t)s_ns;
-      if (tconn->min_owd_ns[pid] == 0 || current_owd < tconn->min_owd_ns[pid]) {
-        tconn->min_owd_ns[pid] = current_owd;
+    /* The wire carries a QUIC path index, while scheduling state follows
+     * physical sockets (which can be compacted after interface removal). */
+    size_t pid = SIZE_MAX;
+    quicly_path_stats_t path;
+    if (quicly_get_path_stats(conn, telemetry.path_id, &path) == 0 &&
+        quicly_is_path_available(conn, telemetry.path_id)) {
+      for (size_t i = 0; i < t->num_fds; i++) {
+        if (transport_path_matches_local(&path, &t->local_addrs[i])) {
+          pid = i;
+          break;
+        }
       }
-      int64_t relative_owd_ns = current_owd - tconn->min_owd_ns[pid];
-      uint32_t relative_owd_us = relative_owd_ns / 1000;
-      tconn->latest_owd_fp[pid] =
-          FP_FROM_INT(relative_owd_us) / 1000000; /* convert us to seconds */
-
-      tconn->last_telemetry_s_ns[pid] = s_ns;
-      tconn->last_telemetry_r_ns[pid] = r_ns;
     }
+    if (pid == SIZE_MAX)
+      return; /* A delayed reply may refer to a retired path. */
+    uint64_t s_ns = telemetry.send_time_ns, r_ns = telemetry.recv_time_ns;
+    if (s_ns > INT64_MAX || r_ns > INT64_MAX) {
+      t->stats.malformed_datagrams++;
+      tconn->malformed_datagrams++;
+      return;
+    }
+    if (tconn->owd_initialized[pid] &&
+        tconn->telemetry_path[pid] == telemetry.path_id &&
+        s_ns <= tconn->last_telemetry_s_ns[pid])
+      return; /* Do not let reordered replies move a newer baseline. */
+
+    /* Both operands are nonnegative signed values, so their difference fits.
+     * Subtract the baseline as unsigned to represent the full possible span. */
+    int64_t current = (int64_t)r_ns - (int64_t)s_ns;
+    uint64_t relative = 0;
+    if (!tconn->owd_initialized[pid] ||
+        tconn->telemetry_path[pid] != telemetry.path_id ||
+        current < tconn->min_owd_ns[pid]) {
+      tconn->min_owd_ns[pid] = current;
+    } else {
+      relative = (uint64_t)current - (uint64_t)tconn->min_owd_ns[pid];
+      /* Beyond ten seconds this is not a useful queue-delay sample. Treat it
+       * as a clock discontinuity and establish a fresh baseline. */
+      if (relative > UINT64_C(10000000000)) {
+        tconn->min_owd_ns[pid] = current;
+        relative = 0;
+      }
+    }
+    tconn->owd_initialized[pid] = true;
+    tconn->telemetry_path[pid] = telemetry.path_id;
+    tconn->latest_owd_fp[pid] = FP_FROM_INT(relative / 1000U) / 1000000;
+    tconn->last_telemetry_s_ns[pid] = s_ns;
+    tconn->last_telemetry_r_ns[pid] = r_ns;
     return;
   }
 
@@ -1110,6 +1146,13 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   moq_track_id_t resolved_track;
   if (transport_subscriptions_find_by_alias(&tconn->receive_subscriptions,
                                             track_id, &resolved_track) != 0) {
+    return;
+  }
+
+  if ((resolved_track.flags & MOQ_TRACK_FLAG_RELIABLE) != 0) {
+    t->stats.protocol_errors++;
+    quicly_close(conn, TRANSPORT_APP_ERROR_PROTOCOL,
+                 "protocol error: datagram on reliable track");
     return;
   }
 
@@ -1147,11 +1190,25 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   if (payload.len != QLINQ_WIRE_FEC_HEADER_SIZE + symbol_size)
     goto malformed_datagram;
 
-  bool rateless_data =
-      resolved_track.type == MOQ_TRACK_DATA &&
-      (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0;
-  transport_object_gap_state_t *object_state =
-      transport_object_gap(tconn, track_id);
+  bool rateless = (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0;
+  bool rateless_data = resolved_track.type == MOQ_TRACK_DATA && rateless;
+  transport_subscription_state_t *subscription_state =
+      transport_subscriptions_get_state(&tconn->receive_subscriptions,
+                                        track_id);
+  if (!subscription_state)
+    return;
+  uint64_t generation = subscription_state->generation;
+  transport_object_gap_state_t *object_state = &subscription_state->object_gap;
+  for (size_t i = 0; i < QLINQ_COMPLETED_OBJECTS; i++) {
+    if (tconn->completed_objects[i].active &&
+        tconn->completed_objects[i].alias == track_id &&
+        tconn->completed_objects[i].generation == generation &&
+        tconn->completed_objects[i].group_id == group_id &&
+        tconn->completed_objects[i].object_id == object_id) {
+      t->stats.fec_duplicate_objects_suppressed++;
+      return;
+    }
+  }
   if (rateless_data && object_was_delivered(object_state, object_id)) {
     t->stats.fec_duplicate_objects_suppressed++;
     return;
@@ -1222,6 +1279,15 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
                                            .object_id = asm_slot->object_id}};
         t->stats.fec_objects_lost++;
         transport_emit_event(tconn->transport, &ev);
+        /* A loss callback may unsubscribe and reuse this alias. Never retain
+         * state across that boundary without checking its lifetime. */
+        subscription_state = transport_subscriptions_get_state(
+            &tconn->receive_subscriptions, track_id);
+        if (!subscription_state ||
+            subscription_state->generation != generation ||
+            quicly_get_state(conn) >= QUICLY_STATE_CLOSING)
+          return;
+        object_state = &subscription_state->object_gap;
       }
     }
 
@@ -1292,9 +1358,10 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     } else {
       size_t parity_symbols = total_symbols - data_symbols;
       if (parity_symbols > 0) {
-        fec_type_t fec_type = rateless_data || total_symbols > 255
-                                  ? FEC_RAPTORQ
-                                  : FEC_REED_SOLOMON;
+        /* Match the sender's codec for every content type. DATA alone uses
+         * the additional gap tracking and recovery-checkpoint machinery. */
+        fec_type_t fec_type =
+            rateless || total_symbols > 255 ? FEC_RAPTORQ : FEC_REED_SOLOMON;
         fec_t *fec = transport_fec_cache_get(
             &t->fec_cache, fec_type, data_symbols, parity_symbols, symbol_size);
         if (fec) {
@@ -1330,6 +1397,13 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
                                          .size = original_size,
                                          .is_keyframe = (is_keyframe != 0),
                                          .priority = asm_slot->priority}};
+      size_t completed = tconn->completed_cursor;
+      tconn->completed_cursor = (completed + 1U) % QLINQ_COMPLETED_OBJECTS;
+      tconn->completed_objects[completed].active = true;
+      tconn->completed_objects[completed].alias = track_id;
+      tconn->completed_objects[completed].generation = generation;
+      tconn->completed_objects[completed].group_id = group_id;
+      tconn->completed_objects[completed].object_id = object_id;
       if (rateless_data) {
         mark_object_delivered(object_state, object_id);
         recovery_mark_delivered(tconn, track_id, group_id, object_id);

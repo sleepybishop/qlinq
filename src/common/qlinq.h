@@ -311,6 +311,9 @@ void qlinq_endpoint_close(qlinq_endpoint_t *endpoint);
 /* A publishing stream accepts records from the application. A subscribed
  * stream produces QLINQ_EVENT_RECORD events. Subscriptions created before
  * authentication are remembered and activated when a peer becomes ready. */
+/* One active stream per endpoint, direction, content type and name.
+ * Delivery mode is immutable; conflicting opens return NULL with STATE status.
+ * Publishers and subscribers for the same track must select the same mode. */
 qlinq_stream_t *qlinq_publish(qlinq_endpoint_t *endpoint,
                               const qlinq_stream_config_t *config);
 qlinq_stream_t *qlinq_subscribe(qlinq_endpoint_t *endpoint,
