@@ -25,8 +25,11 @@ static size_t vector_growth(const quicly_sendbuf_t *sb) {
                                            : 4;
 }
 
-bool transport_stream_can_accept(quicly_stream_t *stream, size_t frame_len,
-                                 bool preserve_control_reserve) {
+static bool stream_can_accept_reserved(quicly_stream_t *stream,
+                                       size_t frame_len,
+                                       bool preserve_control_reserve,
+                                       size_t *reserved_bytes,
+                                       size_t *reserved_vectors) {
   if (!stream || !stream->conn || !stream->data ||
       !quicly_sendstate_is_open(&stream->sendstate) ||
       quicly_get_state(stream->conn) >= QUICLY_STATE_CLOSING ||
@@ -55,12 +58,33 @@ bool transport_stream_can_accept(quicly_stream_t *stream, size_t frame_len,
   size_t bytes = frame_bytes + growth * sizeof(quicly_sendbuf_vec_t);
   size_t stream_bytes = ctx->retained_frame_bytes +
                         sb->vecs.capacity * sizeof(quicly_sendbuf_vec_t);
-  return sb->vecs.size < frame_limit && stream_bytes <= stream_limit &&
-         bytes <= stream_limit - stream_bytes &&
-         t->stats.stream_egress_bytes <= endpoint_limit &&
-         bytes <= endpoint_limit - t->stats.stream_egress_bytes &&
-         t->stats.stream_egress_vector_capacity <= vector_limit &&
-         growth <= vector_limit - t->stats.stream_egress_vector_capacity;
+  if (sb->vecs.size >= frame_limit || stream_bytes > stream_limit ||
+      bytes > stream_limit - stream_bytes ||
+      t->stats.stream_egress_bytes > endpoint_limit ||
+      *reserved_bytes > endpoint_limit - t->stats.stream_egress_bytes ||
+      bytes > endpoint_limit - t->stats.stream_egress_bytes - *reserved_bytes ||
+      t->stats.stream_egress_vector_capacity > vector_limit ||
+      *reserved_vectors >
+          vector_limit - t->stats.stream_egress_vector_capacity ||
+      growth > vector_limit - t->stats.stream_egress_vector_capacity -
+                   *reserved_vectors)
+    return false;
+  *reserved_bytes += bytes;
+  *reserved_vectors += growth;
+  return true;
+}
+
+bool transport_stream_can_accept(quicly_stream_t *stream, size_t frame_len,
+                                 bool preserve_control_reserve) {
+  size_t bytes = 0, vectors = 0;
+  return stream_can_accept_reserved(stream, frame_len, preserve_control_reserve,
+                                    &bytes, &vectors);
+}
+
+bool transport_stream_can_accept_batch(quicly_stream_t *stream,
+                                       size_t frame_len, size_t *bytes,
+                                       size_t *vectors) {
+  return stream_can_accept_reserved(stream, frame_len, true, bytes, vectors);
 }
 
 static quicly_error_t flatten_frame(quicly_sendbuf_vec_t *vec, void *dst,

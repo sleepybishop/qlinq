@@ -37,6 +37,11 @@ typedef struct {
  * enforce bounds atomically on the transport owner thread. */
 bool transport_stream_can_accept(quicly_stream_t *stream, size_t frame_len,
                                  bool preserve_control_reserve);
+/* Preflight one frame per distinct stream, accumulating endpoint budget for
+ * an owner-thread broadcast. Does not reserve or allocate actual storage. */
+bool transport_stream_can_accept_batch(quicly_stream_t *stream,
+                                       size_t frame_len, size_t *bytes,
+                                       size_t *vectors);
 /* Match exact frames still owned by the reliable stream. QUIC handles their
  * retransmission; application retries can enqueue again after ACK release. */
 bool transport_stream_has_retained_frame(quicly_stream_t *stream, uint8_t type,

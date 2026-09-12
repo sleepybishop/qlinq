@@ -102,7 +102,7 @@ bool transport_owner_ok(transport_t *t) {
   if (!t)
     return false;
   if (pthread_equal(t->owner_thread, pthread_self()))
-    return true;
+    return !t->log_callback_active;
   atomic_fetch_add_explicit(&t->cross_thread_violations, 1,
                             memory_order_relaxed);
   return false;
@@ -133,7 +133,9 @@ void transport_log(transport_t *t, transport_log_level_t level,
                                  .path_index = path_index,
                                  .message = message};
   if (t->log_callback) {
+    t->log_callback_active = true;
     t->log_callback(t->log_user_data, &event);
+    t->log_callback_active = false;
   } else if (level >= TRANSPORT_LOG_WARNING) {
     const char *name = level == TRANSPORT_LOG_ERROR ? "error" : "warning";
     if (connection_id != 0 && path_index != SIZE_MAX)
@@ -177,11 +179,14 @@ bool transport_queue_datagram(transport_conn_t *conn, size_t path_index,
   quicly_path_stats_t path_stats;
   if (!conn || !conn->quic || path_index >= TRANSPORT_MAX_QUIC_PATHS ||
       quicly_get_path_stats(conn->quic, path_index, &path_stats) != 0 ||
-      conn->queued_datagrams[path_index] >= QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY)
+      quicly_get_num_datagram_frames_path(conn->quic, path_index) >=
+          QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY)
     return false;
+  size_t before = quicly_get_num_datagram_frames_path(conn->quic, path_index);
   quicly_send_datagram_frames_path(conn->quic, path_index, &datagram, 1);
-  conn->queued_datagrams[path_index]++;
-  return true;
+  size_t after = quicly_get_num_datagram_frames_path(conn->quic, path_index);
+  conn->queued_datagrams[path_index] = (uint16_t)after;
+  return after == before + 1U;
 }
 
 typedef struct {
@@ -496,6 +501,8 @@ static void remove_connection_physical_slot(transport_t *t,
     for (size_t i = removed_index; i + 1 < t->num_fds; i++) {
       conn->path_states[i] = conn->path_states[i + 1];
       conn->min_owd_ns[i] = conn->min_owd_ns[i + 1];
+      conn->owd_initialized[i] = conn->owd_initialized[i + 1];
+      conn->telemetry_path[i] = conn->telemetry_path[i + 1];
       conn->latest_owd_fp[i] = conn->latest_owd_fp[i + 1];
       conn->last_telemetry_s_ns[i] = conn->last_telemetry_s_ns[i + 1];
       conn->last_telemetry_r_ns[i] = conn->last_telemetry_r_ns[i + 1];
@@ -504,6 +511,8 @@ static void remove_connection_physical_slot(transport_t *t,
     size_t last = t->num_fds - 1U;
     memset(&conn->path_states[last], 0, sizeof(conn->path_states[last]));
     conn->min_owd_ns[last] = 0;
+    conn->owd_initialized[last] = false;
+    conn->telemetry_path[last] = 0;
     conn->latest_owd_fp[last] = 0;
     conn->last_telemetry_s_ns[last] = 0;
     conn->last_telemetry_r_ns[last] = 0;
@@ -804,7 +813,7 @@ transport_t *transport_create(const transport_config_t *config) {
         config->handshake_timeout_rtt_multiplier;
 
   /* Setup CID encryptor to support active connection migration */
-  static char cid_key[16];
+  char cid_key[16];
   ptls_openssl_random_bytes(cid_key, sizeof(cid_key));
   t->quic_ctx.cid_encryptor = quicly_new_default_cid_encryptor(
       &ptls_openssl_quiclb, &ptls_openssl_aes128ecb, &ptls_openssl_sha256,
@@ -827,6 +836,15 @@ transport_t *transport_create(const transport_config_t *config) {
   if (config->quic_idle_timeout_ms != 0)
     t->quic_ctx.transport_params.max_idle_timeout =
         config->quic_idle_timeout_ms;
+  /* The parser consumes complete frames. Its receive window must include
+   * both headers as well as the largest advertised application record. */
+  t->quic_ctx.transport_params.max_stream_data.uni =
+      t->limits.max_reliable_object_size + QLINQ_WIRE_FRAME_HEADER_SIZE +
+      QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE;
+  if (t->quic_ctx.transport_params.max_stream_data.bidi_local <
+      t->quic_ctx.transport_params.max_stream_data.uni)
+    t->quic_ctx.transport_params.max_stream_data.bidi_local =
+        t->quic_ctx.transport_params.max_stream_data.uni;
   t->quic_ctx.transport_params.max_streams_uni = 100;
   t->quic_ctx.transport_params.max_streams_bidi = 100;
 
@@ -1492,8 +1510,15 @@ recovery_sweep_done:
   }
 
   size_t receive_budget = t->limits.max_packets_per_tick;
-  for (size_t fd_idx = 0; fd_idx < t->num_fds && receive_budget > 0; fd_idx++) {
-    while (receive_budget > 0) {
+  size_t receive_start = t->num_fds ? t->receive_cursor % t->num_fds : 0;
+  t->receive_cursor = t->num_fds ? (receive_start + 1U) % t->num_fds : 0;
+  size_t quantum =
+      t->num_fds ? (receive_budget + t->num_fds - 1U) / t->num_fds : 0;
+  for (size_t visited = 0; visited < t->num_fds && receive_budget > 0;
+       visited++) {
+    size_t fd_idx = (receive_start + visited) % t->num_fds;
+    size_t serviced = 0;
+    while (receive_budget > 0 && serviced < quantum) {
       uint8_t buf[2048];
       struct sockaddr_storage sa;
       socklen_t sa_len = sizeof(sa);
@@ -1503,9 +1528,12 @@ recovery_sweep_done:
         if (SOCKET_ERROR_CODE == SOCKET_EAGAIN ||
             SOCKET_ERROR_CODE == SOCKET_EWOULDBLOCK)
           break;
-        continue;
+        if (SOCKET_ERROR_CODE == SOCKET_EINTR)
+          continue;
+        break; /* A persistent socket error must not spin the owner thread. */
       }
       receive_budget--;
+      serviced++;
       t->udp_bytes_received[fd_idx] += (uint64_t)rret;
 
       struct sockaddr *psa = (struct sockaddr *)&sa;
@@ -1726,7 +1754,9 @@ recovery_sweep_done:
         size_t sent_path =
             transport_path_find_by_addresses(conn->quic, &src.sa, &dest.sa);
         if (sent_path < TRANSPORT_MAX_QUIC_PATHS)
-          conn->queued_datagrams[sent_path] = 0;
+          conn->queued_datagrams[sent_path] =
+              (uint16_t)quicly_get_num_datagram_frames_path(conn->quic,
+                                                            sent_path);
 
         size_t out_fd_index = SIZE_MAX;
         if (src.sa.sa_family == AF_INET) {
@@ -1837,6 +1867,10 @@ static bool subscribe_connection(transport_conn_t *conn,
       !quicly_sendstate_is_open(&conn->stream->sendstate))
     return false;
 
+  const track_subscription_t *existing = transport_subscriptions_find_const(
+      &conn->receive_subscriptions, track_id);
+  if (existing && existing->track_id.flags != track_id->flags)
+    return false;
   uint8_t alias;
   bool newly_added = false;
   if (transport_subscriptions_find_alias(&conn->receive_subscriptions, track_id,
@@ -2408,12 +2442,14 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
       continue;
 
-    if (!conn->authenticated)
+    if (!t->is_server && (!conn->authenticated || !conn->protocol_ready))
       return false;
-
-    if (t->is_server &&
-        !transport_subscriptions_contains(&conn->send_subscriptions, track_id))
+    if (!transport_publish_recipient_eligible(t, conn, track_id))
       continue;
+    const track_subscription_t *mode =
+        transport_subscriptions_find_const(&conn->send_subscriptions, track_id);
+    if (mode && mode->track_id.flags != track_id->flags)
+      return false;
 
     if (profile.reliable) {
       const track_subscription_t *subscription =
@@ -2433,6 +2469,8 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
       }
     } else {
       for (size_t p = 0; p < TRANSPORT_MAX_QUIC_PATHS; p++) {
+        conn->queued_datagrams[p] =
+            (uint16_t)quicly_get_num_datagram_frames_path(conn->quic, p);
         if (conn->queued_datagrams[p] >=
             QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY * 3 / 4) {
           all_ready = false;
@@ -2528,6 +2566,9 @@ size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
       fds[count].revents = 0;
       count++;
     }
+  }
+  if (t->ifmon_pipe[0] >= 0 && count < max_fds) {
+    fds[count++] = (struct pollfd){.fd = t->ifmon_pipe[0], .events = POLLIN};
   }
   return count;
 }

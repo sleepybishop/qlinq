@@ -570,7 +570,13 @@ int main(void) {
       return 1;
     }
   }
-  if (!transport_finish_track(server, checkpoint_track)) {
+  retries = 500;
+  while (!transport_finish_track(server, checkpoint_track) && retries-- > 0) {
+    transport_tick(server);
+    transport_tick(client);
+    usleep(1000);
+  }
+  if (retries <= 0) {
     fprintf(stderr, "checkpoint track completion failed\n");
     transport_destroy(client);
     transport_destroy(server);

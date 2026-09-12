@@ -129,10 +129,13 @@ bool transport_subscriptions_add(transport_subscription_table_t *table,
   for (size_t i = 0; i < table->capacity; i++) {
     track_subscription_t *entry = &table->entries[i];
     if (entry->active && track_matches(&entry->track_id, type, name)) {
+      if (entry->track_id.flags != flags)
+        return false; /* An active subscription has one immutable mode. */
       if (entry->alias != alias) {
         table->states[alias] = table->states[entry->alias];
         table->states[entry->alias] = NULL;
         memset(table->states[alias], 0, sizeof(*table->states[alias]));
+        table->states[alias]->generation = ++table->next_generation;
       }
       entry->alias = alias;
       entry->track_id.flags = flags;
@@ -145,6 +148,7 @@ bool transport_subscriptions_add(transport_subscription_table_t *table,
       transport_subscription_state_t *state = calloc(1, sizeof(*state));
       if (!state)
         return false;
+      state->generation = ++table->next_generation;
       table->states[alias] = state;
       memset(entry, 0, sizeof(*entry));
       entry->track_id.type = type;
@@ -214,14 +218,15 @@ int transport_subscriptions_next_alias(
     const transport_subscription_table_t *table, int first_dynamic_alias) {
   if (!table || first_dynamic_alias < 0 || first_dynamic_alias > UINT8_MAX)
     return -1;
-  int next = first_dynamic_alias;
-  for (size_t i = 0; i < table->capacity; i++) {
-    const track_subscription_t *entry = &table->entries[i];
-    if (entry->active && entry->alias >= next) {
-      if (entry->alias == UINT8_MAX)
-        return -1;
-      next = entry->alias + 1;
-    }
+  for (int alias = first_dynamic_alias; alias <= UINT8_MAX; alias++) {
+    bool used = false;
+    for (size_t i = 0; i < table->capacity; i++)
+      if (table->entries[i].active && table->entries[i].alias == alias) {
+        used = true;
+        break;
+      }
+    if (!used)
+      return alias;
   }
-  return next;
+  return -1;
 }

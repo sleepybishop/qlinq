@@ -18,9 +18,9 @@
 static transport_publish_result_t
 transport_publish_impl(transport_t *t, const moq_object_t *obj);
 
-static bool transport_publish_recipient_eligible(const transport_t *t,
-                                                 const transport_conn_t *conn,
-                                                 const moq_track_id_t *track) {
+bool transport_publish_recipient_eligible(const transport_t *t,
+                                          const transport_conn_t *conn,
+                                          const moq_track_id_t *track) {
   return t && conn && track && conn->quic && conn->protocol_ready &&
          conn->authenticated &&
          quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
@@ -132,7 +132,7 @@ static transport_publish_result_t publish_datagram_to_conn(
                                                 t->num_fds, physical);
     if (mapped >= TRANSPORT_MAX_QUIC_PATHS ||
         ++needed[mapped] > QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY ||
-        conn->queued_datagrams[mapped] >
+        quicly_get_num_datagram_frames_path(conn->quic, mapped) >
             QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - needed[mapped]) {
       transport_arena_reset(&t->arena);
       return TRANSPORT_PUBLISH_BACKPRESSURE;
@@ -519,6 +519,16 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
       (obj->size > 0 && !obj->data))
     return TRANSPORT_PUBLISH_INVALID;
 
+  size_t recipients = t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
+  for (size_t i = 0; i < recipients; i++) {
+    transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
+    if (!transport_publish_recipient_eligible(t, conn, &obj->track_id))
+      continue;
+    const track_subscription_t *sub = transport_subscriptions_find_const(
+        &conn->send_subscriptions, &obj->track_id);
+    if (sub && sub->track_id.flags != obj->track_id.flags)
+      return TRANSPORT_PUBLISH_INVALID;
+  }
   size_t fec_limit = publication_fec_limit(t, &obj->track_id);
 
   /* route to grouping buffer if it's data and we're not flushing */
@@ -636,75 +646,53 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
       return TRANSPORT_PUBLISH_INVALID;
     size_t active_count =
         t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
-    size_t eligible = 0;
-    size_t delivered = 0;
-    bool failed = false, blocked = false;
-    for (size_t i = 0; i < active_count; ++i) {
+    size_t eligible = 0, reserved_bytes = 0, reserved_vectors = 0;
+    /* Preflight every recipient before writing any frame. A full stream or
+     * endpoint budget is retryable without duplicating earlier recipients. */
+    for (size_t i = 0; i < active_count; i++) {
       transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
-      if (!conn || !conn->quic || !conn->protocol_ready ||
-          !conn->authenticated ||
-          quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
+      if (!transport_publish_recipient_eligible(t, conn, &obj->track_id))
         continue;
-      if (t->is_server && !transport_subscriptions_contains(
-                              &conn->send_subscriptions, &obj->track_id))
-        continue;
+      if (obj->size > conn->negotiated_limits.max_reliable_object_size)
+        return TRANSPORT_PUBLISH_INVALID;
       eligible++;
-      if (obj->size > conn->negotiated_limits.max_reliable_object_size) {
-        failed = true;
-        continue;
-      }
-
       track_subscription_t *sub = transport_subscriptions_find(
           &conn->send_subscriptions, &obj->track_id);
+      quicly_stream_t *stream = conn->stream;
+      size_t frame_len = QLINQ_WIRE_FRAME_HEADER_SIZE + obj->size;
       if (sub) {
         if (!sub->stream ||
             !quicly_sendstate_is_open(&sub->stream->sendstate)) {
           sub->stream = NULL;
-          int err = quicly_open_stream(conn->quic, &sub->stream,
-                                       1); /* 1 = unidirectional */
-          if (err == 0 && sub->stream) {
-            quicly_debug_printf(conn->quic,
-                                "Opened QUIC Stream %" PRIu64
-                                " for MoQ track alias %d",
-                                sub->stream->stream_id, sub->alias);
-          } else {
+          int err = quicly_open_stream(conn->quic, &sub->stream, 1);
+          if (err != 0 || !sub->stream) {
             transport_log(t, TRANSPORT_LOG_ERROR, "stream", conn->id, SIZE_MAX,
                           "failed to open reliable track stream: %d", err);
-            failed = true;
-            continue;
+            return TRANSPORT_PUBLISH_ERROR;
           }
         }
-
-        if (!transport_stream_can_accept(
-                sub->stream,
-                QLINQ_WIRE_FRAME_HEADER_SIZE +
-                    QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE + obj->size,
-                true)) {
-          blocked = true;
-          continue;
-        }
-        uint8_t alias = sub->alias;
-        if (!transport_stream_write_object_frame(sub->stream, alias, obj)) {
-          failed = true;
-          continue;
-        }
-      } else {
-        if (!transport_stream_can_accept(
-                conn->stream, QLINQ_WIRE_FRAME_HEADER_SIZE + obj->size, true)) {
-          blocked = true;
-          continue;
-        }
-        if (!transport_send_unicast(t, conn, obj->data, obj->size)) {
-          failed = true;
-          continue;
-        }
+        stream = sub->stream;
+        frame_len += QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE;
       }
+      if (!transport_stream_can_accept_batch(stream, frame_len, &reserved_bytes,
+                                             &reserved_vectors))
+        return TRANSPORT_PUBLISH_BACKPRESSURE;
+    }
+    size_t delivered = 0;
+    for (size_t i = 0; i < active_count; i++) {
+      transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
+      if (!transport_publish_recipient_eligible(t, conn, &obj->track_id))
+        continue;
+      track_subscription_t *sub = transport_subscriptions_find(
+          &conn->send_subscriptions, &obj->track_id);
+      bool written =
+          sub ? transport_stream_write_object_frame(sub->stream, sub->alias,
+                                                    obj)
+              : transport_send_unicast(t, conn, obj->data, obj->size);
+      if (!written) /* Allocation failure after preflight remains explicit. */
+        return delivered ? TRANSPORT_PUBLISH_PARTIAL : TRANSPORT_PUBLISH_ERROR;
       delivered++;
     }
-    if (failed || blocked)
-      return delivered > 0 ? TRANSPORT_PUBLISH_PARTIAL
-             : failed      ? TRANSPORT_PUBLISH_ERROR
-                           : TRANSPORT_PUBLISH_BACKPRESSURE;
     return eligible == 0 ? TRANSPORT_PUBLISH_NO_RECIPIENTS
                          : TRANSPORT_PUBLISH_DELIVERED;
   }

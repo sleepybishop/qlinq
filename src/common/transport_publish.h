@@ -4,6 +4,10 @@
 #include "transport_internal.h"
 #include "transport_wire.h"
 
+bool transport_publish_recipient_eligible(const transport_t *t,
+                                          const transport_conn_t *conn,
+                                          const moq_track_id_t *track);
+
 bool transport_publish_recovery_ready(transport_t *t,
                                       const moq_track_id_t *track_id);
 

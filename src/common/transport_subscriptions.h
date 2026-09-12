@@ -17,6 +17,7 @@ typedef struct {
 typedef struct {
   track_subscription_t *entries;
   size_t capacity;
+  uint64_t next_generation;
   transport_subscription_state_t *states[UINT8_MAX + 1U];
 } transport_subscription_table_t;
 
