@@ -58,9 +58,8 @@ typedef enum {
 #define QLINQ_WIRE_CAP_KNOWN                                                   \
   (QLINQ_WIRE_CAP_RELIABLE | QLINQ_WIRE_CAP_DATAGRAM |                         \
    QLINQ_WIRE_CAP_FEC_REED_SOLOMON | QLINQ_WIRE_CAP_FEC_RATELESS |             \
-   QLINQ_WIRE_CAP_MULTIPATH | QLINQ_WIRE_CAP_AUTHENTICATION |                 \
-   QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS |                                      \
-   QLINQ_WIRE_CAP_RATELESS_REPAIR)
+   QLINQ_WIRE_CAP_MULTIPATH | QLINQ_WIRE_CAP_AUTHENTICATION |                  \
+   QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS | QLINQ_WIRE_CAP_RATELESS_REPAIR)
 
 typedef enum {
   QLINQ_WIRE_DATAGRAM_FEC = 1,
