@@ -211,6 +211,31 @@ find_recovery_window(transport_object_gap_state_t *state, uint64_t group_id,
   return NULL;
 }
 
+static void retire_recovery_through(transport_conn_t *conn, uint8_t alias,
+                                    uint64_t group_id,
+                                    uint64_t final_object_id) {
+  if (!conn || !conn->transport)
+    return;
+  transport_t *t = conn->transport;
+  transport_object_gap_state_t *gap = transport_object_gap(conn, alias);
+  if (gap && gap->pending_mask != 0 && gap->group_id == group_id &&
+      gap->pending_base <= final_object_id) {
+    uint64_t distance = final_object_id - gap->pending_base;
+    uint32_t covered = distance >= 31U
+                           ? UINT32_MAX
+                           : (UINT32_C(1) << (uint32_t)(distance + 1U)) - 1U;
+    gap->pending_mask &= ~covered;
+  }
+  for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++) {
+    frame_assembler_t *assembler = &conn->assemblers[i];
+    if (assembler->total_symbols > 0 && assembler->track_id == alias &&
+        assembler->group_id == group_id &&
+        assembler->object_id <= final_object_id) {
+      transport_release_assembler(t, assembler);
+    }
+  }
+}
+
 static bool acknowledge_completed_recovery_windows(transport_conn_t *conn,
                                                    uint8_t alias) {
   transport_object_gap_state_t *state = transport_object_gap(conn, alias);
@@ -228,6 +253,10 @@ static bool acknowledge_completed_recovery_windows(transport_conn_t *conn,
     if (!send_checkpoint_ack(conn, alias, first->group_id,
                              first->final_object_id))
       return false;
+    /* The cumulative ACK retires redundant gaps and partial duplicate objects
+     * before the source releases its repair cache. */
+    retire_recovery_through(conn, alias, first->group_id,
+                            first->final_object_id);
     memset(first, 0, sizeof(*first));
   }
 }
@@ -732,12 +761,15 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
           bool outstanding = false;
           for (size_t i = 0; i < QLINQ_RECOVERY_MAX_WINDOWS; i++)
             outstanding |= gap->recovery_windows[i].active;
-          if (!outstanding &&
-              !send_checkpoint_ack(conn, end.alias, end.group_id,
-                                   end.final_object_id)) {
-            quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
-                         "protocol error: completion ACK failed");
-            break;
+          if (!outstanding) {
+            if (!send_checkpoint_ack(conn, end.alias, end.group_id,
+                                     end.final_object_id)) {
+              quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
+                           "protocol error: completion ACK failed");
+              break;
+            }
+            retire_recovery_through(conn, end.alias, end.group_id,
+                                    end.final_object_id);
           }
           t->stats.track_ends_received++;
           quicly_streambuf_ingress_shift(stream, frame.consumed);
@@ -947,13 +979,6 @@ bool transport_protocol_send_nack(transport_conn_t *conn, uint8_t alias,
   if (rateless ? (!whole_object && (count == 0 || missing != NULL))
                : (!whole_object && (count == 0 || missing == NULL)))
     return false;
-  int64_t now = transport_get_time_ms();
-  if (!transport_repair_limiter_take(
-          &conn->nack_request_limiter,
-          conn->transport->limits.max_repair_requests_per_second, now)) {
-    conn->transport->stats.repair_requests_deferred++;
-    return false;
-  }
   size_t payload_len = 20U + (rateless ? 0U : (size_t)count * 2U);
   uint8_t static_buf[1024];
   uint8_t *buf = static_buf;
@@ -970,17 +995,35 @@ bool transport_protocol_send_nack(transport_conn_t *conn, uint8_t alias,
     flags |= QLINQ_WIRE_NACK_RATELESS;
   if (qlinq_wire_encode_nack(buf, payload_len, alias, flags, group_id,
                              object_id, missing, count,
-                             &written) == QLINQ_WIRE_OK &&
-      transport_stream_write_frame(conn->stream, QLINQ_WIRE_NACK, buf,
-                                   written)) {
-    conn->transport->stats.repair_requests_sent++;
-    if (rateless)
-      conn->transport->stats.repair_rateless_requests_sent++;
-    else
-      conn->transport->stats.repair_indexed_requests_sent++;
-    if (whole_object)
-      conn->transport->stats.repair_whole_object_requests_sent++;
-    sent = true;
+                             &written) == QLINQ_WIRE_OK) {
+    if (transport_stream_has_retained_frame(conn->stream, QLINQ_WIRE_NACK, buf,
+                                            written)) {
+      /* QUIC owns retransmission until this exact request is released. A
+       * later application retry can recover a lost repair response. */
+      conn->transport->stats.repair_requests_coalesced++;
+      sent = true;
+    } else if (!transport_stream_can_accept(
+                   conn->stream, QLINQ_WIRE_FRAME_HEADER_SIZE + written,
+                   true)) {
+      /* Recovery timers retain the missing objects and retry after pressure
+       * clears. Preserve essential control capacity without spending tokens. */
+      conn->transport->stats.repair_requests_deferred++;
+    } else if (!transport_repair_limiter_take(
+                   &conn->nack_request_limiter,
+                   conn->transport->limits.max_repair_requests_per_second,
+                   transport_get_time_ms())) {
+      conn->transport->stats.repair_requests_deferred++;
+    } else if (transport_stream_write_frame(conn->stream, QLINQ_WIRE_NACK, buf,
+                                            written)) {
+      conn->transport->stats.repair_requests_sent++;
+      if (rateless)
+        conn->transport->stats.repair_rateless_requests_sent++;
+      else
+        conn->transport->stats.repair_indexed_requests_sent++;
+      if (whole_object)
+        conn->transport->stats.repair_whole_object_requests_sent++;
+      sent = true;
+    }
   }
 
   if (buf != static_buf) {

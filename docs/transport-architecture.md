@@ -13,7 +13,7 @@ types and the wire codec.
 | `transport_publish.c` | Reliable/datagram publication, FEC generation, and grouped data flushes |
 | `transport_tracks.c` | Small delivery-class validation and profile derivation |
 | `transport_wire.c` | Versioned, bounded byte-level encoding and decoding |
-| `transport_stream.c` | Atomic stream-frame construction and emission |
+| `transport_stream.c` | Bounded retained stream frames and QUIC acknowledgement accounting |
 | `transport_subscriptions.c` | Track/alias lookup, allocation, and stream binding |
 | `transport_memory.c` | Packet arena and FEC assembler allocation ownership |
 | `transport_fec_state.c` | Reusable FEC contexts and sent-object repair cache |
@@ -33,9 +33,15 @@ handles.
 
 - `transport_memory` initializes and destroys arenas and frame assemblers.
 - `transport_subscriptions` is the only code that allocates aliases or changes
-  subscription entries.
+  subscription entries. Send and receive directions have independent alias
+  namespaces and subscription limits, so unsubscribing from incoming data does
+  not stop publication to a peer. Gap and checkpoint state is allocated only
+  for active subscriptions and released on removal or disconnect.
 - `transport_fec_state` owns cached FEC instances and copies of sent objects.
 - `transport_stream` emits complete frames in one Quicly egress operation.
+  Retained allocations include frame payloads, ownership headers, and vector
+  capacity. Partial ACKs keep the entire frame charged until QUIC releases it;
+  unused vector capacity is compacted as frames drain.
 - `transport_egress` copies any QUIC packets not accepted immediately by the
   kernel. Quicly is not asked for another batch unless every possible output
   socket has room for one complete batch.
@@ -48,7 +54,11 @@ handles.
   Rejected growth preserves partial data; reusing existing capacity requires
   no additional allocation allowance.
 - NACK handling sends at most 64 requested symbols per repair and accepts at
-  most 16 repair requests per connection per second.
+  most 16 repair requests per connection per second. An exact NACK is coalesced
+  while its reliable frame remains retained, including partial ACKs and later
+  ACKed ranges behind a missing prefix. Once released, a lost repair response
+  can trigger another request. Queue pressure defers NACKs without spending
+  rate tokens or consuming essential-control reserves.
 - Event payload pointers are borrowed and valid only during the callback.
 - The creating thread owns a transport. Callbacks run synchronously on that
   thread and may call non-driving APIs; recursive ticks, callback destruction,
@@ -59,6 +69,22 @@ handles.
 `transport_publish_ex` distinguishes delivery, buffering, no recipients,
 partial delivery, backpressure, invalid input, and internal failure. The legacy
 boolean wrapper returns false for partial delivery and all failures.
+Reliable publication reports backpressure when retained storage is full.
+`max_stream_egress_bytes` defaults to 2 MiB per stream and
+`max_total_stream_egress_bytes` to 16 MiB per transport. Hard bounds also limit
+retained frames to 256 per stream and vector capacity to 8,192 per transport.
+Application data and retryable NACKs leave 64 KiB and 16 frames available on a
+control stream, plus 2 MiB and 256 vector slots across the transport, for
+essential control. Exhausting essential-control capacity closes the connection
+with a resource-limit error. Configuration must accommodate one maximum-sized
+reliable object plus control space.
+
+Datagram publication checks the smallest negotiated FEC object limit among
+eligible receivers before accepting a record into a group or emitting data.
+Grouped records include their two-byte length prefixes in this limit. Short
+objects use smaller FEC symbols instead of padding every symbol to the maximum
+UDP payload. Received objects preserve the subscribed track flags; applications
+recognize grouped FEC data when either FEC flag is present.
 
 Finite rateless publishers call `transport_finish_track` after their final
 application record. Publication assigns internal FEC object IDs, emits a
@@ -66,13 +92,24 @@ rolling checkpoint every 32 objects, and sends a reliable completion
 watermark. Receivers keep at most eight missing-window bitmaps and retry one
 absent object at a time. Cumulative ACKs release source repair-cache entries;
 if eight windows remain unacknowledged, publication reports backpressure rather
-than evicting recoverable objects.
+than evicting recoverable objects. The source cache also has a configurable
+`max_recovery_cache_bytes` payload budget, defaulting to 16 MiB, and admits new
+objects only when both byte and entry limits can be met without evicting
+protected objects. Configuration must hold a maximum FEC object and one
+32-object recovery window at the grouped publication size. Completed cumulative
+checkpoints and repeated final watermarks retire obsolete receiver gaps and
+partial objects through the acknowledged object ID, preserving other groups,
+tracks, and later objects.
 
 `transport_get_stats` reports protocol errors, handshake and reconnect counts,
 publication outcomes, FEC and repair pressure, thread-contract violations, UDP
 would-block/errors, and current/peak egress occupancy.
 `transport_get_conn_stats` adds stable connection IDs, negotiated limits,
-authentication state, subscriptions, and receive counters.
+authentication state, total active subscriptions across both directions, and
+receive counters. Stream statistics include retained bytes, frames, vector
+capacity, their peaks, blocked writes, and control failures. Cache statistics
+include current and peak payload bytes and entry counts; repair counters
+separate coalesced requests from deferred requests.
 Checkpoint, completion, ACK, cache-release, cache-backpressure, pending-window,
 and oldest-unacknowledged-age counters expose bounded recovery behavior.
 

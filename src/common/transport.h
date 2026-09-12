@@ -160,7 +160,7 @@ typedef void (*transport_callback_t)(void *user_data,
 
 typedef struct {
   size_t max_connections;
-  size_t max_subscriptions_per_connection;
+  size_t max_subscriptions_per_connection; /* independently in each direction */
   size_t max_assemblers_per_connection;
   size_t max_repair_requests_per_second;
   size_t max_aggregate_repair_requests_per_second;
@@ -171,8 +171,8 @@ typedef struct {
   size_t max_recovery_cache_bytes;
   /* Frame allocations and send-vector capacity retained until QUIC releases
    * them. */
-  size_t max_stream_egress_bytes;
-  size_t max_total_stream_egress_bytes;
+  size_t max_stream_egress_bytes; /* retained frames and vector capacity */
+  size_t max_total_stream_egress_bytes; /* shared across all connections */
   size_t max_reliable_object_size;
   size_t max_fec_object_size;
   size_t max_udp_payload_size;
@@ -357,6 +357,7 @@ typedef struct {
   uint64_t repair_requests_sent;
   uint64_t repair_indexed_requests_sent;
   uint64_t repair_rateless_requests_sent;
+  uint64_t repair_requests_coalesced;
   uint64_t repair_requests_deferred;
   uint64_t repair_whole_object_requests_sent;
   uint64_t repair_symbols_sent;
@@ -405,7 +406,7 @@ typedef struct {
   bool quic_ready;
   bool protocol_ready;
   bool authenticated;
-  size_t subscriptions;
+  size_t subscriptions; /* active send plus receive subscriptions */
   uint32_t peer_capabilities;
   transport_limits_t negotiated_limits;
   uint64_t stream_frames_received;

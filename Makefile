@@ -208,7 +208,7 @@ soak: t/00util/test_operational t/00util/test_transport \
 	t/00util/test_multipath_nack gencerts
 	./scripts/operational_soak.sh
 
-release-check: t/00util/test_stream_budget t/00util/test_directional_subscriptions t/00util/test_publication_limits check-submodules
+release-check: check-submodules
 	$(MAKE) clean
 	$(MAKE) check
 	$(MAKE) fuzz-wire
@@ -254,7 +254,7 @@ clean:
 		deps/nanors/deps/obl/oblas_common.d \
 		deps/nanors/deps/obl/oblas_lite.d
 
-check: t/00util/test_interleaved_receive t/00util/test_transport_bind t/00util/test_egress_errors qlinqd qlinq-app qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_reliable_bidirectional t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls gencerts
+check: t/00util/test_stream_budget t/00util/test_directional_subscriptions t/00util/test_publication_limits t/00util/test_interleaved_receive t/00util/test_transport_bind t/00util/test_egress_errors qlinqd qlinq-app qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_reliable_bidirectional t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls gencerts
 	prove -I. -v t/*.t
 
 t/assets/server.crt t/assets/server.key &:

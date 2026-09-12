@@ -152,14 +152,14 @@ struct transport_conn_t {
  * must resolve the alias before accessing it; unknown wire aliases are rejected
  * by the protocol parser and never cause an allocation. */
 static inline transport_object_gap_state_t *
-transport_object_gap(transport_conn_t *conn, uint8_t alias) {
+transport_object_gap(const transport_conn_t *conn, uint8_t alias) {
   transport_subscription_state_t *state =
       transport_subscriptions_get_state(&conn->receive_subscriptions, alias);
   return state ? &state->object_gap : NULL;
 }
 
 static inline transport_checkpoint_ack_state_t *
-transport_checkpoint_ack(transport_conn_t *conn, uint8_t alias) {
+transport_checkpoint_ack(const transport_conn_t *conn, uint8_t alias) {
   transport_subscription_state_t *state =
       transport_subscriptions_get_state(&conn->send_subscriptions, alias);
   return state ? &state->checkpoint_ack : NULL;
