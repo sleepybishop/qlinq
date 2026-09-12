@@ -2,6 +2,7 @@
 qlinqd
 qlinq-app
 qlinq-tund
+qlinq-tun
 libqlinq.a
 t/00util/test_fec
 t/00util/test_transport
@@ -63,7 +64,6 @@ t/00util/test_stream_budget
 
 /t/00util/test_qlinq_delivery
 /t/00util/test_qlinq_event_ownership
-/t/00util/test_setup_pto
 /t/00util/test_qlinq_event_overflow
 /t/00util/test_qlinq_compat
 /t/00util/test_qlinq_reconnect

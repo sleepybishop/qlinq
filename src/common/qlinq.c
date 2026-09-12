@@ -647,7 +647,6 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
   transport_config.handshake_timeout_rtt_multiplier =
       config->handshake_timeout_rtt_multiplier;
   transport_config.initial_rtt_ms = config->initial_rtt_ms;
-  transport_config.max_handshake_pto_ms = config->max_handshake_pto_ms;
   transport_config.reconnect_enabled = config->reconnect_enabled;
   transport_config.reconnect_initial_delay_ms =
       config->reconnect_initial_delay_ms;

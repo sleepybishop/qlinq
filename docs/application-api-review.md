@@ -14,9 +14,3 @@ finite-transfer stream lifecycle. FEC DATA records use the existing transport
 format instead of the qtak wrapper's private metadata envelope, preserving
 interoperability with `transport.h` applications. The wrapper does not strip
 payload bytes that resemble that envelope.
-
-The setup PTO ceiling is backed by a small local Quicly change. Unlike the
-source's post-authentication-frame heuristic, the accepting peer clears its
-ceiling when the reliable authentication response is acknowledged, including
-quiet sessions with no subsequent application control frame. Capped retries
-saturate their exponent safely; zero retains unbounded exponential backoff.

@@ -132,9 +132,6 @@ typedef struct {
   uint32_t handshake_timeout_rtt_multiplier;
   /* Initial QUIC RTT estimate in milliseconds. Zero keeps Quicly's default. */
   uint32_t initial_rtt_ms;
-  /* Optional ceiling for exponentially backed-off PTOs through authenticated
-   * setup. Zero keeps unbounded backoff; ordinary traffic is uncapped. */
-  uint32_t max_handshake_pto_ms;
   bool reconnect_enabled;
   uint32_t reconnect_initial_delay_ms;
   uint32_t reconnect_max_delay_ms;

@@ -95,12 +95,8 @@ prefixes; no extra wrapper-header allowance is needed.
 ## Timing, lifecycle and threading
 
 Endpoint timing configuration includes `receive_object_timeout_ms`,
-`initial_rtt_ms`, `handshake_timeout_rtt_multiplier`, and
-`max_handshake_pto_ms`. The first defaults to 2000 ms; zero for the other fields
-keeps the underlying default. The optional PTO ceiling bounds exponential
-backoff during authenticated setup. The connecting peer clears it on a
-successful authentication response; the listener clears it once QUIC
-acknowledges that response. Loss-detection and idle timers are unchanged.
+`initial_rtt_ms`, and `handshake_timeout_rtt_multiplier`. The first defaults
+to 2000 ms; zero for the other fields keeps the underlying default.
 
 `qlinq_endpoint_shutdown` begins an orderly connection shutdown and stops
 reconnect. Continue servicing until `qlinq_endpoint_is_drained`, subject to an

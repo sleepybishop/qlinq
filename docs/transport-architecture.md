@@ -44,11 +44,7 @@ and deferred aggregate-budget retries.
 `initial_rtt_ms` sets Quicly's initial RTT estimate, and
 `handshake_timeout_rtt_multiplier` sets its handshake timeout in RTT multiples.
 Zero preserves each Quicly default. Neither changes the configured QUIC idle
-timeout. `max_handshake_pto_ms` optionally bounds setup PTO backoff; zero
-keeps it unbounded. The initiator clears the ceiling on authentication success;
-the accepting peer clears it once QUIC acknowledges its authentication response.
-The Quicly dependency implements the ceiling for every path and saturates high
-PTO exponents safely.
+timeout.
 
 `transport_close_conn_with_error` accepts zero or a tagged
 `QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE` value and an optional reason.

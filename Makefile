@@ -125,7 +125,7 @@ t/%.o: t/%.c
 deps/%.o: deps/%.c
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -w -c $< -o $@
 
-all: qlinqd qlinq-app qlinq-tund
+all: qlinqd qlinq-app qlinq-tund qlinq-tun
 
 libqlinq.a: $(TRANSPORT_OBJS)
 	$(AR) rcs $@ $(TRANSPORT_OBJS)
@@ -136,9 +136,11 @@ qlinqd: $(DAEMON_OBJS)
 qlinq-app: $(APP_OBJS) libqlinq.a
 	$(CC) -o $@ $(APP_OBJS) libqlinq.a $(LDFLAGS)
 
-qlinq-tund: src/host/linux/tund.c
-	$(CC) $(CFLAGS_COMMON) $(INCLUDES) $(CFLAGS) -o $@ src/host/linux/tund.c \
-		$(LDFLAGS)
+qlinq-tund: src/host/linux/tund.o src/host/linux/tun_device.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+qlinq-tun: src/host/linux/tun_direct.o src/host/linux/tun_device.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS)
 
 examples/data_multipath_benchmark: examples/data_multipath_benchmark.o $(COMMON_OBJS)
 	$(CC) -o $@ examples/data_multipath_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
@@ -174,8 +176,6 @@ t/00util/test_qlinq_delivery: t/00util/test_qlinq_delivery.o libqlinq.a
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 t/00util/test_qlinq_event_ownership: t/00util/test_qlinq_event_ownership.o libqlinq.a
-	$(CC) -o $@ $^ $(LDFLAGS)
-
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 t/00util/test_generic_ports: t/00util/test_generic_ports.o $(COMMON_OBJS)
@@ -267,6 +267,22 @@ benchmark: t/00util/test_benchmark
 benchmark-rateless: t/00util/test_rateless_benchmark
 	./t/00util/test_rateless_benchmark
 
+CHECK_BINARIES = t/00util/test_fec \
+	t/00util/test_egress_errors t/00util/test_transport_bind \
+	t/00util/test_interleaved_receive t/00util/test_publication_limits \
+	t/00util/test_directional_subscriptions \
+	t/00util/test_qlinq_event_overflow t/00util/test_qlinq_compat \
+	t/00util/test_qlinq_reconnect t/00util/test_qlinq_delivery \
+	t/00util/test_qlinq_event_ownership t/00util/test_generic_ports \
+	t/00util/test_stream_budget t/00util/test_transport \
+	t/00util/test_reliable_bidirectional t/00util/test_tund \
+	t/00util/test_data_uds t/00util/test_transport_wire \
+	t/00util/test_transport_components t/00util/test_multipath \
+	t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls
+
+check: all $(CHECK_BINARIES) gencerts
+	prove -I. -v t/*.t
+
 clean: 
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete
@@ -274,8 +290,6 @@ clean:
 		$(PATHFLOW_OBJS:.o=.d) deps/nanors/rs.d \
 		deps/nanors/deps/obl/oblas_common.d \
 		deps/nanors/deps/obl/oblas_lite.d
-
-	prove -I. -v t/*.t
 
 t/assets/server.crt t/assets/server.key &:
 	mkdir -p t/assets

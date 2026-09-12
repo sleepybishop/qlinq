@@ -20,12 +20,14 @@ git submodule update --init --recursive
 make
 ```
 
-This produces three binaries and an embeddable transport library:
+This produces four binaries and an embeddable transport library:
 
 - `qlinqd`: The background peer-to-peer network daemon.
 - `qlinq-app`: A direct `transport.h` file/stream sender and receiver that does
   not use the daemon's Unix data socket.
 - `qlinq-tund`: The lightweight virtual TUN/TAP interface controller.
+- `qlinq-tun`: An opt-in direct unicast TUN helper using the native `qlinq.h`
+  API, without `qlinqd` or a Unix data socket.
 - `libqlinq.a`: The in-process `transport.h` API used by `qlinq-app`, plus the
   [native application API](docs/application-api.md) in `qlinq.h` for named
   streams, owned events and endpoint management.
@@ -51,6 +53,35 @@ IPv6 bracketed peer endpoints, negotiated repair selection, an explicit QUIC
 idle timeout, machine-readable counter snapshots, and `--pv` for pv-style wire
 throughput per physical interface. Run `qlinq-app --help` for the complete
 interface.
+
+## Direct packet tunnel (prototype)
+
+`qlinq-tun` maps each IP packet to one `QLINQ_CONTENT_DATA` record and
+publishes/subscribes to the same named stream in opposite directions. Both
+peers must choose the same `--track` and `--mode` (default `fixed-fec`). The
+listener is limited to one peer; the connecting side reconnects automatically.
+For a real interface, configure the TUN as root and use `--run-as USER` to drop
+privileges before the network endpoint starts. Create a dedicated unprivileged
+`qlinq` account that can read its certificate and private key. For example,
+with identities issued by a shared CA:
+
+```bash
+sudo ./qlinq-tun --listen 8888 --bind 0.0.0.0 --interface tun0 \
+  --ip 10.8.0.1/24 --track vpn/demo --mode fixed-fec \
+  --cert server.crt --key server.key --ca mesh-ca.crt \
+  --auth-token 'replace-with-a-secret' --run-as qlinq
+
+sudo ./qlinq-tun --peer SERVER_IP:8888 --interface tun0 \
+  --ip 10.8.0.2/24 --track vpn/demo --mode fixed-fec \
+  --cert client.crt --key client.key --ca mesh-ca.crt \
+  --auth-token 'replace-with-a-secret' --run-as qlinq
+```
+
+The helper sets MTU 1400, bounds its receive queue, and never retries a
+partially accepted record as a new packet. It does not yet integrate the TUN
+file descriptor into `qlinq_service`'s poller or support multipath/mesh
+configuration; retain `qlinqd` plus `qlinq-tund` for those deployments.
+`--mock --run-ms N` exercises the direct stream without a privileged TUN.
 
 ## Security
 
