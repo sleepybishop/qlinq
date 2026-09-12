@@ -43,7 +43,6 @@ QUICLY_SRCS = deps/quicly/lib/quicly.c \
               deps/quicly/lib/sendstate.c \
               deps/quicly/lib/sentmap.c \
               deps/quicly/lib/streambuf.c \
-              deps/quicly/lib/cc-reno.c \
               deps/quicly/lib/cc-cubic.c \
               deps/quicly/lib/cc-pico.c \
               deps/quicly/deps/picotls/lib/picotls.c \
