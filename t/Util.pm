@@ -20,10 +20,10 @@ sub run_prog {
 	# Drain both streams concurrently. Capture must not depend on temporary
 	# file storage, and reading one pipe to EOF first can deadlock its sibling.
 	# open3 closes its input handle in the parent, so give it a duplicate.
-	open my $input_copy, '<&', \*STDIN
+	open local *INPUT_COPY, '<&', \*STDIN
 		or die "run_prog '$cmd' stdin duplication failed: $!\n";
 	my $error_pipe = gensym;
-	my $pid = open3(['&', $input_copy], my $output_pipe, $error_pipe, $cmd);
+	my $pid = open3('<&INPUT_COPY', my $output_pipe, $error_pipe, $cmd);
 	binmode $output_pipe;
 	binmode $error_pipe;
 	my $output_fd = fileno($output_pipe);
