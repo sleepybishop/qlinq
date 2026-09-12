@@ -660,6 +660,9 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
   if (data_size == 0 || data_size > fec_limit)
     return TRANSPORT_PUBLISH_INVALID;
   size_t symbol_size = transport_get_datagram_symbol_size(t);
+  /* The object envelope and repair cache retain this exact symbol size. */
+  if (symbol_size > data_size)
+    symbol_size = data_size;
   size_t data_symbols = (data_size + symbol_size - 1) / symbol_size;
   if (data_symbols == 0)
     data_symbols = 1;

@@ -22,6 +22,9 @@ int main(void) {
     assert(transport_publish(fixture.server.transport, &object));
   fixture_receive(&fixture, &fixture.client, 2);
   assert(fixture.client.payload_size == 12);
+  sent_object_cache_t *cached = transport_sent_cache_find(
+      &fixture.server.transport->sent_cache, &track, 0, 0);
+  assert(cached && cached->symbol_size == 24 && cached->data_symbols == 1);
   assert(memcmp(fixture.client.payload + 2, payload, 10) == 0);
   track.type = MOQ_TRACK_VIDEO;
   track.flags = 0;

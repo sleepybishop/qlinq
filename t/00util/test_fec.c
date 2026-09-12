@@ -173,6 +173,44 @@ cleanup:
   return result;
 }
 
+static int test_short_symbols(void) {
+  const size_t sizes[] = {1, 3, 31, 257, 999, 1000, 1199, 1200};
+  for (size_t type = 0; type < 2; type++) {
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+      size_t size = sizes[i];
+      fec_t *fec =
+          fec_create_ex(type == 0 ? FEC_REED_SOLOMON : FEC_RAPTORQ, 1, 4, size);
+      uint8_t *blocks[5] = {0};
+      uint8_t *original = malloc(size);
+      bool missing[5] = {true, false, false, false, false};
+      int failed = fec == NULL || original == NULL;
+      for (size_t j = 0; j < 5; j++) {
+        blocks[j] = malloc(size);
+        failed |= blocks[j] == NULL;
+      }
+      if (!failed) {
+        for (size_t j = 0; j < size; j++)
+          original[j] = blocks[0][j] = (uint8_t)(j * 17 + 91);
+        failed = !fec_encode(fec, (const uint8_t *const *)blocks, blocks + 1);
+        memset(blocks[0], 0, size);
+        failed |= !fec_decode(fec, blocks, missing);
+        failed |= memcmp(blocks[0], original, size) != 0;
+      }
+      fec_destroy(fec);
+      free(original);
+      for (size_t j = 0; j < 5; j++)
+        free(blocks[j]);
+      if (failed) {
+        fprintf(stderr, "short FEC recovery failed: type=%zu size=%zu\n", type,
+                size);
+        return 1;
+      }
+    }
+  }
+  puts("Short unaligned single-symbol FEC recovery OK");
+  return 0;
+}
+
 int main(void) {
   printf("running FEC test suite...\n");
   if (fec_create_ex((fec_type_t)99, 4, 2, 1024) != NULL ||
@@ -186,6 +224,8 @@ int main(void) {
   if (run_test(FEC_RAPTORQ, "RaptorQ") != 0)
     return 1;
   if (test_raptorq_extra_equations() != 0)
+    return 1;
+  if (test_short_symbols() != 0)
     return 1;
   printf("===FEC OK===\n");
   return 0;
