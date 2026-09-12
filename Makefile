@@ -69,7 +69,8 @@ NANORQ_OBJS = $(NANORQ_SRCS:.c=.o)
 PATHFLOW_OBJS = $(PATHFLOW_SRCS:.c=.o)
 IFMON_OBJS = $(IFMON_SRCS:.c=.o)
 
-TRANSPORT_OBJS = src/common/cli_parse.o \
+TRANSPORT_OBJS = src/common/qlinq.o \
+              src/common/cli_parse.o \
               src/common/transport_config.o \
               src/common/transport_egress.o \
               src/common/transport_fec_state.o \
@@ -158,6 +159,23 @@ t/00util/test_publication_limits: t/00util/test_publication_limits.o $(COMMON_OB
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 t/00util/test_directional_subscriptions: t/00util/test_directional_subscriptions.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_qlinq_event_overflow: t/00util/test_qlinq_event_overflow.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_qlinq_compat: t/00util/test_qlinq_compat.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_qlinq_reconnect: t/00util/test_qlinq_reconnect.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_qlinq_delivery: t/00util/test_qlinq_delivery.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_qlinq_event_ownership: t/00util/test_qlinq_event_ownership.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS)
+
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 t/00util/test_generic_ports: t/00util/test_generic_ports.o $(COMMON_OBJS)
@@ -250,7 +268,6 @@ benchmark-rateless: t/00util/test_rateless_benchmark
 	./t/00util/test_rateless_benchmark
 
 clean: 
-	rm -f t/00util/test_generic_ports t/00util/test_stream_budget t/00util/test_directional_subscriptions t/00util/test_publication_limits t/00util/test_interleaved_receive t/00util/test_transport_bind t/00util/test_egress_errors qlinqd qlinq-app qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_reliable_bidirectional t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/fuzz_transport_wire t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete
 	rm -f $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \
@@ -258,7 +275,6 @@ clean:
 		deps/nanors/deps/obl/oblas_common.d \
 		deps/nanors/deps/obl/oblas_lite.d
 
-check: t/00util/test_generic_ports t/00util/test_stream_budget t/00util/test_directional_subscriptions t/00util/test_publication_limits t/00util/test_interleaved_receive t/00util/test_transport_bind t/00util/test_egress_errors qlinqd qlinq-app qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_reliable_bidirectional t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls gencerts
 	prove -I. -v t/*.t
 
 t/assets/server.crt t/assets/server.key &:

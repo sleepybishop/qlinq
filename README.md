@@ -26,7 +26,9 @@ This produces three binaries and an embeddable transport library:
 - `qlinq-app`: A direct `transport.h` file/stream sender and receiver that does
   not use the daemon's Unix data socket.
 - `qlinq-tund`: The lightweight virtual TUN/TAP interface controller.
-- `libqlinq.a`: The in-process transport API used by `qlinq-app`.
+- `libqlinq.a`: The in-process `transport.h` API used by `qlinq-app`, plus the
+  [native application API](docs/application-api.md) in `qlinq.h` for named
+  streams, owned events and endpoint management.
 
 For example, send one 512-byte rateless-protected record:
 

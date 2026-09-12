@@ -440,6 +440,12 @@ transport_repair_mode_t
 transport_get_effective_repair_mode(transport_t *t, transport_conn_t *conn,
                                     const moq_track_id_t *track_id);
 
+typedef struct {
+  size_t subscribers;
+} transport_track_stats_t;
+bool transport_get_track_stats(transport_t *t, const moq_track_id_t *track,
+                               transport_track_stats_t *stats);
+
 /* Snapshot the physical interface corresponding to a Pathflow input slot.
  * Returns false when path_idx is not currently active. */
 bool transport_get_path_stats(transport_t *t, size_t path_idx,

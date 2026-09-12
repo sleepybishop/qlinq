@@ -2485,6 +2485,13 @@ int64_t transport_get_first_timeout(transport_t *t) {
     }
   }
 
+  if (active_conns != 0 && t->last_pathflow_update <= INT64_MAX - 25 &&
+      (int64_t)t->last_pathflow_update + 25 < first_timeout)
+    first_timeout = (int64_t)t->last_pathflow_update + 25;
+  if (t->fec_buf_len != 0 && t->fec_first_pkt_time <= INT64_MAX - 3 &&
+      (int64_t)t->fec_first_pkt_time + 3 < first_timeout)
+    first_timeout = (int64_t)t->fec_first_pkt_time + 3;
+
   if (!t->is_server && !t->client_conn && t->reconnect_enabled &&
       !t->shutting_down && t->reconnect_at_ms < first_timeout)
     first_timeout = t->reconnect_at_ms;
@@ -2523,4 +2530,22 @@ size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
     }
   }
   return count;
+}
+
+bool transport_get_track_stats(transport_t *t, const moq_track_id_t *track,
+                               transport_track_stats_t *stats) {
+  if (!transport_owner_ok(t) || !transport_track_id_valid(track) || !stats)
+    return false;
+  *stats = (transport_track_stats_t){0};
+  size_t count = t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
+  for (size_t i = 0; i < count; i++) {
+    transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
+    uint8_t alias;
+    if (conn && conn->authenticated && conn->quic &&
+        quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
+        transport_subscriptions_find_alias(&conn->send_subscriptions, track,
+                                           &alias) == 0)
+      stats->subscribers++;
+  }
+  return true;
 }

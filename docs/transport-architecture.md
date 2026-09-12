@@ -1,11 +1,14 @@
 # Transport architecture
 
-The public transport API remains in `transport.h`. The Quicly implementation is
+The low-level public transport API remains in `transport.h`. The application
+wrapper in `qlinq.h` adds owned events and named streams; see
+[Native application API](application-api.md). The Quicly implementation is
 split into small internal modules with one-way dependencies toward shared data
 types and the wire codec.
 
 | Module | Responsibility |
 | --- | --- |
+| `qlinq.c` | Application contexts, endpoints, named streams and owned event queues |
 | `transport_quicly.c` | Connection lifecycle, socket event loop, and public control/query API |
 | `transport_internal.h` | Private shared transport and connection state |
 | `cli_parse.c` | Shared bounded numeric and endpoint parsing for app and daemon |
@@ -41,8 +44,11 @@ and deferred aggregate-budget retries.
 `initial_rtt_ms` sets Quicly's initial RTT estimate, and
 `handshake_timeout_rtt_multiplier` sets its handshake timeout in RTT multiples.
 Zero preserves each Quicly default. Neither changes the configured QUIC idle
-timeout. The fork's handshake PTO ceiling requires a separate Quicly change
-and is not exposed by this build.
+timeout. `max_handshake_pto_ms` optionally bounds setup PTO backoff; zero
+keeps it unbounded. The initiator clears the ceiling on authentication success;
+the accepting peer clears it once QUIC acknowledges its authentication response.
+The Quicly dependency implements the ceiling for every path and saturates high
+PTO exponents safely.
 
 `transport_close_conn_with_error` accepts zero or a tagged
 `QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE` value and an optional reason.

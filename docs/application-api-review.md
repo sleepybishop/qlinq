@@ -1,22 +1,22 @@
-# Review of the qtak application API
+# Application API port decisions
 
-The existing public API remains `src/common/transport.h`. The `qtak` versions
-of `src/common/qlinq.h` and `qlinq.c` have not been ported.
+The unicast core of `qtak`'s `qlinq.h` and `qlinq.c` is now available in
+`libqlinq.a`. See [Native application API](application-api.md) for usage,
+ownership, timing and compatibility rules.
 
-The wrapper contains useful unicast concepts: a bounded queue of owned events,
-a service loop for multiple endpoints, named stream handles, delivery-mode
-selection and writable notifications. These form a new application-facing API,
-rather than independent fixes to the existing transport API.
+The port retains contexts, endpoints, named publish/subscribe streams,
+delivery modes, bounded owned events, writable notifications, service polling,
+reconnect, credential reload, endpoint shutdown and statistics. It exposes the
+current transport's configurable cache and reliable-stream allocation limits.
 
-A selective adaptation would need to define event ownership and queue-pressure
-behavior, preserve existing payload compatibility, and decide how stream
-handles map onto the current track API. In particular, the wrapper inserts its
-own metadata envelope into FEC data records and removes it on receive. Importing
-it unchanged would introduce another record format. Its endpoint configuration
-and event dispatch also include multicast settings, outgoing mesh connections,
-and finite-transfer finish/drain/abort state.
+It omits multicast and listener-initiated mesh configuration and the excluded
+finite-transfer stream lifecycle. FEC DATA records use the existing transport
+format instead of the qtak wrapper's private metadata envelope, preserving
+interoperability with `transport.h` applications. The wrapper does not strip
+payload bytes that resemble that envelope.
 
-Keep the existing transport API for this generic port. If an application needs
-owned events or a common service loop, design that addition around its unicast
-requirements and existing record format. The qlinq-cast application and
-finite-transfer lifecycle remain outside this port.
+The setup PTO ceiling is backed by a small local Quicly change. Unlike the
+source's post-authentication-frame heuristic, the accepting peer clears its
+ceiling when the reliable authentication response is acknowledged, including
+quiet sessions with no subsequent application control frame. Capped retries
+saturate their exponent safely; zero retains unbounded exponential backoff.
