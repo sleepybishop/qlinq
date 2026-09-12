@@ -765,25 +765,18 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
   }
 }
 
-typedef struct {
-  quicly_streambuf_t streambuf;
-  bool is_control;
-  bool alias_bound;
-  uint8_t alias;
-} stream_ctx_t;
-
 static void on_stream_destroy(quicly_stream_t *stream, quicly_error_t err) {
   transport_conn_t *conn = *quicly_get_data(stream->conn);
   if (conn) {
     transport_subscriptions_clear_stream(&conn->receive_subscriptions, stream);
     transport_subscriptions_clear_stream(&conn->send_subscriptions, stream);
   }
-  quicly_streambuf_destroy(stream, err);
+  transport_stream_destroy(stream, err);
 }
 
 static void parse_track_stream_messages(transport_t *t, transport_conn_t *conn,
                                         quicly_stream_t *stream) {
-  stream_ctx_t *ctx = (stream_ctx_t *)stream->data;
+  transport_stream_ctx_t *ctx = (transport_stream_ctx_t *)stream->data;
   while (1) {
     ptls_iovec_t input = quicly_streambuf_ingress_get(stream);
     if (input.len == 0)
@@ -874,7 +867,7 @@ static void on_receive(quicly_stream_t *stream, size_t off, const void *src,
 
   transport_conn_t *conn = *quicly_get_data(stream->conn);
   if (conn) {
-    stream_ctx_t *ctx = (stream_ctx_t *)stream->data;
+    transport_stream_ctx_t *ctx = (transport_stream_ctx_t *)stream->data;
     if (ctx->is_control) {
       parse_control_messages(conn->transport, conn, stream);
     } else {
@@ -884,7 +877,7 @@ static void on_receive(quicly_stream_t *stream, size_t off, const void *src,
 }
 
 static void on_stop_sending(quicly_stream_t *stream, quicly_error_t err) {
-  stream_ctx_t *ctx = (stream_ctx_t *)stream->data;
+  transport_stream_ctx_t *ctx = (transport_stream_ctx_t *)stream->data;
   if (ctx && ctx->is_control) {
     quicly_close(stream->conn, 0, "");
   } else {
@@ -893,7 +886,7 @@ static void on_stop_sending(quicly_stream_t *stream, quicly_error_t err) {
 }
 
 static void on_receive_reset(quicly_stream_t *stream, quicly_error_t err) {
-  stream_ctx_t *ctx = (stream_ctx_t *)stream->data;
+  transport_stream_ctx_t *ctx = (transport_stream_ctx_t *)stream->data;
   if (ctx && ctx->is_control) {
     quicly_close(stream->conn, 0, "");
   } else {
@@ -906,18 +899,21 @@ static quicly_error_t on_stream_open(quicly_stream_open_t *self,
   (void)self;
   static const quicly_stream_callbacks_t stream_callbacks = {
       on_stream_destroy,
-      quicly_streambuf_egress_shift,
+      transport_stream_egress_shift,
       quicly_streambuf_egress_emit,
       on_stop_sending,
       on_receive,
       on_receive_reset};
   int ret;
 
-  if ((ret = quicly_streambuf_create(stream, sizeof(stream_ctx_t))) != 0)
+  if ((ret = quicly_streambuf_create(stream, sizeof(transport_stream_ctx_t))) !=
+      0)
     return ret;
   stream->callbacks = &stream_callbacks;
 
-  stream_ctx_t *ctx = (stream_ctx_t *)stream->data;
+  transport_stream_ctx_t *ctx = (transport_stream_ctx_t *)stream->data;
+  ctx->owner = NULL;
+  ctx->retained_frame_bytes = 0;
   ctx->is_control = (stream->stream_id == 0);
   ctx->alias_bound = false;
 

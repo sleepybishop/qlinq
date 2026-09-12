@@ -55,3 +55,4 @@ t/00util/test_interleaved_receive
 
 t/00util/test_publication_limits
 t/00util/test_directional_subscriptions
+t/00util/test_stream_budget

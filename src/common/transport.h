@@ -145,6 +145,8 @@ typedef void (*transport_callback_t)(void *user_data,
 #define TRANSPORT_DEFAULT_MAX_EGRESS_PACKETS 1024U
 #define TRANSPORT_DEFAULT_MAX_EGRESS_BYTES (2U * 1024U * 1024U)
 #define TRANSPORT_RECOVERY_WINDOW_OBJECTS 32U
+#define TRANSPORT_DEFAULT_STREAM_EGRESS_BYTES (2U * 1024U * 1024U)
+#define TRANSPORT_DEFAULT_TOTAL_STREAM_EGRESS_BYTES (16U * 1024U * 1024U)
 #define TRANSPORT_DEFAULT_RECOVERY_CACHE_BYTES (16U * 1024U * 1024U)
 #define TRANSPORT_DEFAULT_ASSEMBLER_MEMORY_BUDGET (64U * 1024U * 1024U)
 #define TRANSPORT_DEFAULT_MAX_PACKETS_PER_TICK 1024U
@@ -167,6 +169,10 @@ typedef struct {
   size_t max_assembler_memory_bytes;
   /* Retained recovery payloads, in addition to the fixed cache entry table. */
   size_t max_recovery_cache_bytes;
+  /* Frame allocations and send-vector capacity retained until QUIC releases
+   * them. */
+  size_t max_stream_egress_bytes;
+  size_t max_total_stream_egress_bytes;
   size_t max_reliable_object_size;
   size_t max_fec_object_size;
   size_t max_udp_payload_size;
@@ -332,6 +338,11 @@ typedef struct {
   uint64_t protocol_handshakes_completed;
   uint64_t protocol_errors;
   uint64_t resource_limit_errors;
+  uint64_t stream_egress_blocked, stream_control_failures;
+  size_t stream_egress_bytes, stream_egress_frames,
+      stream_egress_vector_capacity;
+  size_t stream_egress_peak_bytes, stream_egress_peak_frames,
+      stream_egress_peak_vectors;
   uint64_t stream_frames_received;
   uint64_t datagrams_received;
   uint64_t malformed_datagrams;

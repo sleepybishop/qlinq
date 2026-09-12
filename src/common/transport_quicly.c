@@ -2317,8 +2317,11 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
       quicly_stream_t *stream = subscription ? subscription->stream : NULL;
 
       if (stream) {
-        quicly_streambuf_t *sbuf = (quicly_streambuf_t *)stream->data;
-        if (sbuf && sbuf->egress.vecs.size > 256) {
+        if (!transport_stream_can_accept(
+                stream,
+                QLINQ_WIRE_FRAME_HEADER_SIZE +
+                    QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE,
+                true)) {
           all_ready = false;
           break;
         }

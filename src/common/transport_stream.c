@@ -1,34 +1,213 @@
 #include "transport_stream.h"
 
+#include "transport_internal.h"
 #include "transport_wire.h"
 
 #include "quicly/streambuf.h"
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
+
+typedef struct {
+  transport_stream_ctx_t *ctx;
+  uint8_t bytes[];
+} retained_frame_t;
+
+static transport_t *stream_owner(quicly_stream_t *stream) {
+  transport_conn_t *conn = *quicly_get_data(stream->conn);
+  return conn ? conn->transport : NULL;
+}
+
+static size_t vector_growth(const quicly_sendbuf_t *sb) {
+  return sb->vecs.size < sb->vecs.capacity ? 0
+         : sb->vecs.capacity               ? sb->vecs.capacity
+                                           : 4;
+}
+
+bool transport_stream_can_accept(quicly_stream_t *stream, size_t frame_len,
+                                 bool preserve_control_reserve) {
+  if (!stream || !stream->conn || !stream->data ||
+      !quicly_sendstate_is_open(&stream->sendstate) ||
+      quicly_get_state(stream->conn) >= QUICLY_STATE_CLOSING ||
+      frame_len >
+          TRANSPORT_WIRE_MAX_STREAM_PAYLOAD + QLINQ_WIRE_FRAME_HEADER_SIZE)
+    return false;
+  transport_t *t = stream_owner(stream);
+  if (!t)
+    return false;
+  transport_stream_ctx_t *ctx = stream->data;
+  quicly_sendbuf_t *sb = &ctx->streambuf.egress;
+  size_t stream_limit = t->limits.max_stream_egress_bytes;
+  size_t frame_limit = TRANSPORT_STREAM_MAX_FRAMES;
+  size_t endpoint_limit = t->limits.max_total_stream_egress_bytes;
+  size_t vector_limit = TRANSPORT_STREAM_ENDPOINT_MAX_VECTORS;
+  if (preserve_control_reserve) {
+    endpoint_limit -= TRANSPORT_STREAM_ENDPOINT_CONTROL_BYTE_RESERVE;
+    vector_limit -= TRANSPORT_STREAM_ENDPOINT_CONTROL_VECTOR_RESERVE;
+    if (ctx->is_control) {
+      stream_limit -= TRANSPORT_STREAM_CONTROL_BYTE_RESERVE;
+      frame_limit -= TRANSPORT_STREAM_CONTROL_FRAME_RESERVE;
+    }
+  }
+  size_t growth = vector_growth(sb);
+  size_t frame_bytes = sizeof(retained_frame_t) + frame_len;
+  size_t bytes = frame_bytes + growth * sizeof(quicly_sendbuf_vec_t);
+  size_t stream_bytes = ctx->retained_frame_bytes +
+                        sb->vecs.capacity * sizeof(quicly_sendbuf_vec_t);
+  return sb->vecs.size < frame_limit && stream_bytes <= stream_limit &&
+         bytes <= stream_limit - stream_bytes &&
+         t->stats.stream_egress_bytes <= endpoint_limit &&
+         bytes <= endpoint_limit - t->stats.stream_egress_bytes &&
+         t->stats.stream_egress_vector_capacity <= vector_limit &&
+         growth <= vector_limit - t->stats.stream_egress_vector_capacity;
+}
+
+static quicly_error_t flatten_frame(quicly_sendbuf_vec_t *vec, void *dst,
+                                    size_t off, size_t len) {
+  retained_frame_t *frame = vec->cbdata;
+  memcpy(dst, frame->bytes + off, len);
+  return 0;
+}
+
+static void discard_frame(quicly_sendbuf_vec_t *vec) {
+  retained_frame_t *frame = vec->cbdata;
+  size_t bytes = sizeof(*frame) + vec->len;
+  transport_stream_ctx_t *ctx = frame->ctx;
+  assert(ctx->retained_frame_bytes >= bytes &&
+         ctx->owner->stats.stream_egress_bytes >= bytes);
+  ctx->retained_frame_bytes -= bytes;
+  ctx->owner->stats.stream_egress_bytes -= bytes;
+  assert(ctx->owner->stats.stream_egress_frames != 0);
+  ctx->owner->stats.stream_egress_frames--;
+  free(frame);
+}
+
+static const quicly_streambuf_sendvec_callbacks_t retained_callbacks = {
+    flatten_frame, discard_frame};
+
+bool transport_stream_has_retained_frame(quicly_stream_t *stream, uint8_t type,
+                                         const void *payload,
+                                         size_t payload_len) {
+  if (!stream || !stream->conn || !stream->data ||
+      !quicly_sendstate_is_open(&stream->sendstate) ||
+      quicly_get_state(stream->conn) >= QUICLY_STATE_CLOSING ||
+      (payload_len != 0 && !payload) ||
+      payload_len > TRANSPORT_WIRE_MAX_STREAM_PAYLOAD)
+    return false;
+  uint8_t header[QLINQ_WIRE_FRAME_HEADER_SIZE];
+  if (qlinq_wire_encode_frame_header(header, sizeof(header), type, payload_len,
+                                     TRANSPORT_WIRE_MAX_STREAM_PAYLOAD) !=
+      QLINQ_WIRE_OK)
+    return false;
+  transport_stream_ctx_t *ctx = stream->data;
+  const quicly_sendbuf_t *sb = &ctx->streambuf.egress;
+  /* QUIC owns retransmission while the request is retained, including partial
+   * ACKs and later ACKed ranges held behind an unacknowledged prefix. Once the
+   * complete frame shifts out, a missing repair response can trigger a fresh
+   * application request. The frame budget bounds this scan; no index is
+   * allocated. */
+  for (size_t i = sb->vecs.size; i != 0; i--) {
+    const quicly_sendbuf_vec_t *vec = &sb->vecs.entries[i - 1];
+    if (vec->cb != &retained_callbacks ||
+        vec->len != sizeof(header) + payload_len)
+      continue;
+    const retained_frame_t *frame = vec->cbdata;
+    if (memcmp(frame->bytes, header, sizeof(header)) == 0 &&
+        (payload_len == 0 ||
+         memcmp(frame->bytes + sizeof(header), payload, payload_len) == 0))
+      return true;
+  }
+  return false;
+}
+
+static void release_vector_capacity(transport_stream_ctx_t *ctx, size_t count) {
+  if (!count)
+    return;
+  assert(ctx->owner &&
+         ctx->owner->stats.stream_egress_vector_capacity >= count);
+  ctx->owner->stats.stream_egress_vector_capacity -= count;
+  size_t bytes = count * sizeof(quicly_sendbuf_vec_t);
+  assert(ctx->owner->stats.stream_egress_bytes >= bytes);
+  ctx->owner->stats.stream_egress_bytes -= bytes;
+}
+
+void transport_stream_egress_shift(quicly_stream_t *stream, size_t delta) {
+  transport_stream_ctx_t *ctx = stream->data;
+  size_t capacity = ctx->streambuf.egress.vecs.capacity;
+  quicly_streambuf_egress_shift(stream, delta);
+  quicly_sendbuf_t *sb = &ctx->streambuf.egress;
+  /* Quicly keeps a vector array at its historical high-water capacity until
+   * the stream becomes empty. Many concurrent control streams can accumulate
+   * that slack across peers. */
+  if (sb->vecs.capacity > 4 && sb->vecs.size <= sb->vecs.capacity / 4) {
+    size_t compact = 4;
+    while (compact < sb->vecs.size)
+      compact *= 2;
+    quicly_sendbuf_vec_t *entries =
+        realloc(sb->vecs.entries, compact * sizeof(*entries));
+    if (entries) {
+      sb->vecs.entries = entries;
+      sb->vecs.capacity = compact;
+    }
+  }
+  /* Partial ACKs keep their entire frame allocation charged. Quicly also
+   * retains its vector array until the last entry is released unless the
+   * compaction above reclaims its unused tail. */
+  release_vector_capacity(ctx, capacity - sb->vecs.capacity);
+}
+
+void transport_stream_destroy(quicly_stream_t *stream, quicly_error_t err) {
+  transport_stream_ctx_t *ctx = stream->data;
+  release_vector_capacity(ctx, ctx->streambuf.egress.vecs.capacity);
+  quicly_streambuf_destroy(stream, err);
+}
+
+static bool write_failed(quicly_stream_t *stream, bool application_data) {
+  if (!application_data) {
+    transport_conn_t *conn = *quicly_get_data(stream->conn);
+    if (conn && quicly_get_state(stream->conn) < QUICLY_STATE_CLOSING) {
+      conn->transport->stats.stream_control_failures++;
+      conn->transport->stats.resource_limit_errors++;
+      quicly_close(conn->quic, TRANSPORT_APP_ERROR_RESOURCE_LIMIT,
+                   "reliable control queue exhausted");
+    }
+  }
+  return false;
+}
 
 bool transport_stream_write_parts(quicly_stream_t *stream, uint8_t type,
                                   const void *prefix, size_t prefix_len,
                                   const void *payload, size_t payload_len) {
-  if (!stream || prefix_len > SIZE_MAX - payload_len ||
-      (prefix_len > 0 && !prefix) || (payload_len > 0 && !payload))
+  if (!stream || !stream->conn || !stream->data ||
+      prefix_len > SIZE_MAX - payload_len || (prefix_len > 0 && !prefix) ||
+      (payload_len > 0 && !payload))
     return false;
   size_t wire_payload_len = prefix_len + payload_len;
   if (wire_payload_len > TRANSPORT_WIRE_MAX_STREAM_PAYLOAD ||
       wire_payload_len > SIZE_MAX - QLINQ_WIRE_FRAME_HEADER_SIZE)
     return false;
 
+  bool application_data =
+      type == QLINQ_WIRE_TRACK_OBJECT || type == QLINQ_WIRE_UNICAST;
   size_t frame_len = QLINQ_WIRE_FRAME_HEADER_SIZE + wire_payload_len;
-  uint8_t stack_buf[256];
-  uint8_t *frame =
-      frame_len <= sizeof(stack_buf) ? stack_buf : malloc(frame_len);
-  if (!frame)
-    return false;
+  if (!transport_stream_can_accept(stream, frame_len, application_data)) {
+    transport_t *t = stream_owner(stream);
+    if (t)
+      t->stats.stream_egress_blocked++;
+    return write_failed(stream, application_data);
+  }
+  transport_stream_ctx_t *ctx = stream->data;
+  ctx->owner = stream_owner(stream);
+  retained_frame_t *retained = malloc(sizeof(*retained) + frame_len);
+  if (!retained)
+    return write_failed(stream, application_data);
+  retained->ctx = ctx;
+  uint8_t *frame = retained->bytes;
   if (qlinq_wire_encode_frame_header(frame, frame_len, type, wire_payload_len,
                                      TRANSPORT_WIRE_MAX_STREAM_PAYLOAD) !=
       QLINQ_WIRE_OK) {
-    if (frame != stack_buf)
-      free(frame);
+    free(retained);
     return false;
   }
   if (prefix_len > 0)
@@ -37,10 +216,33 @@ bool transport_stream_write_parts(quicly_stream_t *stream, uint8_t type,
     memcpy(frame + QLINQ_WIRE_FRAME_HEADER_SIZE + prefix_len, payload,
            payload_len);
 
-  int ret = quicly_streambuf_egress_write(stream, frame, frame_len);
-  if (frame != stack_buf)
-    free(frame);
-  return ret == 0;
+  quicly_sendbuf_vec_t vec = {&retained_callbacks, frame_len, retained};
+  quicly_sendbuf_t *sb = &ctx->streambuf.egress;
+  size_t old_size = sb->vecs.size, old_capacity = sb->vecs.capacity;
+  int ret = quicly_streambuf_egress_write_vec(stream, &vec);
+  transport_stats_t *stats = &ctx->owner->stats;
+  size_t growth = sb->vecs.capacity - old_capacity;
+  stats->stream_egress_vector_capacity += growth;
+  stats->stream_egress_bytes += growth * sizeof(quicly_sendbuf_vec_t);
+  bool appended = sb->vecs.size != old_size;
+  if (appended) {
+    size_t bytes = sizeof(*retained) + frame_len;
+    ctx->retained_frame_bytes += bytes;
+    stats->stream_egress_bytes += bytes;
+    stats->stream_egress_frames++;
+  } else {
+    free(retained);
+  }
+  if (stats->stream_egress_bytes > stats->stream_egress_peak_bytes)
+    stats->stream_egress_peak_bytes = stats->stream_egress_bytes;
+  if (stats->stream_egress_frames > stats->stream_egress_peak_frames)
+    stats->stream_egress_peak_frames = stats->stream_egress_frames;
+  if (stats->stream_egress_vector_capacity > stats->stream_egress_peak_vectors)
+    stats->stream_egress_peak_vectors = stats->stream_egress_vector_capacity;
+  /* A send-state allocation can fail after Quicly appended the vector. The
+   * stream owns it in that case; fail the connection rather than free it twice
+   * or let an application retry a frame that could subsequently be sent. */
+  return ret == 0 ? true : write_failed(stream, application_data && !appended);
 }
 
 bool transport_stream_write_frame(quicly_stream_t *stream, uint8_t type,

@@ -1,4 +1,5 @@
 #include "transport_config.h"
+#include "transport_stream.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -46,6 +47,12 @@ bool transport_limits_resolve(const transport_limits_t *configured,
   resolved->max_assembler_memory_bytes =
       value_or_default(configured->max_assembler_memory_bytes,
                        TRANSPORT_DEFAULT_ASSEMBLER_MEMORY_BUDGET);
+  resolved->max_stream_egress_bytes =
+      value_or_default(configured->max_stream_egress_bytes,
+                       TRANSPORT_DEFAULT_STREAM_EGRESS_BYTES);
+  resolved->max_total_stream_egress_bytes =
+      value_or_default(configured->max_total_stream_egress_bytes,
+                       TRANSPORT_DEFAULT_TOTAL_STREAM_EGRESS_BYTES);
   resolved->max_recovery_cache_bytes =
       value_or_default(configured->max_recovery_cache_bytes,
                        TRANSPORT_DEFAULT_RECOVERY_CACHE_BYTES);
@@ -102,6 +109,18 @@ bool transport_limits_resolve(const transport_limits_t *configured,
   if (resolved->max_recovery_cache_bytes < minimum_cache)
     return fail(error, error_capacity,
                 "recovery cache must hold one recovery window");
+  if (resolved->max_stream_egress_bytes <
+      resolved->max_reliable_object_size + 1024U +
+          TRANSPORT_STREAM_CONTROL_BYTE_RESERVE)
+    return fail(error, error_capacity,
+                "stream budget must hold a maximum object and control reserve");
+  if (resolved->max_stream_egress_bytes >
+          SIZE_MAX - TRANSPORT_STREAM_ENDPOINT_CONTROL_BYTE_RESERVE ||
+      resolved->max_total_stream_egress_bytes <
+          resolved->max_stream_egress_bytes +
+              TRANSPORT_STREAM_ENDPOINT_CONTROL_BYTE_RESERVE)
+    return fail(error, error_capacity,
+                "total stream budget must hold a stream and control reserve");
   if (resolved->max_udp_payload_size < 1200U ||
       resolved->max_udp_payload_size > 1500U)
     return fail(error, error_capacity,

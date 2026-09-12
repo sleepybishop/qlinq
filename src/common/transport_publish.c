@@ -638,7 +638,7 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
         t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
     size_t eligible = 0;
     size_t delivered = 0;
-    bool failed = false;
+    bool failed = false, blocked = false;
     for (size_t i = 0; i < active_count; ++i) {
       transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
       if (!conn || !conn->quic || !conn->protocol_ready ||
@@ -675,12 +675,25 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
           }
         }
 
+        if (!transport_stream_can_accept(
+                sub->stream,
+                QLINQ_WIRE_FRAME_HEADER_SIZE +
+                    QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE + obj->size,
+                true)) {
+          blocked = true;
+          continue;
+        }
         uint8_t alias = sub->alias;
         if (!transport_stream_write_object_frame(sub->stream, alias, obj)) {
           failed = true;
           continue;
         }
       } else {
+        if (!transport_stream_can_accept(
+                conn->stream, QLINQ_WIRE_FRAME_HEADER_SIZE + obj->size, true)) {
+          blocked = true;
+          continue;
+        }
         if (!transport_send_unicast(t, conn, obj->data, obj->size)) {
           failed = true;
           continue;
@@ -688,9 +701,10 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
       }
       delivered++;
     }
-    if (failed)
+    if (failed || blocked)
       return delivered > 0 ? TRANSPORT_PUBLISH_PARTIAL
-                           : TRANSPORT_PUBLISH_ERROR;
+             : failed      ? TRANSPORT_PUBLISH_ERROR
+                           : TRANSPORT_PUBLISH_BACKPRESSURE;
     return eligible == 0 ? TRANSPORT_PUBLISH_NO_RECIPIENTS
                          : TRANSPORT_PUBLISH_DELIVERED;
   }
