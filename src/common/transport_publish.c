@@ -18,6 +18,29 @@
 static transport_publish_result_t
 transport_publish_impl(transport_t *t, const moq_object_t *obj);
 
+static bool transport_publish_recipient_eligible(const transport_t *t,
+                                                 const transport_conn_t *conn,
+                                                 const moq_track_id_t *track) {
+  return t && conn && track && conn->quic && conn->protocol_ready &&
+         conn->authenticated &&
+         quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
+         (!t->is_server ||
+          transport_subscriptions_contains(&conn->subscriptions, track));
+}
+
+static size_t publication_fec_limit(const transport_t *t,
+                                    const moq_track_id_t *track) {
+  size_t limit = t->limits.max_fec_object_size;
+  size_t count = t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
+  for (size_t i = 0; i < count; i++) {
+    const transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
+    if (transport_publish_recipient_eligible(t, conn, track) &&
+        conn->negotiated_limits.max_fec_object_size < limit)
+      limit = conn->negotiated_limits.max_fec_object_size;
+  }
+  return limit;
+}
+
 static transport_publish_result_t publish_datagram_to_conn(
     transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
     const transport_track_profile_t *profile, size_t symbol_size,
@@ -456,6 +479,8 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
       (obj->size > 0 && !obj->data))
     return TRANSPORT_PUBLISH_INVALID;
 
+  size_t fec_limit = publication_fec_limit(t, &obj->track_id);
+
   /* route to grouping buffer if it's data and we're not flushing */
   if (obj->track_id.type == MOQ_TRACK_DATA && !t->fec_in_flush) {
     bool use_fec = false;
@@ -490,7 +515,9 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
     }
 
     if (use_fec) {
-      if (obj->size > TRANSPORT_MAX_FEC_RECORD_SIZE)
+      size_t group_limit = fec_limit < 16384U ? fec_limit : 16384U;
+      if (obj->size > TRANSPORT_MAX_FEC_RECORD_SIZE || fec_limit < 2U ||
+          obj->size > fec_limit - 2U)
         return TRANSPORT_PUBLISH_INVALID;
 
       if (t->fec_buf_len > 0 &&
@@ -505,8 +532,8 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
       }
 
       if (t->fec_buf_len > 0 &&
-          (t->fec_pkt_count >= 4 || obj->size > 16384 - 2 ||
-           t->fec_buf_len > 16384 - 2 - obj->size)) {
+          (t->fec_pkt_count >= 4 || obj->size > group_limit - 2U ||
+           t->fec_buf_len > group_limit - 2U - obj->size)) {
         transport_publish_result_t result =
             transport_publish_flush_grouped_ex(t);
         if (result == TRANSPORT_PUBLISH_BACKPRESSURE)
@@ -548,7 +575,7 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
       t->fec_buf_len = needed;
       t->fec_pkt_count++;
 
-      if (t->fec_pkt_count >= 4 || t->fec_buf_len >= 16384) {
+      if (t->fec_pkt_count >= 4 || t->fec_buf_len >= group_limit) {
         transport_publish_result_t result =
             transport_publish_flush_grouped_ex(t);
         if (result == TRANSPORT_PUBLISH_BACKPRESSURE)
@@ -630,7 +657,7 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
 
   /* audio, video, text tracks go over unreliable datagram frames with FEC */
   size_t data_size = obj->size;
-  if (data_size == 0 || data_size > t->limits.max_fec_object_size)
+  if (data_size == 0 || data_size > fec_limit)
     return TRANSPORT_PUBLISH_INVALID;
   size_t symbol_size = transport_get_datagram_symbol_size(t);
   size_t data_symbols = (data_size + symbol_size - 1) / symbol_size;
