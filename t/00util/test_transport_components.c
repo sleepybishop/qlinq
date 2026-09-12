@@ -95,7 +95,8 @@ int main(void) {
   CHECK(transport_subscriptions_bind_stream(&subscriptions, 8, fake_stream),
         "subscription stream binding");
   transport_subscriptions_clear_stream(&subscriptions, fake_stream);
-  CHECK(transport_subscriptions_find(&subscriptions, &track)->stream == NULL,
+  CHECK(transport_subscriptions_find(&subscriptions, &track)->stream == NULL &&
+            transport_subscriptions_find(&subscriptions, &track)->ingress_stream == NULL,
         "subscription stream clearing");
   CHECK(transport_subscriptions_next_alias(&subscriptions, 8) == 9,
         "subscription next alias");

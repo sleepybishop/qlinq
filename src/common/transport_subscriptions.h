@@ -9,7 +9,8 @@ typedef struct {
   moq_track_id_t track_id;
   uint8_t alias;
   bool active;
-  quicly_stream_t *stream;
+  quicly_stream_t *stream;         /* egress stream for publishing */
+  quicly_stream_t *ingress_stream; /* ingress stream received from peer */
 } track_subscription_t;
 
 typedef struct {
