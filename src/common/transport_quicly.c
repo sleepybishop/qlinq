@@ -77,8 +77,17 @@ bool transport_grow_assembler(transport_t *t, frame_assembler_t *assembler,
   size_t used_without_old = old_bytes <= t->assembler_memory_bytes
                                 ? t->assembler_memory_bytes - old_bytes
                                 : t->assembler_memory_bytes;
-  if (used_without_old > t->limits.max_assembler_memory_bytes ||
-      new_bytes > t->limits.max_assembler_memory_bytes - used_without_old) {
+  /* Growth allocates replacement buffers before copying and freeing the old
+   * ones. Reserve that transient allocation too; rejecting growth must leave
+   * an incomplete object's symbols intact. Reusing capacity allocates nothing.
+   */
+  bool needs_allocation = !assembler->buffers ||
+                          assembler->capacity_symbols < symbols ||
+                          assembler->capacity_symbol_size < symbol_size;
+  size_t additional_bytes = needs_allocation ? new_bytes : 0;
+  if (t->assembler_memory_bytes > t->limits.max_assembler_memory_bytes ||
+      additional_bytes >
+          t->limits.max_assembler_memory_bytes - t->assembler_memory_bytes) {
     t->stats.resource_limit_errors++;
     return false;
   }

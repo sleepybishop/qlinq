@@ -43,7 +43,10 @@ handles.
 - Path measurements and scheduler state belong to a connection; one client's
   RTT, loss, or telemetry must never determine another client's schedule.
 - Incoming FEC assemblers share a 64 MiB transport-wide memory budget and each
-  connection has eight active assembler slots.
+  connection has eight active assembler slots. Growth must fit both the old
+  buffers and their replacements within that budget until copying completes.
+  Rejected growth preserves partial data; reusing existing capacity requires
+  no additional allocation allowance.
 - NACK handling sends at most 64 requested symbols per repair and accepts at
   most 16 repair requests per connection per second.
 - Event payload pointers are borrowed and valid only during the callback.

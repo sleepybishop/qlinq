@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -126,7 +127,67 @@ static int test_udp_batch_boundaries(void) {
   return 0;
 }
 
+static int test_assembler_growth_budget(void) {
+  transport_t *transport = calloc(1, sizeof(*transport));
+  frame_assembler_t assembler = {0}, other = {0};
+  const uint16_t symbol_size = 64;
+  size_t small = transport_assembler_required_bytes(8, symbol_size);
+  size_t large = transport_assembler_required_bytes(16, symbol_size);
+  CHECK(transport, "assembler budget fixture");
+  transport->limits.max_assembler_memory_bytes = small + large;
+  CHECK(transport_grow_assembler(transport, &assembler, 8, symbol_size) &&
+            transport_grow_assembler(transport, &other, 8, symbol_size),
+        "two assemblers share one allocation budget");
+  assembler.total_symbols = 8;
+  assembler.symbol_size = symbol_size;
+  assembler.received_count = 2;
+  assembler.received_mask[0] = assembler.received_mask[7] = true;
+  memset(assembler.buffers[0], 13, symbol_size);
+  memset(assembler.buffers[7], 29, symbol_size);
+  uint8_t *old_storage = assembler.buffer_storage;
+  uint8_t **old_pointers = assembler.buffers;
+  /* Replacement fits after freeing the old buffers, but exceeds the shared
+   * cap while both old and new buffers are live. */
+  CHECK(
+      !transport_grow_assembler(transport, &assembler, 16, symbol_size),
+      "assembler growth reserves new allocation before crediting old storage");
+  CHECK(transport->stats.resource_limit_errors == 1 &&
+            transport->assembler_memory_bytes == 2 * small &&
+            assembler.buffer_storage == old_storage &&
+            assembler.buffers == old_pointers &&
+            assembler.capacity_symbols == 8 && assembler.received_count == 2 &&
+            assembler.received_mask[0] && assembler.received_mask[7] &&
+            assembler.buffers[0][symbol_size - 1] == 13 &&
+            assembler.buffers[7][symbol_size - 1] == 29,
+        "rejected growth preserves incomplete data, allocation and charge");
+  CHECK(transport_grow_assembler(transport, &assembler, 8, symbol_size) &&
+            transport->stats.resource_limit_errors == 1,
+        "capacity reuse needs no duplicate allocation allowance");
+  transport_release_assembler(transport, &other);
+  CHECK(transport->assembler_memory_bytes == small &&
+            transport_grow_assembler(transport, &assembler, 16, symbol_size),
+        "released peer allocation makes exact transient headroom available");
+  CHECK(transport->assembler_memory_bytes == large &&
+            assembler.capacity_symbols == 16 && assembler.received_count == 2 &&
+            assembler.received_mask[0] && assembler.received_mask[7] &&
+            assembler.buffers[0][symbol_size - 1] == 13 &&
+            assembler.buffers[7][symbol_size - 1] == 29,
+        "successful growth retains partial data and retires old charge");
+  transport_release_assembler(transport, &assembler);
+  CHECK(!transport->assembler_memory_bytes && !assembler.buffers &&
+            !assembler.buffer_storage && !assembler.capacity_symbols,
+        "terminal assembler release restores the shared budget");
+  fprintf(stderr,
+          "assembler growth budget: old=%zu new=%zu limit=%zu "
+          "rejected_with_peer=1 recovery_preserved=1 final_bytes=0\n",
+          small, large, small + large);
+  free(transport);
+  return 0;
+}
+
 int main(void) {
+  CHECK(test_assembler_growth_budget() == 0,
+        "assembler transient allocation budget");
   CHECK(test_udp_batch_boundaries() == 0, "UDP batch boundaries");
   CHECK(test_recovery_cache_protection() == 0, "recovery cache protection");
   transport_limits_t configured = {0};
