@@ -40,7 +40,7 @@
 #include "quicly/sendstate.h"
 #include "quicly/streambuf.h"
 
-#define QLINQ_STREAM_MULTIPATH_SEND_BATCH 8U
+#define QLINQ_STREAM_MULTIPATH_SEND_BATCH 6U
 
 uint64_t transport_get_time_ns(void) {
   struct timespec ts;
@@ -402,6 +402,18 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
                        (stats.bytes_in_flight % symbol_size != 0);
     sample.q = in_flight > FP_SAFE_WHOLE - sample.q ? FP_SAFE_WHOLE
                                                     : sample.q + in_flight;
+    /* Quicly emits at most one path per send call.  A stream call can consume
+     * a small packet batch, so account for that whole batch when comparing
+     * completion times; otherwise each decision charges one packet then sends
+     * several and flattens heterogeneous-link scheduling. */
+    size_t batch = quicly_has_datagram_frames(quic)
+                       ? 1U
+                       : QLINQ_STREAM_MULTIPATH_SEND_BATCH;
+    if (batch > 1U) {
+      size_t additional = batch - 1U;
+      sample.q = additional > FP_SAFE_WHOLE - sample.q ? FP_SAFE_WHOLE
+                                                       : sample.q + additional;
+    }
     quic_paths[count] = path;
     paths[count++] = sample;
   }
@@ -933,10 +945,20 @@ transport_t *transport_create(const transport_config_t *config) {
   t->owner_thread = pthread_self();
   atomic_init(&t->cross_thread_violations, 0);
   t->limits = limits;
-  t->sent_cache.max_payload_bytes = limits.max_recovery_cache_bytes;
+  size_t recovery_object_bytes =
+      limits.max_fec_object_size < TRANSPORT_MAX_FEC_GROUP_SIZE
+          ? limits.max_fec_object_size
+          : TRANSPORT_MAX_FEC_GROUP_SIZE;
+  if (!transport_sent_cache_init(&t->sent_cache,
+                                 limits.max_recovery_cache_bytes,
+                                 recovery_object_bytes)) {
+    free(t);
+    return NULL;
+  }
   if (config->repair_mode != TRANSPORT_REPAIR_MODE_AUTO &&
       config->repair_mode != TRANSPORT_REPAIR_MODE_INDEXED &&
       config->repair_mode != TRANSPORT_REPAIR_MODE_RATELESS) {
+    transport_sent_cache_destroy(&t->sent_cache);
     free(t);
     return NULL;
   }
@@ -947,6 +969,7 @@ transport_t *transport_create(const transport_config_t *config) {
 
   t->conns = calloc(t->limits.max_connections, sizeof(*t->conns));
   if (!t->conns) {
+    transport_sent_cache_destroy(&t->sent_cache);
     free(t);
     return NULL;
   }

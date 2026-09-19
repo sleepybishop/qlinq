@@ -427,6 +427,13 @@ int main(void) {
                 TRANSPORT_DEFAULT_MAX_AGGREGATE_REPAIR_REQUESTS_PER_SECOND &&
             resolved_limits.max_udp_payload_size == 1280,
         "default limits");
+  transport_sent_cache_t derived_cache = {0};
+  CHECK(transport_sent_cache_init(&derived_cache, 128U * 1024U * 1024U,
+                                  TRANSPORT_MAX_FEC_GROUP_SIZE) &&
+            derived_cache.capacity > TRANSPORT_SENT_CACHE_SIZE &&
+            derived_cache.capacity <= TRANSPORT_SENT_CACHE_MAX_SIZE,
+        "recovery cache slots scale with configured byte budget");
+  transport_sent_cache_destroy(&derived_cache);
   configured.max_aggregate_repair_requests_per_second = UINT16_MAX + 1U;
   CHECK(!transport_limits_resolve(&configured, &resolved_limits, limit_error,
                                   sizeof(limit_error)),

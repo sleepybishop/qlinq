@@ -15,13 +15,46 @@ static bool track_equal(const moq_track_id_t *a, const moq_track_id_t *b) {
          strcmp(a->name, b->name) == 0;
 }
 
+static size_t cache_capacity(const transport_sent_cache_t *cache) {
+  return cache && cache->capacity ? cache->capacity : TRANSPORT_SENT_CACHE_SIZE;
+}
+
+bool transport_sent_cache_init(transport_sent_cache_t *cache,
+                               size_t max_payload_bytes,
+                               size_t max_object_bytes) {
+  if (!cache || cache->entries)
+    return cache != NULL && cache->entries != NULL;
+  size_t byte_limit = max_payload_bytes
+                          ? max_payload_bytes
+                          : TRANSPORT_DEFAULT_RECOVERY_CACHE_BYTES;
+  size_t object_limit =
+      max_object_bytes ? max_object_bytes : TRANSPORT_MAX_FEC_OBJECT_SIZE;
+  size_t capacity = byte_limit / object_limit;
+  if (byte_limit % object_limit != 0)
+    capacity++;
+  if (capacity < TRANSPORT_SENT_CACHE_SIZE)
+    capacity = TRANSPORT_SENT_CACHE_SIZE;
+  if (capacity > TRANSPORT_SENT_CACHE_MAX_SIZE)
+    capacity = TRANSPORT_SENT_CACHE_MAX_SIZE;
+  if (capacity > SIZE_MAX / sizeof(*cache->entries))
+    return false;
+  cache->entries = calloc(capacity, sizeof(*cache->entries));
+  if (!cache->entries)
+    return false;
+  cache->capacity = capacity;
+  cache->max_payload_bytes = byte_limit;
+  return true;
+}
+
 sent_object_cache_t *transport_sent_cache_find(transport_sent_cache_t *cache,
                                                const moq_track_id_t *track,
                                                uint64_t group_id,
                                                uint64_t object_id) {
   if (!cache || !track)
     return NULL;
-  for (size_t i = 0; i < TRANSPORT_SENT_CACHE_SIZE; i++) {
+  if (!cache->entries)
+    return NULL;
+  for (size_t i = 0; i < cache_capacity(cache); i++) {
     sent_object_cache_t *entry = &cache->entries[i];
     if (entry->data && track_equal(&entry->track_id, track) &&
         entry->group_id == group_id && entry->object_id == object_id)
@@ -31,12 +64,7 @@ sent_object_cache_t *transport_sent_cache_find(transport_sent_cache_t *cache,
 }
 
 bool transport_sent_cache_has_space(const transport_sent_cache_t *cache) {
-  if (!cache)
-    return false;
-  for (size_t i = 0; i < TRANSPORT_SENT_CACHE_SIZE; i++)
-    if (!cache->entries[i].data)
-      return true;
-  return false;
+  return cache && cache->count < cache_capacity(cache);
 }
 
 static bool source_overlaps_entry(const moq_object_t *object,
@@ -57,7 +85,15 @@ bool transport_sent_cache_can_store(const transport_sent_cache_t *cache,
   size_t available =
       transport_sent_cache_byte_limit(cache) - cache->payload_bytes;
   bool slot_available = false;
-  for (size_t i = 0; i < TRANSPORT_SENT_CACHE_SIZE; i++) {
+  if (!cache->entries)
+    return cache->count == 0 && object->size <= available;
+  /* The common admission path needs neither replacement nor identity lookup:
+   * a free entry and sufficient byte budget make the object storable. Exact
+   * identity validation remains in store(), while the slower scan below is
+   * reserved for a full cache, byte pressure, retries, or eviction. */
+  if (cache->count < cache_capacity(cache) && object->size <= available)
+    return true;
+  for (size_t i = 0; i < cache_capacity(cache); i++) {
     const sent_object_cache_t *entry = &cache->entries[i];
     if (!entry->data) {
       slot_available = true;
@@ -91,6 +127,10 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
                                 uint16_t symbol_size, bool allow_evict) {
   if (!cache || !object || !object->data || object->size == 0)
     return false;
+  if (!cache->entries &&
+      !transport_sent_cache_init(cache, cache->max_payload_bytes,
+                                 TRANSPORT_MAX_FEC_OBJECT_SIZE))
+    return false;
   sent_object_cache_t *existing = transport_sent_cache_find(
       cache, &object->track_id, object->group_id, object->object_id);
   if (existing) {
@@ -121,11 +161,11 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
   for (size_t offset = 0;
        object->size >
            transport_sent_cache_byte_limit(cache) - cache->payload_bytes ||
-       cache->count == TRANSPORT_SENT_CACHE_SIZE;
+       cache->count == cache_capacity(cache);
        offset++) {
-    if (!allow_evict || offset == TRANSPORT_SENT_CACHE_SIZE)
+    if (!allow_evict || offset == cache_capacity(cache))
       return false;
-    size_t index = (cache->next_entry + offset) % TRANSPORT_SENT_CACHE_SIZE;
+    size_t index = (cache->next_entry + offset) % cache_capacity(cache);
     if (cache->entries[index].data &&
         !cache->entries[index].recovery_protected &&
         !source_overlaps_entry(object, &cache->entries[index]))
@@ -133,11 +173,11 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
   }
   sent_object_cache_t *entry = NULL;
   size_t next_entry = cache->next_entry;
-  for (size_t offset = 0; offset < TRANSPORT_SENT_CACHE_SIZE; offset++) {
-    size_t index = (cache->next_entry + offset) % TRANSPORT_SENT_CACHE_SIZE;
+  for (size_t offset = 0; offset < cache_capacity(cache); offset++) {
+    size_t index = (cache->next_entry + offset) % cache_capacity(cache);
     if (!cache->entries[index].data) {
       entry = &cache->entries[index];
-      next_entry = (index + 1U) % TRANSPORT_SENT_CACHE_SIZE;
+      next_entry = (index + 1U) % cache_capacity(cache);
       break;
     }
   }
@@ -178,7 +218,9 @@ size_t transport_sent_cache_release_through(transport_sent_cache_t *cache,
   if (!cache || !track)
     return 0;
   size_t released = 0;
-  for (size_t i = 0; i < TRANSPORT_SENT_CACHE_SIZE; i++) {
+  if (!cache->entries)
+    return 0;
+  for (size_t i = 0; i < cache_capacity(cache); i++) {
     sent_object_cache_t *entry = &cache->entries[i];
     if (entry->data && track_equal(&entry->track_id, track) &&
         entry->group_id == group_id && entry->object_id <= object_id) {
@@ -194,7 +236,9 @@ size_t transport_sent_cache_release_track(transport_sent_cache_t *cache,
   if (!cache || !track)
     return 0;
   size_t released = 0;
-  for (size_t i = 0; i < TRANSPORT_SENT_CACHE_SIZE; i++) {
+  if (!cache->entries)
+    return 0;
+  for (size_t i = 0; i < cache_capacity(cache); i++) {
     sent_object_cache_t *entry = &cache->entries[i];
     if (entry->data && track_equal(&entry->track_id, track)) {
       release_entry(cache, entry);
@@ -207,8 +251,9 @@ size_t transport_sent_cache_release_track(transport_sent_cache_t *cache,
 void transport_sent_cache_destroy(transport_sent_cache_t *cache) {
   if (!cache)
     return;
-  for (size_t i = 0; i < TRANSPORT_SENT_CACHE_SIZE; i++)
+  for (size_t i = 0; cache->entries && i < cache_capacity(cache); i++)
     free(cache->entries[i].data);
+  free(cache->entries);
   memset(cache, 0, sizeof(*cache));
 }
 

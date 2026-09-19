@@ -4,8 +4,9 @@
 
 #define QLINQ_RECOVERY_WINDOW_OBJECTS TRANSPORT_RECOVERY_WINDOW_OBJECTS
 /* A rateless sender can publish many 32-object windows during one repair RTT.
- * Retain a bounded 2048-object history, matching the sent-cache entry cap. */
-#define QLINQ_RECOVERY_MAX_WINDOWS 64U
+ * Retain a bounded 4096-object history, matching the maximum derived
+ * sent-cache slot count for 32 KiB FEC groups. */
+#define QLINQ_RECOVERY_MAX_WINDOWS 128U
 #define QLINQ_RECOVERY_HISTORY_OBJECTS                                         \
   (QLINQ_RECOVERY_WINDOW_OBJECTS * QLINQ_RECOVERY_MAX_WINDOWS)
 

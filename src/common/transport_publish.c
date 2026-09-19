@@ -128,6 +128,16 @@ publish_datagram_to_conn(transport_t *t, transport_conn_t *conn,
     active_samples[active_paths] = transport_path_estimate(
         &stats, queued, t->egress[physical].bytes, estimate_symbol_size,
         conn->latest_owd_fp[physical]);
+    /* Datagram groups leave QLINQ's queue quickly, but remain serialized by
+     * QUIC until the path ACKs them.  Include that outstanding work in the
+     * Pathflow input, as the stream scheduler does, so a fast path is not
+     * repeatedly selected simply because its local queue has drained. */
+    size_t in_flight = stats.bytes_in_flight / estimate_symbol_size +
+                       (stats.bytes_in_flight % estimate_symbol_size != 0);
+    active_samples[active_paths].q =
+        in_flight > FP_SAFE_WHOLE - active_samples[active_paths].q
+            ? FP_SAFE_WHOLE
+            : active_samples[active_paths].q + in_flight;
     if (!conn->path_state_overridden[physical]) {
       fp_t cap =
           transport_path_probe_cap(&conn->path_measurements[physical], &stats,
@@ -569,7 +579,7 @@ bool transport_publish_recovery_ready(transport_t *t,
   if (!t || !track_id)
     return false;
   if (track_id->type != MOQ_TRACK_DATA ||
-      (track_id->flags & MOQ_TRACK_FLAG_RELIABLE) != 0)
+      !transport_track_profile(track_id).fec_rateless)
     return true;
   const transport_sent_cache_t *cache = &t->sent_cache;
   size_t needed = t->fec_buf_len != 0 ? t->fec_buf_len : 1;
@@ -577,7 +587,9 @@ bool transport_publish_recovery_ready(transport_t *t,
     return false;
   size_t available =
       transport_sent_cache_byte_limit(cache) - cache->payload_bytes;
-  bool slot = cache->count < TRANSPORT_SENT_CACHE_SIZE;
+  size_t capacity =
+      cache->capacity ? cache->capacity : TRANSPORT_SENT_CACHE_SIZE;
+  bool slot = cache->count < capacity;
   /* The normal query stays constant-time. Recipient and eviction scans are
    * needed only when the count or byte budget actually prevents admission. */
   if (slot && needed <= available)
@@ -588,7 +600,7 @@ bool transport_publish_recovery_ready(transport_t *t,
     return false;
   /* Preserve legacy eviction, without advertising protected entries as free
    * space to a different track. Actual send still performs exact admission. */
-  for (size_t i = 0; i < TRANSPORT_SENT_CACHE_SIZE; i++) {
+  for (size_t i = 0; cache->entries && i < capacity; i++) {
     const sent_object_cache_t *entry = &cache->entries[i];
     if (entry->data && !entry->recovery_protected) {
       available += entry->size;
@@ -746,7 +758,9 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
     }
 
     if (use_fec) {
-      size_t group_limit = fec_limit < 16384U ? fec_limit : 16384U;
+      size_t group_limit = fec_limit < TRANSPORT_MAX_FEC_GROUP_SIZE
+                               ? fec_limit
+                               : TRANSPORT_MAX_FEC_GROUP_SIZE;
       if (obj->size > TRANSPORT_MAX_FEC_RECORD_SIZE || fec_limit < 2U ||
           obj->size > fec_limit - 2U)
         return TRANSPORT_PUBLISH_INVALID;
@@ -908,7 +922,7 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
   bool protect_repair_cache = obj->track_id.type == MOQ_TRACK_DATA &&
                               profile.fec_rateless &&
                               checkpoint_cache_is_protected(t, &obj->track_id);
-  if (obj->track_id.type == MOQ_TRACK_DATA &&
+  if (obj->track_id.type == MOQ_TRACK_DATA && profile.fec_rateless &&
       !transport_sent_cache_can_store(&t->sent_cache, obj,
                                       !protect_repair_cache)) {
     t->stats.recovery_cache_backpressure++;
@@ -960,7 +974,7 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
   }
 
   if ((delivered > 0 || partially_queued) &&
-      obj->track_id.type == MOQ_TRACK_DATA &&
+      obj->track_id.type == MOQ_TRACK_DATA && profile.fec_rateless &&
       !transport_sent_cache_store(&t->sent_cache, obj, maximum_sent_symbols,
                                   (uint16_t)data_symbols, (uint16_t)symbol_size,
                                   !protect_repair_cache))

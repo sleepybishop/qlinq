@@ -13,13 +13,13 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-# Three heterogeneous transit capacities. The 100 Mbps qualification offer
+# Three heterogeneous transit capacities. The 1 Gbps qualification offer
 # requires aggregation once fixed-FEC wire overhead is included.
-RATES = (20, 50, 100)
+RATES = (250, 500, 1000)
 WARMUP = 4.0
 DURATION = 12.0
-DEFAULT_OFFERED_MBPS = 100.0
-DEFAULT_INITIAL_MBPS = 20.0
+DEFAULT_OFFERED_MBPS = 1000.0
+DEFAULT_INITIAL_MBPS = 250.0
 
 
 def command(*args):
@@ -39,9 +39,13 @@ def setup_links():
             # Separate forward/reverse classes avoid sharing a cap with ACKs.
             command("tc", "class", "add", "dev", "lo", "parent", "1:",
                     "classid", "1:" + handle, "htb", "rate", f"{rate}mbit",
-                    "ceil", f"{rate}mbit", "burst", "4kb", "cburst", "4kb")
+                    "ceil", f"{rate}mbit", "burst", "32kb", "cburst", "32kb")
+            # The queue must cover the shaped link's 20 ms delay window. 128
+            # packets is below the 200 Mbps BDP and manufactures drops from
+            # otherwise harmless scheduler bursts; report-side gates still
+            # bound the observed backlog.
             command("tc", "qdisc", "add", "dev", "lo", "parent", "1:" + handle,
-                    "handle", handle + ":", "netem", "delay", "20ms", "limit", "128")
+                    "handle", handle + ":", "netem", "delay", "20ms", "limit", "2048")
             command("tc", "filter", "add", "dev", "lo", "protocol", "ip", "parent", "1:",
                     "prio", "1", "u32", "match", "ip", "dst", address + "/32",
                     "flowid", "1:" + handle)
