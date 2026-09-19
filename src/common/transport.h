@@ -141,7 +141,9 @@ typedef void (*transport_callback_t)(void *user_data,
  * transport-level bounds, not application schemas or track hierarchies. */
 #define TRANSPORT_DEFAULT_MAX_CONNECTIONS 32U
 #define TRANSPORT_DEFAULT_MAX_SUBSCRIPTIONS 32U
-#define TRANSPORT_DEFAULT_MAX_ASSEMBLERS 8U
+/* This is a per-peer cap. The live receive window starts small and grows from
+ * measured path BDP; it does not reserve or scan this many objects. */
+#define TRANSPORT_DEFAULT_MAX_ASSEMBLERS 1024U
 #define TRANSPORT_DEFAULT_MAX_REPAIR_REQUESTS_PER_SECOND 16U
 #define TRANSPORT_DEFAULT_MAX_AGGREGATE_REPAIR_REQUESTS_PER_SECOND 256U
 #define TRANSPORT_DEFAULT_MAX_AGGREGATE_NACK_REQUESTS_PER_SECOND 16U
@@ -158,12 +160,14 @@ typedef void (*transport_callback_t)(void *user_data,
 
 #define TRANSPORT_HARD_MAX_CONNECTIONS 1024U
 #define TRANSPORT_HARD_MAX_SUBSCRIPTIONS 256U
-#define TRANSPORT_HARD_MAX_ASSEMBLERS 8U
+#define TRANSPORT_HARD_MAX_ASSEMBLERS 1024U
 #define TRANSPORT_HARD_MAX_EGRESS_PACKETS 65536U
 
 typedef struct {
   size_t max_connections;
   size_t max_subscriptions_per_connection; /* independently in each direction */
+  /* Maximum live FEC receive objects per peer. The active window is derived
+   * from measured path capacity and RTT, then clamped to this value. */
   size_t max_assemblers_per_connection;
   size_t max_repair_requests_per_second;
   size_t max_aggregate_repair_requests_per_second;

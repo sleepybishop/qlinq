@@ -40,15 +40,169 @@
 #include "quicly/sendstate.h"
 #include "quicly/streambuf.h"
 
+#define QLINQ_STREAM_MULTIPATH_SEND_BATCH 8U
+
 uint64_t transport_get_time_ns(void) {
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
   return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
+uint64_t transport_get_monotonic_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+/* Exact identities share hash buckets; collisions never replace live objects.
+ * Slot references are offset by one so calloc initializes empty indexes. */
+size_t transport_receive_bucket(uint8_t alias, uint64_t group,
+                                uint64_t object) {
+  uint64_t key =
+      object ^ (group * UINT64_C(0x9e3779b97f4a7c15)) ^ ((uint64_t)alias << 56);
+  key ^= key >> 30;
+  key *= UINT64_C(0xbf58476d1ce4e5b9);
+  key ^= key >> 27;
+  return (size_t)key & (QLINQ_ASSEMBLER_BUCKETS - 1U);
+}
+
+size_t transport_next_assembler(const transport_conn_t *conn, size_t first) {
+  if (conn->assembler_count == 0 || first >= TRANSPORT_HARD_MAX_ASSEMBLERS)
+    return TRANSPORT_HARD_MAX_ASSEMBLERS;
+  size_t word = first / 64U;
+  uint64_t bits = conn->active_assemblers[word] & (UINT64_MAX << (first % 64U));
+  for (;;) {
+    if (bits != 0)
+      return word * 64U + (size_t)__builtin_ctzll(bits);
+    if (++word ==
+        sizeof(conn->active_assemblers) / sizeof(conn->active_assemblers[0]))
+      return TRANSPORT_HARD_MAX_ASSEMBLERS;
+    bits = conn->active_assemblers[word];
+  }
+}
+
+frame_assembler_t *transport_find_assembler(transport_conn_t *conn,
+                                            uint8_t alias, uint64_t group_id,
+                                            uint64_t object_id) {
+  size_t bucket = transport_receive_bucket(alias, group_id, object_id);
+  for (uint16_t ref = conn->assembler_buckets[bucket]; ref != 0;) {
+    frame_assembler_t *a = &conn->assemblers[ref - 1U];
+    if (a->track_id == alias && a->group_id == group_id &&
+        a->object_id == object_id)
+      return a;
+    ref = a->hash_next;
+  }
+  return NULL;
+}
+
+void transport_unindex_assembler(frame_assembler_t *a) {
+  transport_conn_t *conn = a->owner;
+  if (!conn)
+    return;
+  size_t bucket =
+      transport_receive_bucket(a->track_id, a->group_id, a->object_id);
+  uint16_t ref = (uint16_t)(a - conn->assemblers + 1U);
+  uint16_t *link = &conn->assembler_buckets[bucket];
+  while (*link != ref && *link != 0)
+    link = &conn->assemblers[*link - 1U].hash_next;
+  if (*link == ref) {
+    *link = a->hash_next;
+    conn->assembler_count--;
+    size_t slot = ref - 1U;
+    conn->active_assemblers[slot / 64U] &= ~(UINT64_C(1) << (slot % 64U));
+  }
+  a->owner = NULL;
+  a->hash_next = 0;
+}
+
+void transport_index_assembler(transport_conn_t *conn, frame_assembler_t *a) {
+  size_t bucket =
+      transport_receive_bucket(a->track_id, a->group_id, a->object_id);
+  a->owner = conn;
+  a->hash_next = conn->assembler_buckets[bucket];
+  conn->assembler_buckets[bucket] = (uint16_t)(a - conn->assemblers + 1U);
+  conn->assembler_count++;
+  size_t slot = (size_t)(a - conn->assemblers);
+  conn->active_assemblers[slot / 64U] |= UINT64_C(1) << (slot % 64U);
+}
+
+/* A receiver observes payload arrival, not the sender's congestion window.
+ * Estimate a receive BDP from that rate and its observed path RTTs.  Keep two
+ * BDPs plus a small reorder floor, and retain the high-water mark for this
+ * connection; reducing the pool while objects are live would induce evictions.
+ */
+size_t transport_assembler_window(transport_conn_t *conn,
+                                  uint16_t total_symbols,
+                                  uint16_t symbol_size) {
+  if (!conn || !conn->transport || total_symbols == 0 || symbol_size == 0)
+    return QLINQ_MIN_ASSEMBLER_WINDOW;
+  transport_t *t = conn->transport;
+  size_t cap = t->limits.max_assemblers_per_connection;
+  size_t minimum =
+      cap < QLINQ_MIN_ASSEMBLER_WINDOW ? cap : QLINQ_MIN_ASSEMBLER_WINDOW;
+  size_t object_bytes = (size_t)total_symbols * symbol_size;
+  uint32_t rtt_ms = 25;
+  if (conn->quic) {
+    for (size_t i = 0; i < TRANSPORT_MAX_QUIC_PATHS; i++) {
+      quicly_path_stats_t stats;
+      if (quicly_get_path_stats(conn->quic, i, &stats) == 0 &&
+          stats.rtt_smoothed > rtt_ms)
+        rtt_ms = stats.rtt_smoothed;
+    }
+  }
+  uint64_t bdp_bytes = conn->assembler_rx_rate > UINT64_MAX / rtt_ms
+                           ? UINT64_MAX
+                           : conn->assembler_rx_rate * rtt_ms / 1000U;
+  uint64_t target = minimum;
+  if (bdp_bytes != 0) {
+    uint64_t double_bdp =
+        bdp_bytes > UINT64_MAX / 2U ? UINT64_MAX : bdp_bytes * 2U;
+    target += (double_bdp + object_bytes - 1U) / object_bytes;
+  }
+  if (target > cap)
+    target = cap;
+  if (conn->assembler_limit < target)
+    conn->assembler_limit = (size_t)target;
+  if (conn->assembler_limit < minimum)
+    conn->assembler_limit = minimum;
+  return conn->assembler_limit;
+}
+
+void transport_assembler_observe_receive(transport_conn_t *conn,
+                                         size_t payload_bytes) {
+  if (!conn || payload_bytes == 0)
+    return;
+  uint64_t now_ms = (uint64_t)transport_get_time_ms();
+  if (conn->assembler_rx_window_started_ms == 0 ||
+      now_ms < conn->assembler_rx_window_started_ms) {
+    conn->assembler_rx_window_started_ms = now_ms;
+    conn->assembler_rx_window_bytes = payload_bytes;
+    return;
+  }
+  if (payload_bytes > SIZE_MAX - conn->assembler_rx_window_bytes)
+    conn->assembler_rx_window_bytes = SIZE_MAX;
+  else
+    conn->assembler_rx_window_bytes += payload_bytes;
+  uint64_t elapsed = now_ms - conn->assembler_rx_window_started_ms;
+  if (elapsed == 0)
+    return;
+  uint64_t rate = conn->assembler_rx_window_bytes > UINT64_MAX / 1000U
+                      ? UINT64_MAX
+                      : conn->assembler_rx_window_bytes * 1000U / elapsed;
+  if (rate > conn->assembler_rx_rate)
+    conn->assembler_rx_rate = rate;
+  /* Bound the observation interval so a later sparse packet cannot dilute
+   * the startup delivery measurement that sizes this connection's window. */
+  if (elapsed >= 25U) {
+    conn->assembler_rx_window_started_ms = now_ms;
+    conn->assembler_rx_window_bytes = 0;
+  }
+}
+
 void transport_release_assembler(transport_t *t, frame_assembler_t *assembler) {
   if (!t || !assembler)
     return;
+  transport_unindex_assembler(assembler);
   size_t bytes = transport_assembler_capacity_bytes(assembler);
   if (bytes <= t->assembler_memory_bytes)
     t->assembler_memory_bytes -= bytes;
@@ -213,29 +367,88 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
   if (!conn || !conn->transport)
     return 0;
   transport_t *t = conn->transport;
-  for (size_t offset = 0; offset < TRANSPORT_MAX_QUIC_PATHS; offset++) {
-    size_t path = (conn->round_robin_path + offset) % TRANSPORT_MAX_QUIC_PATHS;
-    if (!quicly_is_path_available(quic, path))
+  size_t quic_paths[TRANSPORT_MAX_PATHS];
+  path_t paths[TRANSPORT_MAX_PATHS];
+  size_t count = 0;
+  size_t symbol_size = transport_get_datagram_symbol_size(t);
+  if (symbol_size == 0)
+    symbol_size = 1200;
+
+  for (size_t physical = 0; physical < t->num_fds; physical++) {
+    quicly_path_stats_t stats;
+    size_t path = transport_path_get_stats_by_link(
+        quic, t->local_addrs, t->num_fds, physical, &stats);
+    if (path >= TRANSPORT_MAX_QUIC_PATHS ||
+        !quicly_is_path_available(quic, path))
       continue;
-    bool has_socket = false;
-    for (size_t physical = 0; physical < t->num_fds; physical++) {
-      if (transport_path_find_by_link(quic, t->local_addrs, t->num_fds,
-                                      physical) == path) {
-        has_socket = true;
-        break;
+    path_t sample = transport_path_estimate(
+        &stats, quicly_get_num_datagram_frames_path(quic, path),
+        t->egress[physical].bytes, symbol_size, conn->latest_owd_fp[physical]);
+    const path_state_t *state = &conn->path_states[physical];
+    if (state->initialized) {
+      /* Delivery-rate EWMA is demand-limited when this path has been
+       * underused. Keep the live cwnd / RTT rate for stream scheduling, while
+       * retaining conservative history for latency, loss, and queued work. */
+      if (state->l_ewma > sample.l)
+        sample.l = state->l_ewma;
+      if (state->p_ewma > sample.p)
+        sample.p = state->p_ewma;
+      if (state->q_ewma > sample.q)
+        sample.q = state->q_ewma;
+    }
+    /* Stream frames have no per-path qlinq queue. Account for QUIC's
+     * in-flight stream packets so Pathflow sees their serialized work. */
+    size_t in_flight = stats.bytes_in_flight / symbol_size +
+                       (stats.bytes_in_flight % symbol_size != 0);
+    sample.q = in_flight > FP_SAFE_WHOLE - sample.q ? FP_SAFE_WHOLE
+                                                    : sample.q + in_flight;
+    quic_paths[count] = path;
+    paths[count++] = sample;
+  }
+  if (count == 0)
+    return 0;
+
+  /* A one-packet greedy Pathflow plan selects the path with the earliest
+   * predicted completion, including loss, latency, bandwidth and queued
+   * work. Unlike the former round robin, this applies to stream packets too. */
+  conn->scheduler_context.offset = 0;
+  if (pathflow_optimize(&conn->scheduler_context, count, 1, paths,
+                        FP_FROM_FLOAT(10.0f), 99,
+                        PATHFLOW_SOLVER_GREEDY) == PATHFLOW_ERROR)
+    return 0;
+
+  size_t selected = 0;
+  while (selected < count && paths[selected].m == 0)
+    selected++;
+  if (selected == count)
+    return 0;
+
+  for (size_t attempt = 0; attempt < count; attempt++) {
+    size_t index = attempt == 0 ? selected : SIZE_MAX;
+    if (index == SIZE_MAX) {
+      fp_t earliest = FP_MAX;
+      for (size_t i = 0; i < count; i++) {
+        if (i == selected || paths[i].m == SIZE_MAX)
+          continue;
+        fp_t finish =
+            FP_ADD(paths[i].l,
+                   FP_DIV(FP_ADD(FP_FROM_INT(paths[i].q), FP_ONE), paths[i].b));
+        if (index == SIZE_MAX || finish < earliest) {
+          earliest = finish;
+          index = i;
+        }
       }
     }
-    if (!has_socket)
-      continue;
+    if (index == SIZE_MAX)
+      break;
+    paths[index].m = SIZE_MAX; /* do not retry an empty send path */
     size_t packets_sent = 0;
-    quicly_error_t ret =
-        quicly_send_on_path(quic, send_context, path, &packets_sent);
+    quicly_error_t ret = quicly_send_on_path(quic, send_context,
+                                             quic_paths[index], &packets_sent);
     if (ret != 0)
       return ret;
-    if (packets_sent != 0) {
-      conn->round_robin_path = (path + 1U) % TRANSPORT_MAX_QUIC_PATHS;
+    if (packets_sent != 0)
       break;
-    }
   }
   return 0;
 }
@@ -500,6 +713,8 @@ static void remove_connection_physical_slot(transport_t *t,
       continue;
     for (size_t i = removed_index; i + 1 < t->num_fds; i++) {
       conn->path_states[i] = conn->path_states[i + 1];
+      conn->path_measurements[i] = conn->path_measurements[i + 1];
+      conn->path_budgets[i] = conn->path_budgets[i + 1];
       conn->min_owd_ns[i] = conn->min_owd_ns[i + 1];
       conn->owd_initialized[i] = conn->owd_initialized[i + 1];
       conn->telemetry_path[i] = conn->telemetry_path[i + 1];
@@ -510,6 +725,10 @@ static void remove_connection_physical_slot(transport_t *t,
     }
     size_t last = t->num_fds - 1U;
     memset(&conn->path_states[last], 0, sizeof(conn->path_states[last]));
+    memset(&conn->path_measurements[last], 0,
+           sizeof(conn->path_measurements[last]));
+    memset(&conn->path_budgets[last], 0, sizeof(conn->path_budgets[last]));
+    conn->admission_retry_at_ns = 0;
     conn->min_owd_ns[last] = 0;
     conn->owd_initialized[last] = false;
     conn->telemetry_path[last] = 0;
@@ -836,15 +1055,26 @@ transport_t *transport_create(const transport_config_t *config) {
   if (config->quic_idle_timeout_ms != 0)
     t->quic_ctx.transport_params.max_idle_timeout =
         config->quic_idle_timeout_ms;
-  /* The parser consumes complete frames. Its receive window must include
-   * both headers as well as the largest advertised application record. */
-  t->quic_ctx.transport_params.max_stream_data.uni =
-      t->limits.max_reliable_object_size + QLINQ_WIRE_FRAME_HEADER_SIZE +
-      QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE;
+  /* Reliable tracks are long-lived unidirectional streams. Advertising only
+   * one maximum object as their flow-control window caps a 40 ms path near
+   * 200 Mbps. The configured stream budget is already a bounded per-stream
+   * receive commitment, so use it as the window while retaining the object
+   * minimum for configurations with a smaller budget. */
+  uint64_t reliable_stream_window = t->limits.max_stream_egress_bytes;
+  uint64_t reliable_object_window =
+      (uint64_t)t->limits.max_reliable_object_size +
+      QLINQ_WIRE_FRAME_HEADER_SIZE + QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE;
+  if (reliable_stream_window < reliable_object_window)
+    reliable_stream_window = reliable_object_window;
+  t->quic_ctx.transport_params.max_stream_data.uni = reliable_stream_window;
   if (t->quic_ctx.transport_params.max_stream_data.bidi_local <
-      t->quic_ctx.transport_params.max_stream_data.uni)
+      reliable_stream_window)
     t->quic_ctx.transport_params.max_stream_data.bidi_local =
-        t->quic_ctx.transport_params.max_stream_data.uni;
+        reliable_stream_window;
+  if (t->quic_ctx.transport_params.max_data <
+      t->limits.max_total_stream_egress_bytes)
+    t->quic_ctx.transport_params.max_data =
+        t->limits.max_total_stream_egress_bytes;
   t->quic_ctx.transport_params.max_streams_uni = 100;
   t->quic_ctx.transport_params.max_streams_bidi = 100;
 
@@ -1139,7 +1369,10 @@ void transport_tick(transport_t *t) {
     if (!conn || !conn->quic ||
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
       continue;
-    for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++) {
+    transport_protocol_flush_recovery_acks(conn);
+    for (size_t i = transport_next_assembler(conn, 0);
+         i < t->limits.max_assemblers_per_connection;
+         i = transport_next_assembler(conn, i + 1U)) {
       frame_assembler_t *asm_slot = &conn->assemblers[i];
       if (asm_slot->total_symbols == 0)
         continue;
@@ -1224,26 +1457,22 @@ void transport_tick(transport_t *t) {
             now_nack_ms - window->last_request_ms <
                 QLINQ_FEC_COMPLETION_RETRY_MS)
           continue;
-        for (uint32_t attempt = 0; attempt < QLINQ_RECOVERY_WINDOW_OBJECTS;
+        /* Pipeline distinct missing objects within the existing tick, token
+         * and control-queue budgets. One request per retry interval adds
+         * 500 ms between requests for a burst of lost objects. Keep the start
+         * fixed while the cursor advances after each admitted request. */
+        uint32_t first_bit = window->cursor;
+        for (uint32_t attempt = 0;
+             attempt < QLINQ_RECOVERY_WINDOW_OBJECTS && object_nack_budget > 0;
              attempt++) {
-          uint32_t bit =
-              (window->cursor + attempt) % QLINQ_RECOVERY_WINDOW_OBJECTS;
+          uint32_t bit = (first_bit + attempt) % QLINQ_RECOVERY_WINDOW_OBJECTS;
           if ((window->missing_mask & (1U << bit)) == 0)
             continue;
           uint64_t object_id = window->first_object_id + bit;
           if (object_id > window->final_object_id)
             continue;
-          bool assembling = false;
-          for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++) {
-            frame_assembler_t *assembler = &conn->assemblers[i];
-            if (assembler->total_symbols > 0 && assembler->track_id == alias &&
-                assembler->group_id == window->group_id &&
-                assembler->object_id == object_id) {
-              assembling = true;
-              break;
-            }
-          }
-          if (assembling)
+          if (transport_find_assembler(conn, alias, window->group_id,
+                                       object_id))
             continue;
           aggregate_wait = transport_repair_limiter_wait_ms(
               &t->aggregate_nack_limiter,
@@ -1258,13 +1487,16 @@ void transport_tick(transport_t *t) {
             window->last_request_ms = now_nack_ms;
             object_nack_budget--;
             t->recovery_conn_cursor = (c + 1U) % active_conns;
+          } else {
+            break;
           }
-          break;
         }
       }
     }
 
-    for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++) {
+    for (size_t i = transport_next_assembler(conn, 0);
+         i < t->limits.max_assemblers_per_connection;
+         i = transport_next_assembler(conn, i + 1U)) {
       frame_assembler_t *asm_slot = &conn->assemblers[i];
       if (asm_slot->total_symbols == 0)
         continue;
@@ -1641,74 +1873,34 @@ recovery_sweep_done:
       transport_conn_t *target = t->is_server ? t->conns[c] : t->client_conn;
       if (!target || !target->quic)
         continue;
-      /* Pathflow needs only the primary RTT and congestion window. Reading
-       * the complete connection counters for every peer every 25 ms copies
-       * unrelated telemetry and polls the delivery-rate estimator. */
-      quicly_path_stats_t primary;
-      uint32_t primary_rtt, primary_cwnd;
-      bool have_primary = quicly_get_path_stats(target->quic, 0, &primary) == 0;
-      if (have_primary) {
-        primary_rtt = primary.rtt_smoothed;
-        primary_cwnd = primary.cwnd;
-      } else {
-        /* A primary address may disappear while its path space survives. */
-        quicly_stats_t stats;
-        if (quicly_get_stats(target->quic, &stats) != 0)
-          continue;
-        primary_rtt = (uint32_t)stats.rtt.smoothed;
-        primary_cwnd = stats.cc.cwnd;
-      }
-      /* convert RTT to seconds */
-      fp_t l = FP_DIV(FP_FROM_INT(primary_rtt), FP_FROM_INT(1000));
-
-      /* convert bandwidth to packets/second */
-      size_t cwnd_packets = primary_cwnd / symbol_size;
-      if (cwnd_packets == 0)
-        cwnd_packets = 1;
-      uint32_t rtt_val = primary_rtt > 0 ? primary_rtt : 1;
-      fp_t b = FP_FROM_INT(cwnd_packets * 1000 / rtt_val);
-      if (b <= 0) {
-        b = FP_FROM_INT(100);
-      }
-
-      fp_t p = FP_FROM_FLOAT(0.01f); /* default mock loss rate */
-      size_t q = 0;                  /* bytes in flight or egress queue size */
-
       for (size_t i = 0; i < t->num_fds; i++) {
         if (target->path_state_overridden[i])
           continue;
-        /* use path-specific stats if available, otherwise fallback to
-         * connection defaults */
-        fp_t path_l = l / 2;
-        fp_t path_p = p;
-        quicly_path_stats_t matched;
-        const quicly_path_stats_t *path_stats = &primary;
-        size_t path_idx = 0;
-        /* Link lookup starts at path zero. Its snapshot was already read
-         * above, and no QUIC state changes during this synchronous update. */
-        if (!have_primary ||
-            !transport_path_matches_local(&primary, &t->local_addrs[i])) {
-          path_idx = transport_path_get_stats_by_link(
-              target->quic, t->local_addrs, t->num_fds, i, &matched);
-          path_stats = &matched;
+        quicly_path_stats_t stats;
+        size_t mapped = transport_path_get_stats_by_link(
+            target->quic, t->local_addrs, t->num_fds, i, &stats);
+        if (mapped == SIZE_MAX ||
+            !quicly_is_path_available(target->quic, mapped)) {
+          /* A newly available path must start from its own measurements. */
+          memset(&target->path_states[i], 0, sizeof(target->path_states[i]));
+          memset(&target->path_measurements[i], 0,
+                 sizeof(target->path_measurements[i]));
+          memset(&target->path_budgets[i], 0, sizeof(target->path_budgets[i]));
+          continue;
         }
-        if (path_idx < TRANSPORT_MAX_QUIC_PATHS) {
-          if (path_stats->rtt_smoothed > 0) {
-            path_l = FP_DIV(FP_FROM_INT(path_stats->rtt_smoothed),
-                            FP_FROM_INT(2000));
-          }
-          if (path_stats->sent > 0) {
-            path_p = FP_DIV(FP_FROM_INT(path_stats->lost),
-                            FP_FROM_INT(path_stats->sent));
-          }
-        }
-
-        if (target->latest_owd_fp[i] > 0) {
-          path_l += target->latest_owd_fp[i];
-        }
-
-        pathflow_update_state(&target->path_states[i], b, path_l, path_p, q,
-                              FP_FROM_FLOAT(0.1f));
+        size_t queued =
+            quicly_get_num_datagram_frames_path(target->quic, mapped);
+        if (transport_path_measure(&target->path_measurements[i], &stats,
+                                   mapped, queued, now))
+          memset(&target->path_budgets[i], 0, sizeof(target->path_budgets[i]));
+        path_t sample =
+            transport_path_estimate(&stats, queued, t->egress[i].bytes,
+                                    symbol_size, target->latest_owd_fp[i]);
+        fp_t cap = transport_path_probe_cap(&target->path_measurements[i],
+                                            &stats, symbol_size, now);
+        if (sample.b > cap)
+          sample.b = cap;
+        transport_path_update_state(&target->path_states[i], &sample, true);
       }
     }
   }
@@ -1742,6 +1934,12 @@ recovery_sweep_done:
       struct iovec dgrams[64];
       uint8_t dgrams_buf[64 * 1500];
       size_t num_dgrams = 64;
+      /* qlinq_path_scheduler_send makes a packet-granular Pathflow choice.
+       * Quicly may consume the whole output batch on that path, so bound
+       * stream-only multipath batches to keep a single decision from steering
+       * 64 packets. Datagram publication retains its 64-packet queue batch. */
+      if (t->num_fds > 1 && !quicly_has_datagram_frames(conn->quic))
+        num_dgrams = QLINQ_STREAM_MULTIPATH_SEND_BATCH;
       int send_res = quicly_send(conn->quic, &dest, &src, dgrams, &num_dgrams,
                                  dgrams_buf, sizeof(dgrams_buf));
       if (send_res == 0) {
@@ -2396,6 +2594,9 @@ bool transport_mock_path_state(transport_t *t, size_t path_idx,
     state->p_ewma = FP_FROM_FLOAT((float)loss_rate);
     state->q_ewma = 0;
     conn->path_state_overridden[path_idx] = true;
+    memset(&conn->path_budgets[path_idx], 0,
+           sizeof(conn->path_budgets[path_idx]));
+    conn->admission_retry_at_ns = 0;
   }
   return true;
 }
@@ -2468,6 +2669,8 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
         }
       }
     } else {
+      if (conn->admission_retry_at_ns > transport_get_monotonic_ns())
+        return false;
       for (size_t p = 0; p < TRANSPORT_MAX_QUIC_PATHS; p++) {
         conn->queued_datagrams[p] =
             (uint16_t)quicly_get_num_datagram_frames_path(conn->quic, p);
@@ -2509,7 +2712,24 @@ int64_t transport_get_first_timeout(transport_t *t) {
     if (!conn || !conn->quic ||
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
       continue;
-    for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++) {
+    if (conn->admission_retry_at_ns) {
+      uint64_t monotonic_now = transport_get_monotonic_ns();
+      if (conn->admission_retry_at_ns <= monotonic_now) {
+        conn->admission_retry_at_ns = 0;
+      } else {
+        uint64_t delta = conn->admission_retry_at_ns - monotonic_now;
+        uint64_t delay_ms = delta / 1000000U + (delta % 1000000U != 0);
+        int64_t wall_now = transport_get_time_ms();
+        int64_t retry_at = delay_ms > (uint64_t)(INT64_MAX - wall_now)
+                               ? INT64_MAX
+                               : wall_now + (int64_t)delay_ms;
+        if (retry_at < first_timeout)
+          first_timeout = retry_at;
+      }
+    }
+    for (size_t i = transport_next_assembler(conn, 0);
+         i < t->limits.max_assemblers_per_connection;
+         i = transport_next_assembler(conn, i + 1U)) {
       const frame_assembler_t *assembler = &conn->assemblers[i];
       if (assembler->total_symbols == 0)
         continue;

@@ -6,6 +6,7 @@
 #include "picotls/openssl.h"
 #include "quicly.h"
 #include "transport.h"
+#include "transport_internal.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
@@ -21,6 +22,7 @@ typedef struct {
   bool connected;
   bool subscribed;
   bool object_received;
+  size_t objects_received;
   uint8_t received_data[100];
   size_t received_size;
   transport_t *transport;
@@ -65,6 +67,7 @@ static void on_client_event(void *user_data, const transport_event_t *event) {
     if (event->track_id.type == MOQ_TRACK_VIDEO &&
         strcmp(event->track_id.name, "video_track") == 0) {
       state->object_received = true;
+      state->objects_received++;
       state->received_size = event->object.size;
       if (event->object.size < sizeof(state->received_data)) {
         memcpy(state->received_data, event->object.data, event->object.size);
@@ -190,6 +193,138 @@ static bool test_single_remote_fanout(void) {
 }
 
 #include <signal.h>
+
+typedef struct {
+  size_t expected_queue[TRANSPORT_MAX_PATHS];
+  size_t events;
+  bool valid;
+} scheduler_log_check_t;
+
+static void check_scheduler_log(void *data,
+                                const transport_log_event_t *event) {
+  scheduler_log_check_t *check = data;
+  if (strcmp(event->component, "scheduler") != 0)
+    return;
+  size_t raw_q = SIZE_MAX, used_q = SIZE_MAX;
+  const char *raw = strstr(event->message, " raw_q=");
+  const char *used = strstr(event->message, " q=");
+  check->events++;
+  check->valid &= event->level == TRANSPORT_LOG_DEBUG &&
+                  event->path_index < TRANSPORT_MAX_PATHS &&
+                  strstr(event->message, "mode=pathflow") != NULL &&
+                  strstr(event->message, "raw_b_pps=") != NULL &&
+                  strstr(event->message, " total=") != NULL && raw && used &&
+                  sscanf(raw, " raw_q=%zu", &raw_q) == 1 &&
+                  sscanf(used, " q=%zu", &used_q) == 1;
+  if (event->path_index < TRANSPORT_MAX_PATHS)
+    check->valid &=
+        raw_q == check->expected_queue[event->path_index] && used_q == raw_q;
+}
+
+/* Exercise the real path mapping, Quicly queues and publication sampler before
+ * the allocation-only test installs deterministic bandwidth overrides. */
+static bool test_live_path_inputs(test_state_t *server, test_state_t *client,
+                                  moq_track_id_t track, int log_fd) {
+  transport_t *t = server->transport;
+  transport_conn_t *conn = server->conn;
+  size_t symbol_size = transport_get_datagram_symbol_size(t);
+  uint8_t *payload = calloc(12, symbol_size);
+  if (!payload)
+    return false;
+  moq_object_t object = {.track_id = track,
+                         .group_id = 1,
+                         .object_id = 2,
+                         .data = payload,
+                         .size = 12 * symbol_size};
+  size_t received_before = client->objects_received;
+  memset(conn->path_states, 0, sizeof(conn->path_states));
+  /* A short object's shrunken payload must not seed inflated rate units. */
+  object.size = 1;
+  bool ok = transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_DELIVERED;
+  object.size = 12 * symbol_size;
+  object.object_id++;
+  scheduler_log_check_t check = {.valid = true};
+  t->log_callback = check_scheduler_log;
+  t->log_user_data = &check;
+  fp_t initial_rate[TRANSPORT_MAX_PATHS] = {0};
+  for (size_t publication = 0; publication < 2 && ok; publication++) {
+    size_t queued = 0;
+    for (size_t i = 0; i < t->num_fds; i++) {
+      quicly_path_stats_t stats;
+      size_t mapped = transport_path_get_stats_by_link(
+          conn->quic, t->local_addrs, t->num_fds, i, &stats);
+      if (mapped == SIZE_MAX || !quicly_is_path_available(conn->quic, mapped)) {
+        ok = false;
+        break;
+      }
+      path_t expected = transport_path_estimate(
+          &stats, quicly_get_num_datagram_frames_path(conn->quic, mapped),
+          t->egress[i].bytes, symbol_size, conn->latest_owd_fp[i]);
+      check.expected_queue[i] = expected.q;
+      queued += expected.q;
+      initial_rate[i] = expected.b;
+    }
+    if (!ok || (publication == 1 && queued < 12)) {
+      ok = false;
+      break;
+    }
+    check.events = 0;
+    ok = transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_DELIVERED;
+    for (size_t i = 0; i < t->num_fds; i++)
+      ok &= conn->path_states[i].initialized &&
+            conn->path_states[i].b_ewma == initial_rate[i] &&
+            conn->path_states[i].q_ewma == check.expected_queue[i];
+    ok &= check.valid && check.events == t->num_fds;
+    object.object_id++;
+  }
+  t->log_callback = NULL;
+  t->log_user_data = NULL;
+  free(payload);
+  for (size_t i = 0;
+       i < 2000 && ok && client->objects_received < received_before + 3; i++) {
+    transport_tick(t);
+    transport_tick(client->transport);
+    drain_qlog(log_fd);
+    usleep(500);
+  }
+  ok &= client->objects_received == received_before + 3;
+  /* A preferred path with one slot left cannot fit this three-symbol object.
+   * Admission must replan onto an empty alternate, without partially filling
+   * the preferred path or requiring an event-loop tick first. */
+  if (ok) {
+    for (size_t i = 0; i < t->num_fds; i++)
+      ok &= transport_mock_path_state(t, i, i == 0 ? 10000 : 1000,
+                                      i == 0 ? 1.0 : 100.0, 0);
+    size_t primary =
+        transport_path_find_by_link(conn->quic, t->local_addrs, t->num_fds, 0);
+    uint8_t ignored = 0xff;
+    ptls_iovec_t frame = ptls_iovec_init(&ignored, 1);
+    while (ok && quicly_get_num_datagram_frames_path(conn->quic, primary) < 63)
+      ok &= transport_queue_datagram(conn, primary, frame);
+    uint8_t small_payload[2000] = {19};
+    object.data = small_payload;
+    object.size = sizeof(small_payload);
+    ok &= transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_DELIVERED;
+    ok &= quicly_get_num_datagram_frames_path(conn->quic, primary) == 63;
+    for (size_t i = 0;
+         i < 2000 && ok && client->objects_received < received_before + 4;
+         i++) {
+      transport_tick(t);
+      transport_tick(client->transport);
+      drain_qlog(log_fd);
+      usleep(500);
+    }
+    ok &= client->objects_received == received_before + 4;
+  }
+  if (!ok)
+    fprintf(
+        stderr,
+        "live path inputs, queue refresh or scheduler diagnostics failed\n");
+  else
+    printf(
+        "live per-path inputs and queued publication diagnostics verified\n");
+  return ok;
+}
 
 int main(void) {
   signal(SIGPIPE, SIG_IGN);
@@ -428,6 +563,15 @@ int main(void) {
     return 1;
   }
 
+  if (!test_live_path_inputs(&server_state, &client_state, t_video, log_fd)) {
+    close(log_fd);
+    transport_destroy(client);
+    transport_destroy(server);
+    close(listener_fd);
+    unlink(qlog_path);
+    return 1;
+  }
+
   /* Test 60/5/10/25 split for 1000 packets */
   printf("testing 60/5/10/25 split for 1000 packets...\n");
   if (!transport_mock_path_state(server, 0, 60, 10.0, 0.0) ||
@@ -487,8 +631,37 @@ int main(void) {
                               .data = chunk_payload,
                               .size = chunk_size,
                               .is_keyframe = true};
-    transport_publish(server, &chunk_obj);
+    /* Measure the actual FEC datagram allocation before packet I/O. Native
+     * packet counters also include ACKs, control traffic and PTO probes. */
+    size_t mapped[4], queued_before[4];
+    for (size_t i = 0; i < 4; ++i) {
+      mapped[i] = transport_path_find_by_link(
+          server_state.conn->quic, server->local_addrs, server->num_fds, i);
+      queued_before[i] = quicly_get_num_datagram_frames_path(
+          server_state.conn->quic, mapped[i]);
+    }
+    bool allocation_ok =
+        transport_publish_ex(server, &chunk_obj) == TRANSPORT_PUBLISH_DELIVERED;
+    /* Data allocation is 31/2/5/12; earliest-finish parity goes to path 3. */
+    const size_t expected[4] = {31, 2, 5, 13};
+    for (size_t i = 0; i < 4; ++i) {
+      size_t queued = quicly_get_num_datagram_frames_path(
+          server_state.conn->quic, mapped[i]);
+      if (queued != queued_before[i] + expected[i]) {
+        fprintf(stderr, "chunk %d path %zu: queued %zu, expected %zu\n", chunk,
+                i, queued, queued_before[i] + expected[i]);
+        allocation_ok = false;
+      }
+    }
     free(chunk_payload);
+    if (!allocation_ok) {
+      close(log_fd);
+      transport_destroy(client);
+      transport_destroy(server);
+      close(listener_fd);
+      unlink(qlog_path);
+      return 1;
+    }
 
     /* Tick client and server in a loop to transfer this chunk */
     retries = 2000;
@@ -510,7 +683,7 @@ int main(void) {
     }
   }
 
-  /* Verify the packet split on the server's paths */
+  /* Report native packet counts separately from the exact allocation above. */
   transport_path_stats_t final_stats[4];
   long diff_sent[4];
   for (size_t i = 0; i < 4; i++) {
@@ -529,41 +702,6 @@ int main(void) {
            (unsigned long)final_stats[i].sent, diff_sent[i]);
   }
 
-  /* Assert the split matches 60/5/10/25 +/- 5% margin */
-  /* Expected packets: 640, 40, 100, 240 */
-  bool split_ok = true;
-  if (diff_sent[0] < 600 || diff_sent[0] > 660) {
-    fprintf(stderr,
-            "path 0 sent packets %ld out of expected range [600, 660]\n",
-            diff_sent[0]);
-    split_ok = false;
-  }
-  if (diff_sent[1] < 35 || diff_sent[1] > 65) {
-    fprintf(stderr, "path 1 sent packets %ld out of expected range [35, 65]\n",
-            diff_sent[1]);
-    split_ok = false;
-  }
-  if (diff_sent[2] < 85 || diff_sent[2] > 115) {
-    fprintf(stderr, "path 2 sent packets %ld out of expected range [85, 115]\n",
-            diff_sent[2]);
-    split_ok = false;
-  }
-  if (diff_sent[3] < 220 || diff_sent[3] > 260) {
-    fprintf(stderr,
-            "path 3 sent packets %ld out of expected range [220, 260]\n",
-            diff_sent[3]);
-    split_ok = false;
-  }
-
-  if (!split_ok) {
-    fprintf(stderr, "pathflow split verification failed!\n");
-    close(log_fd);
-    transport_destroy(client);
-    transport_destroy(server);
-    close(listener_fd);
-    unlink(qlog_path);
-    return 1;
-  }
   printf("60/5/10/25 split verified successfully!\n");
 
   /* Remove one established path at each endpoint. The physical socket and

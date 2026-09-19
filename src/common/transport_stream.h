@@ -13,7 +13,10 @@
 /* Allocation budgets, including retained frame headers and vector capacity.
  * Application data and retryable repair requests leave room for authentication
  * and checkpoints. */
-#define TRANSPORT_STREAM_MAX_FRAMES 256U
+/* Stream frames are additionally bounded by retained bytes and send-vector
+ * capacity. The frame count therefore derives from the configured byte budget
+ * at admission time rather than imposing a fixed object-size-dependent cap. */
+#define TRANSPORT_STREAM_MIN_FRAME_ACCOUNTING_BYTES 64U
 #define TRANSPORT_STREAM_MAX_BYTES TRANSPORT_DEFAULT_STREAM_EGRESS_BYTES
 #define TRANSPORT_STREAM_ENDPOINT_MAX_BYTES                                    \
   TRANSPORT_DEFAULT_TOTAL_STREAM_EGRESS_BYTES

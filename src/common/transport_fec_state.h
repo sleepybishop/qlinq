@@ -9,7 +9,9 @@
 
 #define QLINQ_FEC_MAX_TOTAL_SYMBOLS 1024U
 #define QLINQ_FEC_MAX_SYMBOL_SIZE 1500U
-#define TRANSPORT_SENT_CACHE_SIZE 256U
+/* The byte budget remains authoritative. This hard slot bound lets the default
+ * 16 MiB cache retain 8 KiB objects without an artificial 4 MiB ceiling. */
+#define TRANSPORT_SENT_CACHE_SIZE 2048U
 #define TRANSPORT_FEC_CACHE_SIZE 8U
 
 typedef struct {

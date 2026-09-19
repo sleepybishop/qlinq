@@ -28,6 +28,51 @@ bool transport_publish_recipient_eligible(const transport_t *t,
           transport_subscriptions_contains(&conn->send_subscriptions, track));
 }
 
+/* A publication can become ineligible between grouped flushes. Preserve the
+ * reason at the API boundary: callers otherwise cannot distinguish a missing
+ * subscription from a connection that has begun closing. */
+static void publish_log_no_recipients(transport_t *t,
+                                      const moq_track_id_t *track) {
+  size_t absent = 0, no_quic = 0, unready = 0, unauthenticated = 0;
+  size_t closing = 0, unsubscribed = 0;
+  int64_t close_error = 0;
+  const char *close_reason = "none";
+  size_t count = t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
+  for (size_t i = 0; i < count; i++) {
+    const transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
+    if (!conn) {
+      absent++;
+    } else if (!conn->quic) {
+      no_quic++;
+    } else if (!conn->protocol_ready) {
+      unready++;
+    } else if (!conn->authenticated) {
+      unauthenticated++;
+    } else if (quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING) {
+      closing++;
+      if (closing == 1) {
+        uint64_t offending_frame_type;
+        int is_remote;
+        const char *reason = NULL;
+        close_error = quicly_get_close_reason(conn->quic, &offending_frame_type,
+                                              &reason, &is_remote);
+        if (reason && reason[0])
+          close_reason = reason;
+      }
+    } else if (t->is_server && !transport_subscriptions_contains(
+                                   &conn->send_subscriptions, track)) {
+      unsubscribed++;
+    }
+  }
+  transport_log(
+      t, TRANSPORT_LOG_WARNING, "publish", 0, SIZE_MAX,
+      "no eligible recipients: connections=%zu absent=%zu no_quic=%zu "
+      "unready=%zu unauthenticated=%zu closing=%zu unsubscribed=%zu "
+      "close_raw=%" PRId64 " close_reason=%s",
+      count, absent, no_quic, unready, unauthenticated, closing, unsubscribed,
+      close_error, close_reason);
+}
+
 static size_t publication_fec_limit(const transport_t *t,
                                     const moq_track_id_t *track) {
   size_t limit = t->limits.max_fec_object_size;
@@ -39,6 +84,18 @@ static size_t publication_fec_limit(const transport_t *t,
       limit = conn->negotiated_limits.max_fec_object_size;
   }
   return limit;
+}
+
+static void note_admission_retry(transport_conn_t *conn, size_t physical,
+                                 size_t burst, size_t symbols,
+                                 uint64_t now_ns) {
+  uint64_t wait =
+      transport_path_budget_wait(&conn->path_budgets[physical], burst, symbols);
+  if (wait == 0 || wait == UINT64_MAX)
+    return;
+  uint64_t at = wait > UINT64_MAX - now_ns ? UINT64_MAX : now_ns + wait;
+  if (conn->admission_retry_at_ns == 0 || at < conn->admission_retry_at_ns)
+    conn->admission_retry_at_ns = at;
 }
 
 static transport_publish_result_t
@@ -53,6 +110,9 @@ publish_datagram_to_conn(transport_t *t, transport_conn_t *conn,
   bool active_rate_known[TRANSPORT_MAX_PATHS];
   size_t active_quic[TRANSPORT_MAX_PATHS], available[TRANSPORT_MAX_PATHS];
   size_t active_paths = 0;
+  uint64_t admission_now = transport_get_monotonic_ns();
+  uint64_t measure_now = ptls_get_time.cb(&ptls_get_time);
+  conn->admission_retry_at_ns = 0;
   for (size_t physical = 0; physical < t->num_fds; physical++) {
     quicly_path_stats_t stats;
     size_t mapped = transport_path_get_stats_by_link(
@@ -68,12 +128,41 @@ publish_datagram_to_conn(transport_t *t, transport_conn_t *conn,
     active_samples[active_paths] = transport_path_estimate(
         &stats, queued, t->egress[physical].bytes, estimate_symbol_size,
         conn->latest_owd_fp[physical]);
+    if (!conn->path_state_overridden[physical]) {
+      fp_t cap =
+          transport_path_probe_cap(&conn->path_measurements[physical], &stats,
+                                   estimate_symbol_size, measure_now);
+      if (active_samples[active_paths].b > cap)
+        active_samples[active_paths].b = cap;
+      fp_t rate = conn->path_states[physical].initialized
+                      ? conn->path_states[physical].b_ewma
+                      : active_samples[active_paths].b;
+      if (rate > cap)
+        rate = cap;
+      size_t burst = transport_path_budget_burst(rate);
+      size_t reserved = transport_path_budget_update(
+          &conn->path_budgets[physical], rate, admission_now);
+      if (reserved >= burst) {
+        note_admission_retry(conn, physical, burst,
+                             data_symbols < burst ? data_symbols + 1U : burst,
+                             admission_now);
+        continue;
+      }
+      if (reserved > active_samples[active_paths].q)
+        active_samples[active_paths].q = reserved;
+      size_t capacity = burst - reserved;
+      if (available[active_paths] > capacity)
+        available[active_paths] = capacity;
+    }
     active_rate_known[active_paths] = stats.cwnd > 0 && stats.rtt_smoothed > 0;
     if (!conn->path_state_overridden[physical])
       transport_path_update_state(&conn->path_states[physical],
                                   &active_samples[active_paths], false);
     active_physical[active_paths] = physical;
     active_states[active_paths] = conn->path_states[physical];
+    if (!conn->path_state_overridden[physical] &&
+        active_states[active_paths].b_ewma > active_samples[active_paths].b)
+      active_states[active_paths].b_ewma = active_samples[active_paths].b;
     active_paths++;
   }
   if (active_paths == 0)
@@ -94,6 +183,13 @@ publish_datagram_to_conn(transport_t *t, transport_conn_t *conn,
     size_t blocked = active_paths;
     for (size_t i = 0; i < active_paths; i++) {
       if (schedule.paths[i].x > available[i]) {
+        size_t physical = active_physical[i];
+        if (!conn->path_state_overridden[physical]) {
+          fp_t rate = active_states[i].b_ewma;
+          note_admission_retry(conn, physical,
+                               transport_path_budget_burst(rate),
+                               schedule.paths[i].x, admission_now);
+        }
         blocked = i;
         break;
       }
@@ -110,6 +206,24 @@ publish_datagram_to_conn(transport_t *t, transport_conn_t *conn,
       active_rate_known[i] = active_rate_known[i + 1];
       available[i] = available[i + 1];
     }
+  }
+
+  /* Rateless tracks keep their source transmission systematic. They retain
+   * the object for on-demand RaptorQ symbols after a NACK, but do not pay a
+   * full RaptorQ precompute or speculative parity cost on every healthy
+   * object. Fixed FEC continues to transmit the pathflow-selected parity. */
+  if (profile->fec_rateless) {
+    schedule.parity_symbols = 0;
+    size_t source_symbols = 0;
+    for (size_t i = 0; i < active_paths; i++)
+      source_symbols += schedule.paths[i].m;
+    /* Pathflow is not invoked for a one-symbol source object, so its m
+     * vector is empty. Keep transport_schedule_build's round-robin placement
+     * in that case; otherwise send the Pathflow source allocation without
+     * speculative parity. */
+    if (source_symbols == data_symbols)
+      for (size_t i = 0; i < active_paths; i++)
+        schedule.paths[i].x = schedule.paths[i].m;
   }
 
   if (t->log_callback) {
@@ -245,10 +359,14 @@ publish_datagram_to_conn(transport_t *t, transport_conn_t *conn,
       return queued > 0 ? TRANSPORT_PUBLISH_PARTIAL
                         : TRANSPORT_PUBLISH_BACKPRESSURE;
     }
+    size_t physical = active_physical[scheduled];
+    if (!conn->path_state_overridden[physical])
+      transport_path_budget_charge(&conn->path_budgets[physical]);
     queued++;
   }
 
   transport_arena_reset(&t->arena);
+  conn->admission_retry_at_ns = 0;
   return TRANSPORT_PUBLISH_DELIVERED;
 }
 
@@ -850,8 +968,13 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
 
   if (partially_queued || (delivered > 0 && delivered != eligible))
     return TRANSPORT_PUBLISH_PARTIAL;
-  if (delivered == 0)
-    return eligible == 0 ? TRANSPORT_PUBLISH_NO_RECIPIENTS : failure;
+  if (delivered == 0) {
+    if (eligible == 0) {
+      publish_log_no_recipients(t, &obj->track_id);
+      return TRANSPORT_PUBLISH_NO_RECIPIENTS;
+    }
+    return failure;
+  }
   return TRANSPORT_PUBLISH_DELIVERED;
 }
 

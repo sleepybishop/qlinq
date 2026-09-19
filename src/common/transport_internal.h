@@ -26,7 +26,9 @@
 /* Quicly's per-path queue, not its legacy connection-wide 256-frame queue.
  * The publication boundary test verifies this against the linked backend. */
 #define QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY 64U
-#define QLINQ_COMPLETED_OBJECTS 256U
+#define QLINQ_COMPLETED_OBJECTS (2U * TRANSPORT_HARD_MAX_ASSEMBLERS)
+#define QLINQ_ASSEMBLER_BUCKETS 2048U
+#define QLINQ_MIN_ASSEMBLER_WINDOW 8U
 
 typedef struct {
   moq_track_id_t track_id;
@@ -144,14 +146,26 @@ struct transport_conn_t {
   quicly_stream_t *stream;
   frame_assembler_t assemblers[TRANSPORT_HARD_MAX_ASSEMBLERS];
   size_t assembler_index;
+  size_t assembler_limit;
+  size_t assembler_count;
+  uint64_t assembler_rx_rate;
+  uint64_t assembler_rx_window_started_ms;
+  size_t assembler_rx_window_bytes;
+  uint64_t active_assemblers[(TRANSPORT_HARD_MAX_ASSEMBLERS + 63U) / 64U];
+  uint16_t assembler_buckets[QLINQ_ASSEMBLER_BUCKETS];
   struct {
     uint64_t generation, group_id, object_id;
     uint8_t alias;
     bool active;
+    uint16_t hash_next;
   } completed_objects[QLINQ_COMPLETED_OBJECTS];
   size_t completed_cursor;
+  uint16_t completed_buckets[QLINQ_ASSEMBLER_BUCKETS];
   uint16_t queued_datagrams[TRANSPORT_MAX_QUIC_PATHS];
+  transport_path_budget_t path_budgets[TRANSPORT_MAX_PATHS];
+  uint64_t admission_retry_at_ns;
   path_state_t path_states[TRANSPORT_MAX_PATHS];
+  transport_path_measurement_t path_measurements[TRANSPORT_MAX_PATHS];
   int64_t min_owd_ns[TRANSPORT_MAX_PATHS];
   bool owd_initialized[TRANSPORT_MAX_PATHS];
   size_t telemetry_path[TRANSPORT_MAX_PATHS];
@@ -220,11 +234,23 @@ transport_checkpoint_ack(const transport_conn_t *conn, uint8_t alias) {
 }
 
 uint64_t transport_get_time_ns(void);
+uint64_t transport_get_monotonic_ns(void);
 bool transport_owner_ok(transport_t *t);
 void transport_emit_event(transport_t *t, const transport_event_t *event);
 void transport_log(transport_t *t, transport_log_level_t level,
                    const char *component, uint32_t connection_id,
                    size_t path_index, const char *format, ...);
+size_t transport_next_assembler(const transport_conn_t *conn, size_t first);
+size_t transport_receive_bucket(uint8_t alias, uint64_t group, uint64_t object);
+frame_assembler_t *transport_find_assembler(transport_conn_t *conn,
+                                            uint8_t alias, uint64_t group_id,
+                                            uint64_t object_id);
+void transport_index_assembler(transport_conn_t *conn, frame_assembler_t *a);
+void transport_unindex_assembler(frame_assembler_t *a);
+size_t transport_assembler_window(transport_conn_t *conn,
+                                  uint16_t total_symbols, uint16_t symbol_size);
+void transport_assembler_observe_receive(transport_conn_t *conn,
+                                         size_t payload_bytes);
 void transport_release_assembler(transport_t *t, frame_assembler_t *assembler);
 bool transport_grow_assembler(transport_t *t, frame_assembler_t *assembler,
                               uint16_t symbols, uint16_t symbol_size);

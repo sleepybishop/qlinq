@@ -78,6 +78,26 @@ the scope ID.
 - `transport_wire` is the only code that reads or writes multibyte wire fields.
 - Path measurements and scheduler state belong to a connection; one client's
   RTT, loss, or telemetry must never determine another client's schedule.
+  Each available path uses its own congestion-window/RTT rate proxy, expressed
+  in full-sized FEC symbol equivalents per second. Missing window/RTT samples
+  use 100 symbols/s and missing RTT uses 50 ms one-way latency; another path's
+  estimate is never substituted. Rate, RTT/2 plus relative one-way delay, and
+  cumulative loss are smoothed every 25 ms. The rate is a sending-rate proxy,
+  not a measured link capacity.
+  At publication, uninitialized paths are sampled immediately and unsent queue
+  inputs are refreshed even between ticks: the path's QUIC DATAGRAM frame count
+  plus `ceil(socket_egress_bytes / full_symbol_size)`. The socket backlog is
+  shared across peers and is included once for each candidate path's completion
+  estimate. Outstanding bytes in flight and kernel/network queues are excluded.
+  Queue occupancy is not smoothed, so small queues and completed drains take
+  effect immediately. Small single-symbol objects do not change the units of
+  the stored rate estimate.
+  Debug log events from component `scheduler` include connection and physical
+  path identity, object identity, symbol size, raw and used bandwidth/latency/
+  loss/queue inputs, and planned data/total symbol allocation. `source` identifies
+  `cwnd_rtt`, a cold-start `default`, or a test `override`; `mode` distinguishes
+  pathflow from the non-FEC and single-symbol round-robin cases. These events
+  describe scheduling decisions, including plans subsequently backpressured.
 - Incoming FEC assemblers share a 64 MiB transport-wide memory budget and each
   connection has eight active assembler slots. Growth must fit both the old
   buffers and their replacements within that budget until copying completes.
@@ -153,3 +173,47 @@ Component-level tests cover these ownership and lookup boundaries. End-to-end
 tests cover connection establishment, authentication, reliable streams,
 datagrams, FEC/NACK recovery, IPv4/IPv6 mutual TLS, reconnect after peer
 restart, live interface removal, and multipath behavior.
+
+`make check-multipath-demo` runs the dynamically discovered Cellular, Wi-Fi,
+Satcom and Ethernet profiles in an isolated user/network namespace. It shapes
+delay and loss, not bandwidth. The benchmark reports a shared server-traffic
+window after all four paths have been active for 500 ms, and fails if the
+window is shorter than one second or Ethernet carries no more than half of
+the server's UDP payload bytes. This avoids comparing lifetime totals from
+paths that joined at different times. Rates include protocol traffic and are
+not capacity measurements. Reported QUIC RTT can include an ACK returned on
+another link, so it need not equal the configured same-link round-trip delay.
+
+`./examples/multipath_bw_demo` (or `make check-multipath-bw-demo`) is a separate
+bandwidth experiment. All four paths are validated before sending; each has a
+20 ms one-way delay and independent forward/reverse HTB caps of 1, 2, 4 and
+8 Mbps. There is no injected loss, though overflowing a bounded kernel queue
+can still drop packets. Offered application traffic ramps from 2 to 12 Mbps
+over four seconds, followed by eight seconds at 12 Mbps and a three-second
+drain. Publication backpressure is counted as undelivered offered traffic.
+
+The demo records actual kernel dequeue rates, UDP send shares, sampled kernel
+queue occupancy and growth, queue drops, application goodput, delivery, and
+mean/p95/p99 completion latency. Goodput counts records completed during the
+measurement window; delivery/latency cover records offered in that window,
+including completions during the drain. Kernel queue milliseconds include the
+configured propagation delay and do not include QUIC or application queues.
+The kernel samples omit an additional half-second at the start and quarter-
+second at the end of the steady window to allow for sampler timing.
+
+The explicit checks require cap compliance within 5%, increasing dequeue rates
+with increasing caps, goodput above the fastest individual link's 8 Mbps cap,
+at least 99% delivery of offered records, p99 latency at most 250 ms, no steady
+queue drops, and late median kernel queues at most 100 ms with growth at most
+50 ms. A failing check returns nonzero and preserves `benchmark.log`,
+`queues.json`, and `report.json` in a printed temporary directory. Use
+`--output-dir PATH` to choose it, or `--benchmark PATH` to compare a compatible
+benchmark built with another transport version. Run the report-validator tests
+with `python3 examples/test_multipath_bw_demo.py`.
+
+This is a diagnostic target, not part of `release-check`: the initial per-path
+window/RTT and queue-input implementation still fails the saturated profile.
+An observed run produced 2.009 Mbps goodput, admitted 207 of 1,499 offered
+steady-window records, delivered 205, and reached 923 ms p99 latency. These
+are observed results, not relaxed acceptance limits; the benchmark is intended
+to expose the remaining capacity-estimation and backpressure behavior.

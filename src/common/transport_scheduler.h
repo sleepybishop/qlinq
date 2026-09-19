@@ -15,7 +15,7 @@ typedef struct {
   size_t parity_symbols;
 } transport_schedule_t;
 
-bool transport_schedule_build(pathflow_context_t *context, quicly_conn_t *quic,
+bool transport_schedule_build(pathflow_context_t *context,
                               const path_state_t *states, size_t num_paths,
                               size_t data_symbols, size_t symbol_size,
                               bool fec_enabled, uint8_t priority,

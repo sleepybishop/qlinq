@@ -89,6 +89,9 @@ typedef struct {
   size_t max_connections;
   size_t max_subscriptions_per_peer; /* independently in each publishing
                                         direction */
+  /* Hard cap for live FEC receive objects. qlinq derives a smaller active
+   * window from observed receive rate and path RTT, then grows up to this
+   * cap when the BDP requires it. */
   size_t max_active_receive_objects_per_peer;
   size_t max_repair_requests_per_second;
   size_t max_aggregate_repair_requests_per_second;

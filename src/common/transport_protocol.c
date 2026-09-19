@@ -1239,7 +1239,12 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     return;
   uint64_t generation = subscription_state->generation;
   transport_object_gap_state_t *object_state = &subscription_state->object_gap;
-  for (size_t i = 0; i < QLINQ_COMPLETED_OBJECTS; i++) {
+  transport_assembler_observe_receive(tconn, symbol_size);
+  size_t completion_bucket =
+      transport_receive_bucket(track_id, group_id, object_id);
+  for (uint16_t ref = tconn->completed_buckets[completion_bucket]; ref != 0;) {
+    size_t i = ref - 1U;
+    ref = tconn->completed_objects[i].hash_next;
     if (tconn->completed_objects[i].active &&
         tconn->completed_objects[i].alias == track_id &&
         tconn->completed_objects[i].generation == generation &&
@@ -1273,20 +1278,12 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     }
   }
 
-  /* lookup active frame assembler cache */
-  frame_assembler_t *asm_slot = NULL;
-  for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++) {
-    frame_assembler_t *a = &tconn->assemblers[i];
-    if (a->total_symbols > 0 && a->track_id == track_id &&
-        a->group_id == group_id && a->object_id == object_id) {
-      if (a->symbol_size != symbol_size || a->data_symbols != data_symbols ||
-          a->original_size != original_size) {
-        goto malformed_datagram;
-      }
-      asm_slot = a;
-      break;
-    }
-  }
+  frame_assembler_t *asm_slot =
+      transport_find_assembler(tconn, track_id, group_id, object_id);
+  if (asm_slot && (asm_slot->symbol_size != symbol_size ||
+                   asm_slot->data_symbols != data_symbols ||
+                   asm_slot->original_size != original_size))
+    goto malformed_datagram;
 
   if (!asm_slot) {
     /* Completed small records leave reusable slots behind. Do not evict a
@@ -1296,11 +1293,11 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
      * slot reuse, not progress; it can otherwise discard a fresh object while
      * retaining old incomplete objects whose remaining symbols never arrive.
      * Equal timestamps retain the rotating cursor's tie-breaking order. */
-    size_t selected = tconn->assembler_index;
-    for (size_t offset = 0; offset < t->limits.max_assemblers_per_connection;
-         offset++) {
-      size_t index = (tconn->assembler_index + offset) %
-                     t->limits.max_assemblers_per_connection;
+    size_t assembler_limit =
+        transport_assembler_window(tconn, total_symbols, symbol_size);
+    size_t selected = tconn->assembler_index % assembler_limit;
+    for (size_t offset = 0; offset < assembler_limit; offset++) {
+      size_t index = (tconn->assembler_index + offset) % assembler_limit;
       if (tconn->assemblers[index].total_symbols == 0) {
         selected = index;
         break;
@@ -1311,8 +1308,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     }
     tconn->assembler_index = selected;
     asm_slot = &tconn->assemblers[tconn->assembler_index];
-    tconn->assembler_index =
-        (tconn->assembler_index + 1) % t->limits.max_assemblers_per_connection;
+    tconn->assembler_index = (tconn->assembler_index + 1) % assembler_limit;
 
     if (asm_slot->total_symbols > 0 && !asm_slot->decoded) {
       moq_track_id_t resolved_track;
@@ -1339,6 +1335,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
       }
     }
 
+    transport_unindex_assembler(asm_slot);
     if (!asm_slot->buffers || asm_slot->capacity_symbols < total_symbols ||
         asm_slot->capacity_symbol_size < symbol_size) {
       transport_release_assembler(t, asm_slot);
@@ -1363,6 +1360,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     asm_slot->nack_sent = false;
     asm_slot->first_symbol_time_ms = transport_get_time_ms();
     asm_slot->last_activity_time_ms = asm_slot->first_symbol_time_ms;
+    transport_index_assembler(tconn, asm_slot);
   }
 
   if (asm_slot->decoded)
@@ -1447,6 +1445,20 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
                                          .priority = asm_slot->priority}};
       size_t completed = tconn->completed_cursor;
       tconn->completed_cursor = (completed + 1U) % QLINQ_COMPLETED_OBJECTS;
+      if (tconn->completed_objects[completed].active) {
+        size_t bucket = transport_receive_bucket(
+            tconn->completed_objects[completed].alias,
+            tconn->completed_objects[completed].group_id,
+            tconn->completed_objects[completed].object_id);
+        uint16_t *link = &tconn->completed_buckets[bucket];
+        while (*link != 0 && *link != completed + 1U)
+          link = &tconn->completed_objects[*link - 1U].hash_next;
+        if (*link != 0)
+          *link = tconn->completed_objects[completed].hash_next;
+      }
+      tconn->completed_objects[completed].hash_next =
+          tconn->completed_buckets[completion_bucket];
+      tconn->completed_buckets[completion_bucket] = (uint16_t)(completed + 1U);
       tconn->completed_objects[completed].active = true;
       tconn->completed_objects[completed].alias = track_id;
       tconn->completed_objects[completed].generation = generation;

@@ -231,6 +231,14 @@ check-multipath-demo:
 		./examples/multipath_demo.sh; \
 	fi
 
+check-multipath-bw-demo:
+	python3 examples/test_multipath_bw_demo.py
+	@if [ "$${QLINQ_SKIP_PRIVILEGED:-0}" = 1 ]; then \
+		echo "SKIP privileged bandwidth demo (QLINQ_SKIP_PRIVILEGED=1)"; \
+	else \
+		./examples/multipath_bw_demo; \
+	fi
+
 check-sanitize:
 	$(MAKE) clean
 	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
@@ -343,7 +351,7 @@ indent:
 	clang-format -style=LLVM -i src/common/*.c src/common/*.h src/host/linux/*.c examples/*.c t/00util/*.c
 
 .PHONY: all clean check benchmark fuzz-wire check-submodules \
-	check-multipath-demo check-sanitize soak release-check indent gencerts
+	check-multipath-demo check-multipath-bw-demo check-sanitize soak release-check indent gencerts
 
 -include $(shell find src t examples -name "*.d" -print 2>/dev/null) \
          $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \

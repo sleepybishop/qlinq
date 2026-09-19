@@ -21,6 +21,10 @@ void *transport_arena_alloc(arena_t *arena, size_t size);
 void transport_arena_reset(arena_t *arena);
 
 typedef struct {
+  /* Set only while indexed in a connection; standalone allocators leave NULL.
+   */
+  struct transport_conn_t *owner;
+  uint16_t hash_next; /* Slot index + 1; zero terminates the bucket chain. */
   uint8_t track_id;
   uint64_t group_id;
   uint64_t object_id;

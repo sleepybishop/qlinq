@@ -42,9 +42,15 @@ static bool stream_can_accept_reserved(quicly_stream_t *stream,
   transport_stream_ctx_t *ctx = stream->data;
   quicly_sendbuf_t *sb = &ctx->streambuf.egress;
   size_t stream_limit = t->limits.max_stream_egress_bytes;
-  size_t frame_limit = TRANSPORT_STREAM_MAX_FRAMES;
   size_t endpoint_limit = t->limits.max_total_stream_egress_bytes;
   size_t vector_limit = TRANSPORT_STREAM_ENDPOINT_MAX_VECTORS;
+  /* Bound tiny control frames without making large-object throughput depend on
+   * a fixed frame count. The retained-byte and vector budgets below remain the
+   * hard resource limits. */
+  size_t frame_limit =
+      stream_limit / TRANSPORT_STREAM_MIN_FRAME_ACCOUNTING_BYTES;
+  if (frame_limit > vector_limit)
+    frame_limit = vector_limit;
   if (preserve_control_reserve) {
     endpoint_limit -= TRANSPORT_STREAM_ENDPOINT_CONTROL_BYTE_RESERVE;
     vector_limit -= TRANSPORT_STREAM_ENDPOINT_CONTROL_VECTOR_RESERVE;
@@ -53,6 +59,8 @@ static bool stream_can_accept_reserved(quicly_stream_t *stream,
       frame_limit -= TRANSPORT_STREAM_CONTROL_FRAME_RESERVE;
     }
   }
+  if (frame_limit == 0)
+    return false;
   size_t growth = vector_growth(sb);
   size_t frame_bytes = sizeof(retained_frame_t) + frame_len;
   size_t bytes = frame_bytes + growth * sizeof(quicly_sendbuf_vec_t);

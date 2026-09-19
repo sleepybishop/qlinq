@@ -235,7 +235,179 @@ static int test_subscription_state_lifetime(void) {
   return 0;
 }
 
+static int test_path_pacing_inputs(void) {
+  transport_limits_t configured = {0}, resolved;
+  char error[128];
+  CHECK(
+      transport_limits_resolve(&configured, &resolved, error, sizeof(error)) &&
+          resolved.max_assemblers_per_connection == 1024,
+      "default FEC receive-object cap supports high-BDP paths");
+  configured.max_assemblers_per_connection = 1025;
+  CHECK(!transport_limits_resolve(&configured, &resolved, error, sizeof(error)),
+        "FEC receive-object cap remains bounded");
+  configured.max_assemblers_per_connection = 64;
+  CHECK(
+      transport_limits_resolve(&configured, &resolved, error, sizeof(error)) &&
+          resolved.max_assemblers_per_connection == 64,
+      "application can set a lower receive-object cap");
+  transport_t receiver = {.limits = resolved};
+  transport_conn_t receiver_conn = {.transport = &receiver,
+                                    .assembler_rx_rate = 100000000};
+  CHECK(transport_assembler_window(&receiver_conn, 8, 1000) == 64,
+        "derived BDP receive window is clamped by configured cap");
+  receiver.limits.max_assemblers_per_connection = 1024;
+  receiver_conn.assembler_limit = 0;
+  CHECK(transport_assembler_window(&receiver_conn, 8, 1000) == 633,
+        "derived receive window keeps two BDPs plus reorder floor");
+
+  transport_path_measurement_t measurement = {0};
+  quicly_path_stats_t stats = {.cwnd = 1000000, .rtt_smoothed = 40};
+  stats.local.sa.sa_family = stats.remote.sa.sa_family = AF_INET;
+  CHECK(transport_path_measure(&measurement, &stats, 0, 1, 1000),
+        "initialize path measurement");
+  stats.acked = stats.sent = 90;
+  stats.bytes_acked = 90000;
+  CHECK(!transport_path_measure(&measurement, &stats, 0, 1, 1100),
+        "complete ACK measurement window");
+  CHECK(transport_path_probe_cap(&measurement, &stats, 1120, 1100) ==
+            FP_FROM_INT(FP_SAFE_WHOLE),
+        "clean RTT leaves an underused path's capacity estimate unbounded");
+  stats.rtt_smoothed = 46;
+  CHECK(transport_path_probe_cap(&measurement, &stats, 1120, 1100) ==
+            FP_FROM_INT(750),
+        "queue-induced RTT growth removes probe gain");
+  CHECK(transport_path_probe_cap(&measurement, &stats, 1120, 1601) ==
+            FP_FROM_INT(FP_SAFE_WHOLE),
+        "stale ACK observations do not cap a recovered path");
+
+  transport_path_budget_t budget = {0};
+  CHECK(transport_path_budget_burst(FP_FROM_INT(100)) == 8 &&
+            transport_path_budget_burst(FP_FROM_INT(2000)) == 64,
+        "burst scales from low-rate latency budget to QUIC queue bound");
+  CHECK(transport_path_budget_update(&budget, FP_FROM_INT(100), 1000000000) ==
+            0,
+        "empty path starts without reserved work");
+  for (size_t i = 0; i < 8; i++)
+    transport_path_budget_charge(&budget);
+  CHECK(transport_path_budget_wait(&budget, 8, 3) == 30000000,
+        "complete allocation waits for its serialized symbols");
+  CHECK(transport_path_budget_update(&budget, FP_FROM_INT(100), 1010000000) ==
+            7,
+        "paced budget releases work at the measured rate");
+  return 0;
+}
+
+static int test_path_estimates(void) {
+  quicly_path_stats_t fast = {
+      .cwnd = 100000, .rtt_smoothed = 100, .sent = 100, .lost = 0};
+  quicly_path_stats_t slow = fast;
+  slow.cwnd = 10000;
+  path_t samples[2] = {transport_path_estimate(&fast, 0, 0, 1000, 0),
+                       transport_path_estimate(&slow, 0, 0, 1000, 0)};
+  CHECK(samples[0].b == FP_FROM_INT(1000) && samples[1].b == FP_FROM_INT(100) &&
+            samples[0].l == samples[1].l,
+        "equal RTT paths retain their own ten-to-one window rates");
+  path_state_t states[2] = {0};
+  for (size_t i = 0; i < 2; i++)
+    transport_path_update_state(&states[i], &samples[i], false);
+  pathflow_context_t context = {0};
+  transport_schedule_t schedule;
+  size_t round_robin = 0;
+  CHECK(transport_schedule_build(&context, states, 2, 100, 1000, true, 1,
+                                 &round_robin, &schedule) &&
+            schedule.paths[0].m >= 90 && schedule.paths[1].m <= 10,
+        "measured window asymmetry changes FEC allocation");
+
+  samples[0] = transport_path_estimate(&fast, 1000, 0, 1000, 0);
+  transport_path_update_state(&states[0], &samples[0], false);
+  CHECK(transport_schedule_build(&context, states, 2, 50, 1000, true, 1,
+                                 &round_robin, &schedule) &&
+            schedule.paths[0].m == 0 && schedule.paths[1].m == 50,
+        "a queued fast path yields to an empty slow path before another tick");
+  CHECK(schedule.parity_symbols == 1 && schedule.paths[0].x == 0 &&
+            schedule.paths[1].x == 51 &&
+            transport_path_select_physical(schedule.paths, 2, 50) == 1 &&
+            transport_path_select_physical(schedule.paths, 2, 51) == SIZE_MAX,
+        "minimum parity has an explicit allocation away from the queued path");
+  samples[0].q = 0;
+  transport_path_update_state(&states[0], &samples[0], false);
+  CHECK(states[0].q_ewma == 0 &&
+            transport_schedule_build(&context, states, 2, 100, 1000, true, 1,
+                                     &round_robin, &schedule) &&
+            schedule.paths[0].m >= 90,
+        "drained queue immediately restores fast-path allocation");
+  samples[0].b = FP_FROM_INT(200);
+  samples[0].q = 1;
+  transport_path_update_state(&states[0], &samples[0], false);
+  CHECK(states[0].q_ewma == 1 && states[0].b_ewma == FP_FROM_INT(1000),
+        "publication refresh sees a one-packet queue without resampling rate");
+  transport_path_update_state(&states[0], &samples[0], true);
+  CHECK(states[0].b_ewma > FP_FROM_INT(900) &&
+            states[0].b_ewma < FP_FROM_INT(1000) && states[0].q_ewma == 1,
+        "periodic samples smooth rate but preserve current queue occupancy");
+
+  fast.bytes_in_flight = UINT32_MAX;
+  path_t queued = transport_path_estimate(&fast, 3, 1501, 1000, 0);
+  CHECK(queued.q == 5,
+        "combine QUIC frames and rounded socket bytes without bytes in flight");
+  queued = transport_path_estimate(&slow, 0, 1501, 1000, 0);
+  CHECK(queued.q == 2, "shared socket backlog applies to another peer");
+  queued = transport_path_estimate(&fast, SIZE_MAX, SIZE_MAX, 1, 0);
+  CHECK(queued.q == FP_SAFE_WHOLE,
+        "large queue inputs saturate without overflow");
+
+  quicly_path_stats_t fractional = {.cwnd = 1500,
+                                    .rtt_smoothed = 3000,
+                                    .sent = UINT64_MAX,
+                                    .lost = UINT64_MAX / 2};
+  path_t sample = transport_path_estimate(&fractional, 0, 0, 1000, 0);
+  CHECK(sample.b == FP_ONE / 2 && sample.p > FP_ONE / 2 - 2 &&
+            sample.p <= FP_ONE / 2,
+        "fractional rates and large lifetime loss counters retain precision");
+  fractional.lost = UINT64_MAX;
+  fractional.sent = 1;
+  sample = transport_path_estimate(&fractional, 0, 0, 1000, 0);
+  CHECK(sample.p == FP_ONE, "loss probability is bounded");
+  fractional.cwnd = UINT32_MAX;
+  fractional.rtt_smoothed = 1;
+  sample = transport_path_estimate(&fractional, 0, 0, 1, 0);
+  CHECK(sample.b == FP_FROM_INT(FP_SAFE_WHOLE), "large rates are bounded");
+  fractional.cwnd = 1;
+  fractional.rtt_smoothed = UINT32_MAX;
+  sample = transport_path_estimate(&fractional, 0, 0, SIZE_MAX, 0);
+  CHECK(sample.b > 0, "very slow paths retain positive optimizer throughput");
+  fractional.rtt_smoothed = 0;
+  sample = transport_path_estimate(&fractional, 0, 0, 1000, 0);
+  CHECK(sample.b == FP_FROM_INT(100) && sample.l == FP_FROM_FLOAT(0.050f),
+        "unmeasured RTT uses independent defaults rather than a fictitious "
+        "millisecond");
+  sample = transport_path_estimate(NULL, 0, 0, 1000, FP_ONE / 100);
+  CHECK(sample.b == FP_FROM_INT(100) &&
+            sample.l == FP_FROM_FLOAT(0.050f) + FP_ONE / 100,
+        "missing path defaults and relative delay use consistent units");
+  memset(states, 0, sizeof(states));
+  CHECK(transport_schedule_build(&context, states, 2, 10, 1000, true, 1,
+                                 &round_robin, &schedule) &&
+            schedule.paths[0].b == FP_FROM_INT(100) &&
+            schedule.paths[1].l == FP_FROM_FLOAT(0.050f),
+        "scheduler cold start uses the same independent defaults");
+  states[0] = (path_state_t){
+      .initialized = true, .b_ewma = FP_FROM_INT(1000), .p_ewma = FP_ONE};
+  states[1] = (path_state_t){.initialized = true,
+                             .b_ewma = FP_FROM_INT(100),
+                             .l_ewma = FP_FROM_FLOAT(0.05f)};
+  CHECK(transport_schedule_build(&context, states, 2, 4, 1000, true, 2,
+                                 &round_robin, &schedule) &&
+            schedule.paths[0].m == 0 && schedule.paths[0].x == 0 &&
+            schedule.paths[1].x == 5,
+        "minimum parity does not revive a fast path rejected for total loss");
+  return 0;
+}
+
 int main(void) {
+  CHECK(test_path_pacing_inputs() == 0, "per-path ACK probing and pacing");
+  CHECK(test_path_estimates() == 0,
+        "heterogeneous path inputs and allocations");
   CHECK(test_subscription_state_lifetime() == 0,
         "sparse recovery state lifetime");
   CHECK(test_assembler_growth_budget() == 0,
@@ -344,6 +516,9 @@ int main(void) {
             transport_path_select_physical(paths, 3, 2) == 1 &&
             transport_path_select_physical(paths, 3, 5) == 2,
         "physical path selection");
+  CHECK(transport_path_select_physical(paths, 3, 6) == SIZE_MAX &&
+            transport_path_select_physical(NULL, 0, 0) == SIZE_MAX,
+        "unallocated symbols cannot silently fall back to the first path");
 
   path_state_t path_states[2] = {
       {.b_ewma = FP_FROM_INT(100), .l_ewma = FP_FROM_FLOAT(0.01f)},
@@ -351,13 +526,13 @@ int main(void) {
   pathflow_context_t scheduler_context = {0};
   size_t round_robin = 0;
   transport_schedule_t schedule;
-  CHECK(transport_schedule_build(&scheduler_context, NULL, path_states, 2, 5,
-                                 1100, false, 1, &round_robin, &schedule) &&
+  CHECK(transport_schedule_build(&scheduler_context, path_states, 2, 5, 1100,
+                                 false, 1, &round_robin, &schedule) &&
             schedule.paths[0].x == 3 && schedule.paths[1].x == 2 &&
             schedule.parity_symbols == 0,
         "non-FEC schedule distribution");
-  CHECK(transport_schedule_build(&scheduler_context, NULL, path_states, 2, 1,
-                                 1100, true, 1, &round_robin, &schedule) &&
+  CHECK(transport_schedule_build(&scheduler_context, path_states, 2, 1, 1100,
+                                 true, 1, &round_robin, &schedule) &&
             schedule.paths[0].x == 1 && round_robin == 1,
         "single-symbol round robin schedule");
 
