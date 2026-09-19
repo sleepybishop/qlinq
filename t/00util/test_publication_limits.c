@@ -1,7 +1,156 @@
 #include "transport_fixture.h"
+#include "transport_publish.h"
 #include <stdio.h>
 
+static void fill_queue(transport_conn_t *conn, size_t count) {
+  /* Unknown application datagrams are discarded by the receiver. Queue them
+   * directly in Quicly so the test also checks our capacity assumption. */
+  uint8_t ignored = 0xff;
+  ptls_iovec_t frame = ptls_iovec_init(&ignored, 1);
+  while (quicly_get_num_datagram_frames_path(conn->quic, 0) < count) {
+    size_t before = quicly_get_num_datagram_frames_path(conn->quic, 0);
+    quicly_send_datagram_frames_path(conn->quic, 0, &frame, 1);
+    assert(quicly_get_num_datagram_frames_path(conn->quic, 0) == before + 1);
+  }
+}
+
+static void test_queue_boundary(void) {
+  transport_fixture_t f;
+  fixture_create(&f, 19932, NULL, NULL);
+  moq_track_id_t track = {.type = MOQ_TRACK_VIDEO,
+                          .flags = MOQ_TRACK_FLAG_FEC_ENABLED,
+                          .name = "queue-boundary"};
+  fixture_subscribe(&f, &f.client, track);
+  transport_conn_t *conn = f.server.conn;
+  uint8_t payload[2000] = {42};
+  moq_object_t object = {
+      .track_id = track, .data = payload, .size = sizeof(payload)};
+  fill_queue(conn, 62);
+  assert(transport_publish_ex(f.server.transport, &object) ==
+         TRANSPORT_PUBLISH_BACKPRESSURE);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, 0) == 62);
+  fill_queue(conn, 64);
+  uint8_t ignored = 0xff;
+  ptls_iovec_t frame = ptls_iovec_init(&ignored, 1);
+  quicly_send_datagram_frames_path(conn->quic, 0, &frame, 1);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, 0) == 64);
+  assert(QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY == 64);
+  for (size_t i = 0;
+       i < 2000 && quicly_get_num_datagram_frames_path(conn->quic, 0); i++)
+    fixture_tick(&f);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, 0) == 0);
+  fill_queue(conn, 61);
+  assert(transport_publish_ex(f.server.transport, &object) ==
+         TRANSPORT_PUBLISH_DELIVERED);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, 0) == 64);
+  fixture_receive(&f, &f.client, 1);
+  assert(f.client.payload_size == sizeof(payload) &&
+         memcmp(f.client.payload, payload, sizeof(payload)) == 0);
+  fixture_destroy(&f);
+}
+
+static void test_partial_group_retry(void) {
+  transport_fixture_t f;
+  fixture_create(&f, 19933, NULL, NULL);
+  fixture_endpoint_t second = {0};
+  transport_config_t config = {.bind_hosts = {"127.0.0.1"},
+                               .num_bind_hosts = 1,
+                               .remote_hosts = {"127.0.0.1"},
+                               .num_remote_hosts = 1,
+                               .port = 19933,
+                               .allow_insecure_peer = true,
+                               .callback = fixture_event,
+                               .user_data = &second};
+  second.transport = transport_create(&config);
+  assert(second.transport);
+  for (size_t i = 0; i < 2000 && !second.authenticated; i++) {
+    fixture_tick(&f);
+    transport_tick(second.transport);
+  }
+  assert(second.authenticated && f.server.transport->conn_count == 2);
+  moq_track_id_t track = {.type = MOQ_TRACK_DATA,
+                          .flags = MOQ_TRACK_FLAG_FEC_ENABLED,
+                          .name = "frozen-group"};
+  fixture_subscribe(&f, &f.client, track);
+  assert(transport_subscribe_conn(second.transport, second.conn, track));
+  for (size_t i = 0; i < 2000 && f.server.subscriptions < 2; i++) {
+    fixture_tick(&f);
+    transport_tick(second.transport);
+  }
+  assert(f.server.subscriptions == 2);
+  transport_t *t = f.server.transport;
+  transport_conn_t *first_conn = t->conns[0], *blocked_conn = t->conns[1];
+  fill_queue(blocked_conn, 64);
+  uint8_t original[1000], next[1000];
+  memset(original, 17, sizeof(original));
+  memset(next, 23, sizeof(next));
+  moq_object_t object = {
+      .track_id = track, .data = original, .size = sizeof(original)};
+  assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BUFFERED);
+  assert(!transport_publish_flush_grouped(
+      t)); /* First peer accepted, second did not. */
+  sent_object_cache_t *cached =
+      transport_sent_cache_find(&t->sent_cache, &track, 0, 0);
+  assert(cached && cached->size == 1002 &&
+         memcmp(cached->data + 2, original, 1000) == 0);
+  size_t first_queued =
+      quicly_get_num_datagram_frames_path(first_conn->quic, 0);
+  assert(first_queued > 0);
+  object.data = next;
+  for (size_t i = 0; i < 3; i++) {
+    assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BACKPRESSURE);
+    assert(t->fec_buf_len == 1002 &&
+           memcmp(t->fec_buf + 2, original, 1000) == 0);
+    assert(quicly_get_num_datagram_frames_path(first_conn->quic, 0) ==
+           first_queued);
+    assert(t->stats.recovery_cache_backpressure == 0);
+  }
+  for (size_t i = 0; i < 2000 && (t->fec_buf_len || f.client.objects < 1 ||
+                                  second.objects < 1);
+       i++) {
+    fixture_tick(&f);
+    transport_tick(second.transport);
+  }
+  assert(!t->fec_buf_len && f.client.objects == 1 && second.objects == 1);
+  assert(memcmp(f.client.payload + 2, original, 1000) == 0 &&
+         memcmp(second.payload + 2, original, 1000) == 0);
+  assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BUFFERED);
+  assert(transport_publish_flush_grouped(t));
+  for (size_t i = 0; i < 2000 && (f.client.objects < 2 || second.objects < 2);
+       i++) {
+    fixture_tick(&f);
+    transport_tick(second.transport);
+  }
+  assert(f.client.objects == 2 && second.objects == 2 && !second.failed);
+  assert(memcmp(f.client.payload + 2, next, 1000) == 0 &&
+         memcmp(second.payload + 2, next, 1000) == 0);
+  assert(t->stats.recovery_cache_backpressure == 0);
+  /* The record triggering a partial flush is itself retained, so it must be
+   * reported as BUFFERED rather than failed or rejected. */
+  fill_queue(blocked_conn, 64);
+  object.data = original;
+  for (size_t i = 0; i < 4; i++)
+    assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BUFFERED);
+  assert(t->fec_buf_len == 4008 && t->fec_flush_pending);
+  for (size_t i = 0; i < 2000 && (t->fec_buf_len || f.client.objects < 3 ||
+                                  second.objects < 3);
+       i++) {
+    fixture_tick(&f);
+    transport_tick(second.transport);
+  }
+  assert(!t->fec_buf_len && f.client.objects == 3 && second.objects == 3);
+  assert(f.client.payload_size == 4008 && second.payload_size == 4008);
+  for (size_t i = 0; i < 4; i++) {
+    assert(memcmp(f.client.payload + i * 1002 + 2, original, 1000) == 0);
+    assert(memcmp(second.payload + i * 1002 + 2, original, 1000) == 0);
+  }
+  transport_destroy(second.transport);
+  fixture_destroy(&f);
+}
+
 int main(void) {
+  test_queue_boundary();
+  test_partial_group_retry();
   transport_fixture_t fixture;
   transport_limits_t limits = {.max_fec_object_size = 32};
   fixture_create(&fixture, 19931, NULL, &limits);

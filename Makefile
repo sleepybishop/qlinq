@@ -20,6 +20,12 @@ endif
 
 # Default CFLAGS for our code
 CFLAGS_COMMON = -Wvla -Wall -Wextra -std=c11 -g -D_GNU_SOURCE -D_DEFAULT_SOURCE -DPATHFLOW_ARENA_SIZE=65536
+# Match the codec libraries' optimization settings only for their own sources.
+# These follow CFLAGS; override FEC_CFLAGS for debug/sanitizer builds. Native
+# CPU targeting is opt-in: FEC_NATIVE_CFLAGS=-march=native. Clean when changing
+# flags, since Make does not track compiler command lines as dependencies.
+FEC_CFLAGS ?= -O3 -funroll-loops -ftree-vectorize
+FEC_NATIVE_CFLAGS ?=
 # Quicly's encoder capacity helpers intentionally perform arithmetic from a
 # null base pointer. Exclude that one UBSan check while retaining ASan and all
 # other undefined-behavior checks across qlinq and its linked dependencies.
@@ -122,8 +128,11 @@ t/%.o: t/%.c
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -c $< -o $@
 
 # Rule to compile third-party deps and suppress all warnings with -w
+
+deps/nanors/%.o deps/nanorq/%.o: private CODEC_CFLAGS = $(FEC_CFLAGS) $(FEC_NATIVE_CFLAGS)
+
 deps/%.o: deps/%.c
-	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -w -c $< -o $@
+	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) $(CODEC_CFLAGS) -w -c $< -o $@
 
 all: qlinqd qlinq-app qlinq-tund qlinq-tun
 
@@ -227,6 +236,7 @@ check-sanitize:
 	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
 	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 	$(MAKE) check CC=clang CFLAGS="$(SANITIZER_FLAGS)" \
+		FEC_CFLAGS="$(SANITIZER_FLAGS)" FEC_NATIVE_CFLAGS= \
 		LDFLAGS="$(SANITIZER_FLAGS) $(LDFLAGS)"
 
 soak: t/00util/test_operational t/00util/test_transport \

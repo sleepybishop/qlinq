@@ -23,7 +23,9 @@
 #define QLINQ_FEC_REPAIR_DEDUP_MS 25
 #define QLINQ_FEC_COMPLETION_RETRY_MS 500
 #define QLINQ_CONNECTION_CACHE_SLOTS 256U
-#define QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY 256U
+/* Quicly's per-path queue, not its legacy connection-wide 256-frame queue.
+ * The publication boundary test verifies this against the linked backend. */
+#define QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY 64U
 #define QLINQ_COMPLETED_OBJECTS 256U
 
 typedef struct {
@@ -110,6 +112,8 @@ struct transport_t {
   uint32_t fec_pkt_count;
   uint8_t fec_priority;
   bool fec_in_flush;
+  bool fec_flush_pending; /* Keep an attempted group's identity and bytes fixed.
+                           */
   transport_fec_track_state_t fec_tracks[TRANSPORT_HARD_MAX_SUBSCRIPTIONS];
 
   ifmon_watcher_t ifmon_w;
@@ -130,6 +134,7 @@ struct transport_conn_t {
   bool protocol_ready;
   bool connected_emitted;
   bool authenticated;
+  bool fec_group_delivered; /* This peer accepted the current grouped object. */
   uint32_t peer_capabilities;
   transport_limits_t negotiated_limits;
   uint64_t stream_frames_received;

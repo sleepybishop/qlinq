@@ -596,15 +596,168 @@ cleanup:
   return failed;
 }
 
+/* A burst of entirely absent objects must request distinct repairs in one
+ * bounded sweep, including cursor wrap, without exceeding either token cap. */
+static int checkpoint_repair_batch(size_t peer_limit, size_t aggregate_limit) {
+  int failed = 0;
+  transport_t *t = fixture();
+  CHECK(t && t->client_conn && t->client_conn->stream);
+  transport_conn_t *conn = t->client_conn;
+  conn->authenticated = conn->protocol_ready = true;
+  conn->negotiated_limits = t->limits;
+  conn->peer_capabilities |= QLINQ_WIRE_CAP_RATELESS_REPAIR;
+  t->limits.max_repair_requests_per_second = peer_limit;
+  t->limits.max_aggregate_nack_requests_per_second = aggregate_limit;
+  CHECK(transport_subscriptions_add(&conn->receive_subscriptions,
+                                    MOQ_TRACK_DATA, MOQ_TRACK_FLAG_FEC_RATELESS,
+                                    "batch", 7));
+  transport_object_gap_state_t *gap = transport_object_gap(conn, 7);
+  for (size_t n = 0; n < 2; n++) {
+    gap->recovery_windows[n] =
+        (transport_recovery_window_t){.active = true,
+                                      .group_id = 3,
+                                      .first_object_id = 32 * n,
+                                      .final_object_id = 32 * n + 31,
+                                      .missing_mask = UINT32_MAX,
+                                      .cursor = 13};
+  }
+  size_t expected = peer_limit < aggregate_limit ? peer_limit : aggregate_limit;
+  if (expected > 32)
+    expected = 32;
+  transport_tick(t);
+  CHECK(t->stats.repair_requests_sent == expected);
+  CHECK(t->stats.repair_whole_object_requests_sent == expected);
+  CHECK(gap->recovery_windows[0].cursor == (13 + expected) % 32);
+  CHECK(gap->recovery_windows[0].last_request_ms > 0);
+  CHECK(gap->recovery_windows[1].last_request_ms == 0);
+  for (size_t n = 0; n < 32; n++) {
+    uint8_t payload[32];
+    size_t written;
+    CHECK(qlinq_wire_encode_nack(
+              payload, sizeof(payload), 7,
+              QLINQ_WIRE_NACK_RATELESS | QLINQ_WIRE_NACK_WHOLE_OBJECT, 3,
+              (13 + n) % 32, NULL, 0, &written) == QLINQ_WIRE_OK);
+    CHECK(transport_stream_has_retained_frame(conn->stream, QLINQ_WIRE_NACK,
+                                              payload,
+                                              written) == (n < expected));
+  }
+cleanup:
+  if (!dispose(t))
+    failed = 1;
+  return failed;
+}
+
+/* Completing several windows may happen behind a full retained control queue.
+ * Keep the completed prefix and later acknowledge it with one cumulative frame.
+ */
+static int checkpoint_ack_pressure(void) {
+  int failed = 0;
+  transport_t *t = fixture();
+  CHECK(t && t->client_conn && t->client_conn->stream);
+  transport_conn_t *conn = t->client_conn;
+  conn->authenticated = conn->protocol_ready = true;
+  conn->negotiated_limits = t->limits;
+  conn->peer_capabilities |= QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS;
+  CHECK(transport_subscriptions_add(&conn->receive_subscriptions,
+                                    MOQ_TRACK_DATA, MOQ_TRACK_FLAG_FEC_RATELESS,
+                                    "ack-pressure", 7));
+  transport_object_gap_state_t *gap = transport_object_gap(conn, 7);
+  /* Deliberately reverse physical slots: ACK order is by object ID. */
+  for (size_t i = 0; i < 5; i++) {
+    gap->recovery_windows[4 - i] = (transport_recovery_window_t){
+        .active = true,
+        .group_id = 3,
+        .first_object_id = 32 * i,
+        .final_object_id = 32 * i + 31,
+        .missing_mask = (i == 0 || i == 3) ? 1U : 0U};
+  }
+  gap->recovery_windows[0].group_id = 4; /* Must never merge distinct groups. */
+  const size_t frame_size =
+      QLINQ_WIRE_FRAME_HEADER_SIZE + QLINQ_WIRE_TRACK_CHECKPOINT_SIZE;
+  while (transport_stream_can_accept(conn->stream, frame_size, false))
+    CHECK(transport_stream_write_track_checkpoint_frame(conn->stream, 7, 3, 0,
+                                                        31, false));
+  CHECK(t->stats.stream_egress_frames == TRANSPORT_STREAM_MAX_FRAMES);
+  uint8_t datagram[QLINQ_WIRE_FEC_HEADER_SIZE + 3] = {0};
+  qlinq_wire_fec_header_t header = {.alias = 7,
+                                    .group_id = 3,
+                                    .object_id = 0,
+                                    .total_symbols = 1,
+                                    .data_symbols = 1,
+                                    .symbol_size = 3,
+                                    .original_size = 3};
+  CHECK(qlinq_wire_encode_fec_header(datagram, sizeof(datagram), &header) ==
+        QLINQ_WIRE_OK);
+  memcpy(datagram + QLINQ_WIRE_FEC_HEADER_SIZE, "abc", 3);
+  t->receive_datagram.cb(&t->receive_datagram, conn->quic,
+                         ptls_iovec_init(datagram, sizeof(datagram)));
+  CHECK(quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING);
+  CHECK(t->stats.stream_control_failures == 0 &&
+        t->stats.recovery_checkpoint_acks_sent == 0);
+  CHECK(gap->recovery_windows[4].active &&
+        gap->recovery_windows[4].missing_mask == 0);
+  CHECK(transport_get_first_timeout(t) <=
+        (int64_t)t->last_pathflow_update + 25);
+  CHECK(
+      acknowledge(conn->stream, frame_size)); /* Only one frame becomes free. */
+  /* Empty feedback tokens cannot prevent completion acknowledgment. */
+  t->aggregate_nack_limiter.last_refill_ms = transport_get_time_ms();
+  t->aggregate_nack_limiter.tokens_milli = 0;
+  transport_tick(t);
+  CHECK(t->stats.recovery_checkpoint_acks_sent == 1 &&
+        t->stats.stream_control_failures == 0);
+  for (size_t i = 2; i < 5; i++)
+    CHECK(!gap->recovery_windows[i].active);
+  CHECK(gap->recovery_windows[1].active &&
+        gap->recovery_windows[1].missing_mask == 1 &&
+        gap->recovery_windows[0].active);
+  uint8_t payload[QLINQ_WIRE_TRACK_CHECKPOINT_ACK_SIZE];
+  qlinq_wire_track_checkpoint_ack_t ack = {
+      .alias = 7, .group_id = 3, .final_object_id = 95};
+  CHECK(qlinq_wire_encode_track_checkpoint_ack(payload, sizeof(payload),
+                                               &ack) == QLINQ_WIRE_OK);
+  CHECK(transport_stream_has_retained_frame(
+      conn->stream, QLINQ_WIRE_TRACK_CHECKPOINT_ACK, payload, sizeof(payload)));
+  transport_protocol_flush_recovery_acks(conn);
+  CHECK(t->stats.recovery_checkpoint_acks_sent == 1);
+  /* Once the gap closes, two groups require two separate cumulative ACKs. */
+  header.object_id = 96;
+  CHECK(qlinq_wire_encode_fec_header(datagram, sizeof(datagram), &header) ==
+        QLINQ_WIRE_OK);
+  t->receive_datagram.cb(&t->receive_datagram, conn->quic,
+                         ptls_iovec_init(datagram, sizeof(datagram)));
+  CHECK(quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
+        t->stats.recovery_checkpoint_acks_sent == 1);
+  CHECK(acknowledge(conn->stream, 2 * frame_size));
+  transport_protocol_flush_recovery_acks(conn);
+  CHECK(t->stats.recovery_checkpoint_acks_sent == 3 &&
+        !gap->recovery_windows[0].active && !gap->recovery_windows[1].active);
+  for (unsigned group = 3; group <= 4; group++) {
+    ack.group_id = group;
+    ack.final_object_id = group == 3 ? 127 : 159;
+    CHECK(qlinq_wire_encode_track_checkpoint_ack(payload, sizeof(payload),
+                                                 &ack) == QLINQ_WIRE_OK);
+    CHECK(transport_stream_has_retained_frame(conn->stream,
+                                              QLINQ_WIRE_TRACK_CHECKPOINT_ACK,
+                                              payload, sizeof(payload)));
+  }
+cleanup:
+  if (!dispose(t))
+    failed = 1;
+  return failed;
+}
+
 int main(void) {
-  int failed = entry_limit_and_control_failure() ||
-               byte_limits_and_recovery() || endpoint_vector_limit() ||
-               vector_capacity_compaction() || configurable_limits() ||
-               retained_nack_retries(false) || retained_nack_retries(true) ||
-               retained_nack_ack_gap(false) || retained_nack_ack_gap(true) ||
-               repair_pressure(false, false) || repair_pressure(false, true) ||
-               repair_pressure(true, false) || repair_pressure(true, true) ||
-               checkpoint_retires_redundant_recovery();
+  int failed =
+      checkpoint_ack_pressure() || checkpoint_repair_batch(1024, 1024) ||
+      checkpoint_repair_batch(2, 1024) || checkpoint_repair_batch(1024, 3) ||
+      entry_limit_and_control_failure() || byte_limits_and_recovery() ||
+      endpoint_vector_limit() || vector_capacity_compaction() ||
+      configurable_limits() || retained_nack_retries(false) ||
+      retained_nack_retries(true) || retained_nack_ack_gap(false) ||
+      retained_nack_ack_gap(true) || repair_pressure(false, false) ||
+      repair_pressure(false, true) || repair_pressure(true, false) ||
+      repair_pressure(true, true) || checkpoint_retires_redundant_recovery();
   if (!failed)
     puts("===STREAM BUDGET OK===");
   return failed;

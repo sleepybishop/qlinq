@@ -1,10 +1,51 @@
 /* test_fec.c */
 
 #include "fec.h"
+#include "oblas_common.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static int check_row_swap(unsigned a, unsigned b, unsigned count) {
+  uint8_t actual[4096], expected[4096];
+  for (unsigned i = 0; i < sizeof(actual); i++)
+    actual[i] = (uint8_t)(i * 37U + i / 13U);
+  memcpy(expected, actual, sizeof(actual));
+  /* Preserve the original forward byte-swap behavior even for overlaps. */
+  for (unsigned i = 0; i < count; i++) {
+    uint8_t value = expected[a + i];
+    expected[a + i] = expected[b + i];
+    expected[b + i] = value;
+  }
+  obl_swap(actual + a, actual + b, count);
+  if (memcmp(actual, expected, sizeof(actual)) != 0) {
+    fprintf(stderr, "row swap mismatch: a=%u b=%u bytes=%u\n", a, b, count);
+    return 1;
+  }
+  return 0;
+}
+
+static int test_row_swaps(void) {
+  for (unsigned count = 0; count <= 1536; count++) {
+    for (unsigned offset = 0; offset < 8; offset++) {
+      if (check_row_swap(offset, 2055 - offset, count) ||
+          check_row_swap(2055 - offset, offset, count) ||
+          check_row_swap(offset, offset, count))
+        return 1;
+    }
+  }
+  for (unsigned count = 0; count <= 256; count++) {
+    for (unsigned offset = 0; offset < 192; offset++) {
+      if (check_row_swap(7, 7 + offset, count) ||
+          check_row_swap(7 + offset, 7, count))
+        return 1;
+    }
+  }
+  obl_swap(NULL, NULL, 0);
+  puts("FEC row swaps: disjoint, overlapping, identical and unaligned OK");
+  return 0;
+}
 
 static int run_test(fec_type_t type, const char *name) {
   size_t data_symbols = 4;
@@ -213,6 +254,8 @@ static int test_short_symbols(void) {
 
 int main(void) {
   printf("running FEC test suite...\n");
+  if (test_row_swaps() != 0)
+    return 1;
   if (fec_create_ex((fec_type_t)99, 4, 2, 1024) != NULL ||
       fec_create_ex(FEC_REED_SOLOMON, 0, 2, 1024) != NULL ||
       fec_create_ex(FEC_REED_SOLOMON, 250, 10, 1024) != NULL) {

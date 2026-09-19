@@ -73,6 +73,65 @@ static int check_interleaved_records(void) {
   return failed;
 }
 
+/* A full window can contain stalled objects alongside an older object still
+ * making progress. Evict the stalled object, even when the ring cursor points
+ * at the progressing one. Drive actual datagrams through the wire receiver. */
+static int check_stalled_object_eviction(void) {
+  unsigned records = 0;
+  transport_config_t config = {.bind_hosts = {"127.0.0.1"},
+                               .num_bind_hosts = 1,
+                               .remote_hosts = {"127.0.0.1"},
+                               .num_remote_hosts = 1,
+                               .port = 19867,
+                               .allow_insecure_peer = true,
+                               .callback = count_record,
+                               .user_data = &records,
+                               .limits = {.max_assemblers_per_connection = 2}};
+  transport_t *t = transport_create(&config);
+  if (!t)
+    return 1;
+  transport_conn_t *conn = t->client_conn;
+  conn->authenticated = true;
+  conn->negotiated_limits.max_fec_object_size = 1024;
+  if (!transport_subscriptions_add(&conn->receive_subscriptions,
+                                   MOQ_TRACK_VIDEO, MOQ_TRACK_FLAG_FEC_ENABLED,
+                                   "eviction", 8)) {
+    transport_destroy(t);
+    return 1;
+  }
+  receive_symbol(conn, 8, 0, 0, 3);
+  receive_symbol(conn, 8, 1, 0, 3);
+  receive_symbol(conn, 8, 0, 1, 3);
+  frame_assembler_t *progressing = NULL, *stalled = NULL;
+  for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++) {
+    frame_assembler_t *slot = &conn->assemblers[i];
+    if (slot->total_symbols && slot->track_id == 8 && slot->group_id == 0) {
+      if (slot->object_id == 0)
+        progressing = slot;
+      else if (slot->object_id == 1)
+        stalled = slot;
+    }
+  }
+  if (!progressing || !stalled)
+    abort();
+  int64_t now = transport_get_time_ms();
+  progressing->first_symbol_time_ms = now - 200;
+  progressing->last_activity_time_ms = now - 1;
+  stalled->first_symbol_time_ms = stalled->last_activity_time_ms = now - 100;
+  /* A repeated symbol is not progress and must not refresh its eviction age. */
+  receive_symbol(conn, 8, 1, 0, 3);
+  receive_symbol(conn, 8, 2, 0, 1);
+  receive_symbol(conn, 8, 0, 2, 3);
+  int failed = records != 2 || t->stats.fec_objects_lost != 1 ||
+               conn->assemblers[0].total_symbols != 0 ||
+               conn->assemblers[1].total_symbols != 0 ||
+               t->assembler_memory_bytes != 0;
+  if (failed)
+    fputs("stalled-object eviction discarded progressing data\n", stderr);
+  transport_destroy(t);
+  return failed;
+}
+
 typedef struct {
   uint8_t expected[4 * 64];
   unsigned records;
@@ -302,6 +361,8 @@ static int check_callback_and_completion_lifetimes(void) {
 }
 
 int main(void) {
+  if (check_stalled_object_eviction())
+    return 1;
   if (check_callback_and_completion_lifetimes() || check_fec_loss_recovery())
     return 1;
   if (check_interleaved_records()) {

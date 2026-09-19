@@ -250,14 +250,54 @@ static bool acknowledge_completed_recovery_windows(transport_conn_t *conn,
     }
     if (!first || first->missing_mask != 0)
       return true;
-    if (!send_checkpoint_ack(conn, alias, first->group_id,
-                             first->final_object_id))
+    uint64_t group_id = first->group_id;
+    uint64_t final_object_id = first->final_object_id;
+    /* One cumulative ACK covers the completed prefix. Stop at the first
+     * incomplete window or different group; never acknowledge across a gap. */
+    while (true) {
+      transport_recovery_window_t *next = NULL;
+      for (size_t i = 0; i < QLINQ_RECOVERY_MAX_WINDOWS; i++) {
+        transport_recovery_window_t *window = &state->recovery_windows[i];
+        if (!window->active || window->first_object_id <= final_object_id ||
+            (next && window->first_object_id >= next->first_object_id))
+          continue;
+        next = window;
+      }
+      if (!next || next->missing_mask != 0 || next->group_id != group_id)
+        break;
+      final_object_id = next->final_object_id;
+    }
+    if (!conn->stream || !quicly_sendstate_is_open(&conn->stream->sendstate))
       return false;
-    /* The cumulative ACK retires redundant gaps and partial duplicate objects
-     * before the source releases its repair cache. */
-    retire_recovery_through(conn, alias, first->group_id,
-                            first->final_object_id);
-    memset(first, 0, sizeof(*first));
+    /* Keep completed windows until their ACK can be retained. Temporary
+     * control pressure must not close the connection or release source data.
+     * transport_tick retries independently of the NACK token budget. */
+    if (!transport_stream_can_accept(conn->stream,
+                                     QLINQ_WIRE_FRAME_HEADER_SIZE +
+                                         QLINQ_WIRE_TRACK_CHECKPOINT_ACK_SIZE,
+                                     false))
+      return true;
+    if (!send_checkpoint_ack(conn, alias, group_id, final_object_id))
+      return false;
+    retire_recovery_through(conn, alias, group_id, final_object_id);
+    for (size_t i = 0; i < QLINQ_RECOVERY_MAX_WINDOWS; i++) {
+      transport_recovery_window_t *window = &state->recovery_windows[i];
+      if (window->active && window->group_id == group_id &&
+          window->final_object_id <= final_object_id)
+        memset(window, 0, sizeof(*window));
+    }
+  }
+}
+
+void transport_protocol_flush_recovery_acks(transport_conn_t *conn) {
+  if (!conn || !conn->authenticated || !conn->stream ||
+      quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
+    return;
+  for (size_t i = 0; i < conn->receive_subscriptions.capacity; i++) {
+    const track_subscription_t *sub = &conn->receive_subscriptions.entries[i];
+    if (sub->active && sub->track_id.type == MOQ_TRACK_DATA &&
+        (sub->track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0)
+      (void)acknowledge_completed_recovery_windows(conn, sub->alias);
   }
 }
 
@@ -1251,17 +1291,25 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   if (!asm_slot) {
     /* Completed small records leave reusable slots behind. Do not evict a
      * still-assembling image merely because the round-robin cursor wrapped
-     * after several chat/PLI records. Preserve bounded eviction only when
-     * every slot is actually occupied. */
+     * after several chat/PLI records. If every slot is occupied, evict the
+     * object that has gone longest without a new symbol. Ring order reflects
+     * slot reuse, not progress; it can otherwise discard a fresh object while
+     * retaining old incomplete objects whose remaining symbols never arrive.
+     * Equal timestamps retain the rotating cursor's tie-breaking order. */
+    size_t selected = tconn->assembler_index;
     for (size_t offset = 0; offset < t->limits.max_assemblers_per_connection;
          offset++) {
       size_t index = (tconn->assembler_index + offset) %
                      t->limits.max_assemblers_per_connection;
       if (tconn->assemblers[index].total_symbols == 0) {
-        tconn->assembler_index = index;
+        selected = index;
         break;
       }
+      if (tconn->assemblers[index].last_activity_time_ms <
+          tconn->assemblers[selected].last_activity_time_ms)
+        selected = index;
     }
+    tconn->assembler_index = selected;
     asm_slot = &tconn->assemblers[tconn->assembler_index];
     tconn->assembler_index =
         (tconn->assembler_index + 1) % t->limits.max_assemblers_per_connection;
