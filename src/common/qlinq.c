@@ -661,7 +661,10 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
   map_limits(&config->limits, &transport_config.limits);
   transport_config.callback = on_transport_event;
   transport_config.user_data = endpoint;
-  transport_config.log_callback = on_transport_log;
+  /* Leave logging disabled at the transport too: otherwise hot paths format
+   * per-object diagnostics only for the bridge to discard them. */
+  transport_config.log_callback =
+      endpoint->context->log_callback ? on_transport_log : NULL;
   transport_config.log_user_data = endpoint;
 
   endpoint->transport = transport_create(&transport_config);
