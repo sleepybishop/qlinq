@@ -4,20 +4,26 @@ from pathlib import Path
 import runpy
 import unittest
 
-analyze = runpy.run_path(str(Path(__file__).with_name('multipath_bw_demo')))['analyze']
+demo = runpy.run_path(str(Path(__file__).with_name('multipath_bw_demo')))
+
+
+def analyze(output, samples, exit_code):
+    return demo['analyze'](output, samples, exit_code,
+                           demo['DEFAULT_OFFERED_MBPS'],
+                           demo['DEFAULT_INITIAL_MBPS'])
 
 
 class BandwidthReportTests(unittest.TestCase):
     def fixture(self):
-        rates = (0.8, 1.6, 3.2, 6.4)
-        output = ''.join(f'path {i}: rate={rate * 1e6 / 8:.0f} B/s share={rate / 12 * 100:.1f}%\n'
+        rates = tuple(cap * 0.6 for cap in demo['RATES'])
+        output = ''.join(f'path {i}: rate={rate * 1e6 / 8:.0f} B/s share={rate / sum(rates) * 100:.1f}%\n'
                          for i, rate in enumerate(rates))
         output += ('window_offered: 1500\nwindow_admitted: 1500\nwindow_received: 1500\n'
-                   'window_goodput_mbps: 11.9\nwindow_p99_latency_ms: 50\n')
+                   f"window_goodput_mbps: {demo['DEFAULT_OFFERED_MBPS']}\nwindow_p99_latency_ms: 50\n")
         samples = [{'time': 4.5 + i * 0.25,
                     'queues': {f'1:{n}2': {'bytes': int(rate * i * 0.25 * 1e6 / 8),
                                            'packets': i, 'drops': 0,
-                                           'backlog': (2 ** (n - 1)) * 2500}
+                                           'backlog': demo['RATES'][n - 1] * 2500}
                                for n, rate in enumerate(rates, 1)}}
                    for i in range(29)]
         return output, samples
@@ -42,7 +48,7 @@ class BandwidthReportTests(unittest.TestCase):
     def test_growing_queue_and_drops_fail(self):
         output, samples = self.fixture()
         for i, sample in enumerate(samples):
-            sample['queues']['1:12']['backlog'] += i * 2500
+            sample['queues']['1:12']['backlog'] += i * demo['RATES'][0] * 2500
             sample['queues']['1:12']['drops'] = i
         checks = analyze(output, samples, 0)['checks']
         self.assertFalse(checks['queues_bounded'])
@@ -54,7 +60,18 @@ class BandwidthReportTests(unittest.TestCase):
             sample['queues']['1:12']['bytes'] *= 10
         checks = analyze(output, samples, 0)['checks']
         self.assertFalse(checks['caps_respected'])
-        self.assertFalse(checks['faster_links_carry_more'])
+        self.assertFalse(checks['traffic_matches_capabilities'])
+
+    def test_low_goodput_and_high_latency_fail(self):
+        output, samples = self.fixture()
+        output = output.replace(
+            f"window_goodput_mbps: {demo['DEFAULT_OFFERED_MBPS']}",
+            f"window_goodput_mbps: {demo['DEFAULT_OFFERED_MBPS'] * 0.98}")
+        output = output.replace('window_p99_latency_ms: 50',
+                                'window_p99_latency_ms: 251')
+        checks = analyze(output, samples, 0)['checks']
+        self.assertFalse(checks['sustains_configured_offer'])
+        self.assertFalse(checks['p99_at_most_250ms'])
 
     def test_failed_benchmark_cannot_pass(self):
         output, samples = self.fixture()

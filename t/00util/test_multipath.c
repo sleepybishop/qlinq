@@ -260,6 +260,8 @@ static bool test_live_path_inputs(test_state_t *server, test_state_t *client,
       path_t expected = transport_path_estimate(
           &stats, quicly_get_num_datagram_frames_path(conn->quic, mapped),
           t->egress[i].bytes, symbol_size, conn->latest_owd_fp[i]);
+      expected.q += stats.bytes_in_flight / symbol_size +
+                    (stats.bytes_in_flight % symbol_size != 0);
       check.expected_queue[i] = expected.q;
       queued += expected.q;
       initial_rate[i] = expected.b;

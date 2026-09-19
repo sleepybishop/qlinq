@@ -67,7 +67,11 @@ the scope ID.
   namespaces and subscription limits, so unsubscribing from incoming data does
   not stop publication to a peer. Gap and checkpoint state is allocated only
   for active subscriptions and released on removal or disconnect.
-- `transport_fec_state` owns cached FEC instances and copies of sent objects.
+- `transport_fec_state` owns cached FEC instances and copies of rateless DATA
+  objects. Cache slots derive from the configured byte and object limits, up
+  to 4,096 objects, matching the receiver's 128 recovery windows of 32 objects.
+  An unresolved recovery prefix therefore backpressures publication before
+  the sender can exceed the receiver's checkpoint history.
 - `transport_stream` emits complete frames in one Quicly egress operation.
   Retained allocations include frame payloads, ownership headers, and vector
   capacity. Partial ACKs keep the entire frame charged until QUIC releases it;
@@ -88,7 +92,12 @@ the scope ID.
   inputs are refreshed even between ticks: the path's QUIC DATAGRAM frame count
   plus `ceil(socket_egress_bytes / full_symbol_size)`. The socket backlog is
   shared across peers and is included once for each candidate path's completion
-  estimate. Outstanding bytes in flight and kernel/network queues are excluded.
+  estimate. Publication also includes outstanding bytes in flight. Kernel and
+  network queues are excluded. Admission normally permits 50 ms of work (8–64
+  symbols); one complete allocation may exceed that allowance after all prior
+  debt drains, within the actual 64-frame path queue. Every transmitted symbol
+  is charged, so subsequent allocations wait for debt repayment. Rateless DATA
+  preflight counts only systematic source symbols, not speculative parity.
   Queue occupancy is not smoothed, so small queues and completed drains take
   effect immediately. Small single-symbol objects do not change the units of
   the stored rate estimate.

@@ -72,10 +72,10 @@ static int entry_limit_and_control_failure(void) {
   CHECK(t && t->client_conn && t->client_conn->stream);
   quicly_stream_t *stream = t->client_conn->stream;
   size_t accepted = 0;
-  while (accepted < 1024 &&
+  while (accepted <= TRANSPORT_STREAM_ENDPOINT_MAX_VECTORS &&
          transport_stream_write_frame(stream, QLINQ_WIRE_UNICAST, "x", 1))
     accepted++;
-  CHECK(accepted > 0 && accepted < TRANSPORT_STREAM_MAX_FRAMES);
+  CHECK(accepted > 0 && accepted < TRANSPORT_STREAM_ENDPOINT_MAX_VECTORS);
   CHECK(quicly_get_state(stream->conn) < QUICLY_STATE_CLOSING);
   size_t retained = t->stats.stream_egress_bytes;
   size_t vectors = t->stats.stream_egress_vector_capacity;
@@ -88,11 +88,12 @@ static int entry_limit_and_control_failure(void) {
         t->stats.stream_egress_vector_capacity == vectors);
   CHECK(transport_stream_write_frame(stream, QLINQ_WIRE_UNICAST, "x", 1));
   size_t controls = 0;
-  while (controls < TRANSPORT_STREAM_MAX_FRAMES &&
+  while (controls < TRANSPORT_STREAM_ENDPOINT_MAX_VECTORS &&
          transport_stream_write_track_checkpoint_frame(stream, 1, 0, controls,
                                                        controls, false))
     controls++;
-  CHECK(controls > 0 && accepted + controls <= TRANSPORT_STREAM_MAX_FRAMES);
+  CHECK(controls > 0 &&
+        accepted + controls <= TRANSPORT_STREAM_ENDPOINT_MAX_VECTORS);
   CHECK(quicly_get_state(stream->conn) >= QUICLY_STATE_CLOSING &&
         t->stats.stream_control_failures == 1 &&
         t->stats.resource_limit_errors == 1);
@@ -168,7 +169,7 @@ static int endpoint_vector_limit(void) {
     quicly_stream_t *stream;
     CHECK(quicly_open_stream(t->client_conn->quic, &stream, 1) == 0);
     size_t before = accepted;
-    for (size_t i = 0; i < TRANSPORT_STREAM_MAX_FRAMES; i++) {
+    for (size_t i = 0; i < TRANSPORT_STREAM_ENDPOINT_MAX_VECTORS; i++) {
       if (!transport_stream_write_frame(stream, QLINQ_WIRE_TRACK_OBJECT, "x",
                                         1))
         break;
@@ -177,8 +178,7 @@ static int endpoint_vector_limit(void) {
     if (accepted == before)
       break;
   }
-  CHECK(accepted > TRANSPORT_STREAM_MAX_FRAMES &&
-        accepted < TRANSPORT_STREAM_ENDPOINT_MAX_VECTORS);
+  CHECK(accepted > 256 && accepted < TRANSPORT_STREAM_ENDPOINT_MAX_VECTORS);
   CHECK(t->stats.stream_egress_bytes < 1024 * 1024 &&
         t->stats.stream_egress_vector_capacity <=
             TRANSPORT_STREAM_ENDPOINT_MAX_VECTORS);
@@ -257,6 +257,40 @@ static int configurable_limits(void) {
                                      sizeof(payload)));
 cleanup:
   if (t && !dispose(t))
+    failed = 1;
+  return failed;
+}
+
+/* Tiny frames should scale with the configured byte budget, rather than
+ * stopping at the old 256-frame cap. These sizes reach the frame bound before
+ * either the retained-byte or endpoint-vector budget is exhausted. */
+static int configured_frame_capacity(size_t stream_bytes, size_t expected) {
+  int failed = 0;
+  transport_config_t config = {
+      .bind_hosts = {"127.0.0.1"},
+      .num_bind_hosts = 1,
+      .remote_hosts = {"127.0.0.1"},
+      .num_remote_hosts = 1,
+      .port = 19869,
+      .allow_insecure_peer = true,
+      .callback = ignore_event,
+      .limits = {.max_reliable_object_size = 1024,
+                 .max_stream_egress_bytes = stream_bytes}};
+  transport_t *t = transport_create(&config);
+  CHECK(t && t->client_conn);
+  quicly_stream_t *stream;
+  CHECK(quicly_open_stream(t->client_conn->quic, &stream, 1) == 0);
+  for (size_t i = 0; i < expected; i++)
+    CHECK(transport_stream_write_frame(stream, QLINQ_WIRE_UNICAST, "x", 1));
+  CHECK(!transport_stream_write_frame(stream, QLINQ_WIRE_UNICAST, "x", 1));
+  CHECK(t->stats.stream_egress_frames == expected &&
+        t->stats.stream_egress_bytes < stream_bytes);
+  CHECK(acknowledge(stream, QLINQ_WIRE_FRAME_HEADER_SIZE + 1));
+  CHECK(transport_stream_write_frame(stream, QLINQ_WIRE_UNICAST, "x", 1));
+  CHECK(transport_stream_write_track_checkpoint_frame(t->client_conn->stream, 1,
+                                                      0, 0, 0, false));
+cleanup:
+  if (!dispose(t))
     failed = 1;
   return failed;
 }
@@ -432,14 +466,13 @@ static int repair_pressure(bool endpoint, bool rateless) {
       if (total == before)
         break;
     }
-    CHECK(total > TRANSPORT_STREAM_MAX_FRAMES);
+    CHECK(total > 256 && total <= TRANSPORT_STREAM_ENDPOINT_MAX_VECTORS);
   } else {
     size_t total = 0;
     while (
         transport_stream_write_frame(conn->stream, QLINQ_WIRE_UNICAST, "x", 1))
       total++;
-    CHECK(total ==
-          TRANSPORT_STREAM_MAX_FRAMES - TRANSPORT_STREAM_CONTROL_FRAME_RESERVE);
+    CHECK(total > 256 && total < TRANSPORT_STREAM_ENDPOINT_MAX_VECTORS);
   }
   size_t bytes = t->stats.stream_egress_bytes;
   size_t frames = t->stats.stream_egress_frames;
@@ -677,7 +710,8 @@ static int checkpoint_ack_pressure(void) {
   while (transport_stream_can_accept(conn->stream, frame_size, false))
     CHECK(transport_stream_write_track_checkpoint_frame(conn->stream, 7, 3, 0,
                                                         31, false));
-  CHECK(t->stats.stream_egress_frames == TRANSPORT_STREAM_MAX_FRAMES);
+  CHECK(t->stats.stream_egress_frames > 256 &&
+        t->stats.stream_egress_frames <= TRANSPORT_STREAM_ENDPOINT_MAX_VECTORS);
   uint8_t datagram[QLINQ_WIRE_FEC_HEADER_SIZE + 3] = {0};
   qlinq_wire_fec_header_t header = {.alias = 7,
                                     .group_id = 3,
@@ -753,11 +787,13 @@ int main(void) {
       checkpoint_repair_batch(2, 1024) || checkpoint_repair_batch(1024, 3) ||
       entry_limit_and_control_failure() || byte_limits_and_recovery() ||
       endpoint_vector_limit() || vector_capacity_compaction() ||
-      configurable_limits() || retained_nack_retries(false) ||
-      retained_nack_retries(true) || retained_nack_ack_gap(false) ||
-      retained_nack_ack_gap(true) || repair_pressure(false, false) ||
-      repair_pressure(false, true) || repair_pressure(true, false) ||
-      repair_pressure(true, true) || checkpoint_retires_redundant_recovery();
+      configurable_limits() || configured_frame_capacity(128U * 1024U, 2048) ||
+      configured_frame_capacity(256U * 1024U, 4096) ||
+      retained_nack_retries(false) || retained_nack_retries(true) ||
+      retained_nack_ack_gap(false) || retained_nack_ack_gap(true) ||
+      repair_pressure(false, false) || repair_pressure(false, true) ||
+      repair_pressure(true, false) || repair_pressure(true, true) ||
+      checkpoint_retires_redundant_recovery();
   if (!failed)
     puts("===STREAM BUDGET OK===");
   return failed;

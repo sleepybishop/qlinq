@@ -13,7 +13,9 @@
  * caches derive their slot count from the byte budget and maximum FEC object
  * size, up to this allocation bound. */
 #define TRANSPORT_SENT_CACHE_SIZE 2048U
-#define TRANSPORT_SENT_CACHE_MAX_SIZE 16384U
+/* Retained objects must not outgrow the peer recovery history. This limit
+ * applies even when small objects or a larger byte budget allow more slots. */
+#define TRANSPORT_SENT_CACHE_MAX_SIZE TRANSPORT_RECOVERY_MAX_OBJECTS
 #define TRANSPORT_FEC_CACHE_SIZE 8U
 
 typedef struct {

@@ -149,20 +149,10 @@ publish_datagram_to_conn(transport_t *t, transport_conn_t *conn,
                       : active_samples[active_paths].b;
       if (rate > cap)
         rate = cap;
-      size_t burst = transport_path_budget_burst(rate);
       size_t reserved = transport_path_budget_update(
           &conn->path_budgets[physical], rate, admission_now);
-      if (reserved >= burst) {
-        note_admission_retry(conn, physical, burst,
-                             data_symbols < burst ? data_symbols + 1U : burst,
-                             admission_now);
-        continue;
-      }
       if (reserved > active_samples[active_paths].q)
         active_samples[active_paths].q = reserved;
-      size_t capacity = burst - reserved;
-      if (available[active_paths] > capacity)
-        available[active_paths] = capacity;
     }
     active_rate_known[active_paths] = stats.cwnd > 0 && stats.rtt_smoothed > 0;
     if (!conn->path_state_overridden[physical])
@@ -190,16 +180,47 @@ publish_datagram_to_conn(transport_t *t, transport_conn_t *conn,
                                   use_fec, obj->priority,
                                   &conn->round_robin_path, &schedule))
       return TRANSPORT_PUBLISH_ERROR;
+    /* Rateless tracks keep their source transmission systematic. They retain
+     * the object for on-demand RaptorQ symbols after a NACK, but do not pay a
+     * full RaptorQ precompute or speculative parity cost on every healthy
+     * object. Fixed FEC continues to transmit the pathflow-selected parity. */
+    if (profile->fec_rateless) {
+      schedule.parity_symbols = 0;
+      size_t source_symbols = 0;
+      for (size_t i = 0; i < active_paths; i++)
+        source_symbols += schedule.paths[i].m;
+      /* Pathflow is not invoked for a one-symbol source object, so its m
+       * vector is empty. Keep transport_schedule_build's round-robin placement
+       * in that case; otherwise send the Pathflow source allocation without
+       * speculative parity. */
+      if (source_symbols == data_symbols)
+        for (size_t i = 0; i < active_paths; i++)
+          schedule.paths[i].x = schedule.paths[i].m;
+    }
+
     size_t blocked = active_paths;
     for (size_t i = 0; i < active_paths; i++) {
-      if (schedule.paths[i].x > available[i]) {
-        size_t physical = active_physical[i];
-        if (!conn->path_state_overridden[physical]) {
-          fp_t rate = active_states[i].b_ewma;
-          note_admission_retry(conn, physical,
-                               transport_path_budget_burst(rate),
-                               schedule.paths[i].x, admission_now);
-        }
+      size_t symbols = schedule.paths[i].x;
+      if (symbols == 0)
+        continue;
+      size_t physical = active_physical[i];
+      bool budget_blocked = false;
+      if (!conn->path_state_overridden[physical]) {
+        /* Admit one whole allocation even when it exceeds 50 ms of work.
+         * It must first repay all prior debt; charging every symbol after
+         * enqueue preserves the long-term rate and bounds bursts by the
+         * actual QUIC queue capacity. */
+        size_t burst =
+            transport_path_budget_burst(conn->path_budgets[physical].rate);
+        if (burst < symbols)
+          burst = symbols;
+        budget_blocked =
+            transport_path_budget_wait(&conn->path_budgets[physical], burst,
+                                       symbols) != 0;
+        if (budget_blocked)
+          note_admission_retry(conn, physical, burst, symbols, admission_now);
+      }
+      if (symbols > available[i] || budget_blocked) {
         blocked = i;
         break;
       }
@@ -216,24 +237,6 @@ publish_datagram_to_conn(transport_t *t, transport_conn_t *conn,
       active_rate_known[i] = active_rate_known[i + 1];
       available[i] = available[i + 1];
     }
-  }
-
-  /* Rateless tracks keep their source transmission systematic. They retain
-   * the object for on-demand RaptorQ symbols after a NACK, but do not pay a
-   * full RaptorQ precompute or speculative parity cost on every healthy
-   * object. Fixed FEC continues to transmit the pathflow-selected parity. */
-  if (profile->fec_rateless) {
-    schedule.parity_symbols = 0;
-    size_t source_symbols = 0;
-    for (size_t i = 0; i < active_paths; i++)
-      source_symbols += schedule.paths[i].m;
-    /* Pathflow is not invoked for a one-symbol source object, so its m
-     * vector is empty. Keep transport_schedule_build's round-robin placement
-     * in that case; otherwise send the Pathflow source allocation without
-     * speculative parity. */
-    if (source_symbols == data_symbols)
-      for (size_t i = 0; i < active_paths; i++)
-        schedule.paths[i].x = schedule.paths[i].m;
   }
 
   if (t->log_callback) {
