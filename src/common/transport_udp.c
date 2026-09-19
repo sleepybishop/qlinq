@@ -6,7 +6,7 @@
 #include <string.h>
 
 #define TRANSPORT_UDP_MAX_BATCH 64U
-#define TRANSPORT_UDP_GSO_BUFFER_SIZE 65536U
+#define TRANSPORT_UDP_GSO_BUFFER_SIZE 65507U /* IPv4 UDP payload ceiling. */
 
 #ifdef __linux__
 #include <netinet/udp.h>
@@ -17,6 +17,25 @@
 #ifndef SOL_UDP
 #define SOL_UDP 17
 #endif
+
+/* Select complete datagrams that fit one UDP_SEGMENT message. A short
+ * final segment ends the group; an empty datagram needs an ordinary send. */
+static size_t gso_prefix(const struct iovec *datagrams, size_t count) {
+  size_t segment_size = datagrams[0].iov_len, bytes = 0, prefix = 0;
+  if (segment_size == 0 || segment_size > TRANSPORT_UDP_GSO_BUFFER_SIZE)
+    return 0;
+  while (prefix < count) {
+    size_t len = datagrams[prefix].iov_len;
+    if (len == 0 || len > segment_size ||
+        len > TRANSPORT_UDP_GSO_BUFFER_SIZE - bytes)
+      break;
+    bytes += len;
+    prefix++;
+    if (len != segment_size)
+      break;
+  }
+  return prefix;
+}
 
 static bool try_gso(int fd, const struct sockaddr *destination,
                     socklen_t destination_len, const struct iovec *datagrams,
@@ -83,8 +102,16 @@ ssize_t transport_udp_send_batch(int fd, const struct sockaddr *destination,
   }
 
 #ifdef __linux__
-  if (try_gso(fd, destination, destination_len, datagrams, count))
-    return (ssize_t)count;
+  size_t sent_count = 0;
+  while (sent_count < count) {
+    size_t group = gso_prefix(datagrams + sent_count, count - sent_count);
+    if (group < 2 || !try_gso(fd, destination, destination_len,
+                              datagrams + sent_count, group))
+      break;
+    sent_count += group;
+  }
+  if (sent_count == count)
+    return (ssize_t)sent_count;
 
   struct mmsghdr messages[TRANSPORT_UDP_MAX_BATCH];
   struct iovec iovs[TRANSPORT_UDP_MAX_BATCH];
@@ -96,7 +123,6 @@ ssize_t transport_udp_send_batch(int fd, const struct sockaddr *destination,
     messages[i].msg_hdr.msg_iov = &iovs[i];
     messages[i].msg_hdr.msg_iovlen = 1;
   }
-  size_t sent_count = 0;
   while (sent_count < count) {
     int sent = sendmmsg(fd, messages + sent_count,
                         (unsigned int)(count - sent_count), 0);

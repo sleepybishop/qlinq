@@ -77,9 +77,14 @@ static int test_udp_batch_boundaries(void) {
   static const struct {
     size_t count;
     size_t lengths[3];
-  } cases[] = {{3, {40, 40, 40}}, {3, {80, 80, 40}}, {2, {40, 80}},
-               {3, {80, 40, 80}}, {2, {40, 0}},      {2, {0, 40}},
-               {3, {80, 0, 40}}};
+    size_t uniform_length;
+    size_t override_index, override_length;
+  } cases[] = {{3, {40, 40, 40}, 0, 0, 0}, {3, {80, 80, 40}, 0, 0, 0},
+               {2, {40, 80}, 0, 0, 0},     {3, {80, 40, 80}, 0, 0, 0},
+               {2, {40, 0}, 0, 0, 0},      {2, {0, 40}, 0, 0, 0},
+               {3, {80, 0, 40}, 0, 0, 0},  {64, {0}, 1280, 64, 0},
+               {64, {0}, 1500, 64, 0},     {64, {0}, 1280, 63, 13},
+               {64, {0}, 1280, 31, 0}};
   int sender = socket(AF_INET, SOCK_DGRAM, 0);
   int receiver = socket(AF_INET, SOCK_DGRAM, 0);
   CHECK(sender >= 0 && receiver >= 0, "UDP batch sockets");
@@ -94,15 +99,23 @@ static int test_udp_batch_boundaries(void) {
   CHECK(setsockopt(receiver, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                    sizeof(timeout)) == 0,
         "UDP batch receive deadline");
-  uint8_t payloads[3][80], received[256];
-  for (size_t i = 0; i < 3; i++)
+  int receive_bytes = 1024 * 1024;
+  CHECK(setsockopt(receiver, SOL_SOCKET, SO_RCVBUF, &receive_bytes,
+                   sizeof(receive_bytes)) == 0,
+        "large batch receive buffer");
+  uint8_t payloads[64][1500], received[1600];
+  for (size_t i = 0; i < 64; i++)
     for (size_t j = 0; j < sizeof(payloads[i]); j++)
       payloads[i][j] = (uint8_t)(i * 23 + j);
   for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
-    struct iovec datagrams[3];
+    struct iovec datagrams[64];
     for (size_t i = 0; i < cases[c].count; i++)
       datagrams[i] = (struct iovec){.iov_base = payloads[i],
-                                    .iov_len = cases[c].lengths[i]};
+                                    .iov_len = cases[c].uniform_length
+                                                   ? cases[c].uniform_length
+                                                   : cases[c].lengths[i]};
+    if (cases[c].uniform_length && cases[c].override_index < cases[c].count)
+      datagrams[cases[c].override_index].iov_len = cases[c].override_length;
     CHECK(transport_udp_send_batch(sender, (struct sockaddr *)&address,
                                    address_len, datagrams,
                                    cases[c].count) == (ssize_t)cases[c].count,

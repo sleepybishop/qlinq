@@ -202,6 +202,9 @@ t/00util/test_transport_wire: t/00util/test_transport_wire.o src/common/transpor
 t/00util/test_transport_components: t/00util/test_transport_components.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_transport_components.o $(COMMON_OBJS) $(LDFLAGS)
 
+t/00util/test_udp_gso_prefix: t/00util/test_udp_gso_prefix.o
+	$(CC) -o $@ $< $(LDFLAGS)
+
 t/00util/fuzz_transport_wire: t/00util/fuzz_transport_wire.c src/common/transport_wire.c
 	clang $(CFLAGS_COMMON) $(INCLUDES) -fsanitize=fuzzer,address,undefined \
 		-o $@ t/00util/fuzz_transport_wire.c src/common/transport_wire.c
@@ -277,7 +280,8 @@ CHECK_BINARIES = t/00util/test_fec \
 	t/00util/test_stream_budget t/00util/test_transport \
 	t/00util/test_reliable_bidirectional t/00util/test_tund \
 	t/00util/test_data_uds t/00util/test_transport_wire \
-	t/00util/test_transport_components t/00util/test_multipath \
+	t/00util/test_transport_components t/00util/test_udp_gso_prefix \
+	t/00util/test_multipath \
 	t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls
 
 check: all $(CHECK_BINARIES) gencerts
